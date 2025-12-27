@@ -1,0 +1,41 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+        "#PlaylistItem": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "label": {
+                    "type": "string"
+                },
+                "template_id": {
+                    "type": "string"
+                }
+            },
+            "required": [
+                "template_id"
+            ]
+        }
+    },
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "$ref": "#/$defs/#PlaylistItem"
+            }
+        },
+        "name": {
+            "type": "string"
+        },
+        "playlist_id": {
+            "type": "string",
+            "pattern": "^pl_"
+        }
+    },
+    "required": [
+        "name",
+        "playlist_id"
+    ]
+}

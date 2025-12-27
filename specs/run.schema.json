@@ -1,0 +1,103 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+        "#CodeState": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "base_commit": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{40}$"
+                },
+                "patch": {
+                    "$ref": "#/$defs/#Patch"
+                },
+                "repo_url": {
+                    "type": "string"
+                }
+            },
+            "required": [
+                "base_commit",
+                "repo_url"
+            ]
+        },
+        "#Exec": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "argv": {
+                    "allOf": [
+                        {
+                            "prefixItems": [
+                                true
+                            ]
+                        },
+                        {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "minLength": 1
+                        }
+                    ]
+                },
+                "cwd": {
+                    "type": "string"
+                },
+                "env": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                },
+                "timeout_sec": {
+                    "type": "integer"
+                }
+            },
+            "required": [
+                "argv",
+                "cwd"
+            ]
+        },
+        "#Patch": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "ref": {
+                    "type": "string",
+                    "pattern": "^refs/patches/"
+                },
+                "sha256": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                }
+            },
+            "required": [
+                "ref",
+                "sha256"
+            ]
+        }
+    },
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+        "code_state": {
+            "$ref": "#/$defs/#CodeState"
+        },
+        "exec": {
+            "$ref": "#/$defs/#Exec"
+        },
+        "run_id": {
+            "type": "string",
+            "pattern": "^run_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "run_version": {
+            "const": 0
+        }
+    },
+    "required": [
+        "code_state",
+        "exec",
+        "run_id"
+    ]
+}

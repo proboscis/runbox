@@ -1,0 +1,75 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+        "bindings": {
+            "type": "object",
+            "properties": {
+                "defaults": {
+                    "type": "object",
+                    "additionalProperties": true
+                },
+                "interactive": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "code_state": {
+            "type": "object",
+            "properties": {
+                "repo_url": {
+                    "type": "string"
+                }
+            },
+            "required": [
+                "repo_url"
+            ]
+        },
+        "exec": {
+            "type": "object",
+            "properties": {
+                "argv": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "cwd": {
+                    "type": "string"
+                },
+                "env": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                },
+                "timeout_sec": {
+                    "type": "integer"
+                }
+            },
+            "required": [
+                "cwd"
+            ]
+        },
+        "name": {
+            "type": "string"
+        },
+        "template_id": {
+            "type": "string",
+            "pattern": "^tpl_"
+        },
+        "template_version": {
+            "const": 0
+        }
+    },
+    "required": [
+        "code_state",
+        "exec",
+        "name",
+        "template_id"
+    ]
+}

@@ -1,0 +1,9 @@
+{
+  "playlist_id": "pl_daily",
+  "name": "Daily Tasks",
+  "items": [
+    {"template_id": "tpl_plc_runner", "label": "PLC Runner (default)"},
+    {"template_id": "tpl_eval_all"},
+    {"template_id": "tpl_sync_data"}
+  ]
+}

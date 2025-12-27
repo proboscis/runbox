@@ -1,0 +1,23 @@
+{
+  "template_version": 0,
+  "template_id": "tpl_plc_runner",
+  "name": "PLC Runner",
+
+  "exec": {
+    "argv": ["uv", "run", "python", "-m", "plc.runner", "--i", "{i}"],
+    "cwd": ".",
+    "env": {
+      "WANDB_DIR": "./outputs"
+    },
+    "timeout_sec": 3600
+  },
+
+  "bindings": {
+    "defaults": {"i": 0},
+    "interactive": ["i"]
+  },
+
+  "code_state": {
+    "repo_url": "git@github.com:org/repo.git"
+  }
+}
