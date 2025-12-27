@@ -1,11 +1,14 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use dialoguer::{theme::ColorfulTheme, Input};
 use runbox_core::{
     BindingResolver, GitContext, Playlist, PlaylistItem, RunTemplate, Storage, Validator,
 };
-use std::path::Path;
-use std::process::Command;
+use serde::Deserialize;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(name = "runbox")]
@@ -61,6 +64,30 @@ enum Commands {
     Replay {
         /// Run ID
         run_id: String,
+
+        /// Override worktree directory
+        #[arg(long)]
+        worktree_dir: Option<PathBuf>,
+
+        /// Keep worktree after execution (default)
+        #[arg(long, conflicts_with = "cleanup")]
+        keep: bool,
+
+        /// Remove worktree after execution
+        #[arg(long, conflicts_with = "keep")]
+        cleanup: bool,
+
+        /// Reuse existing worktree if possible (default)
+        #[arg(long, conflicts_with = "fresh")]
+        reuse: bool,
+
+        /// Always create a fresh worktree
+        #[arg(long, conflicts_with = "reuse")]
+        fresh: bool,
+
+        /// Verbose output (-v, -vv, -vvv)
+        #[arg(short, long, action = ArgAction::Count)]
+        verbose: u8,
     },
 
     /// Validate a JSON file
@@ -137,7 +164,26 @@ fn main() -> Result<()> {
         },
         Commands::History { limit } => cmd_history(&storage, limit),
         Commands::Show { run_id } => cmd_show(&storage, &run_id),
-        Commands::Replay { run_id } => cmd_replay(&storage, &run_id),
+        Commands::Replay {
+            run_id,
+            worktree_dir,
+            keep,
+            cleanup,
+            reuse,
+            fresh,
+            verbose,
+        } => cmd_replay(
+            &storage,
+            &run_id,
+            ReplayCliOptions {
+                worktree_dir,
+                keep,
+                cleanup,
+                reuse,
+                fresh,
+                verbose,
+            },
+        ),
         Commands::Validate { path } => cmd_validate(&path),
     }
 }
@@ -363,25 +409,307 @@ fn cmd_show(storage: &Storage, run_id: &str) -> Result<()> {
 
 // === Replay Command ===
 
-fn cmd_replay(storage: &Storage, run_id: &str) -> Result<()> {
+#[derive(Debug)]
+struct ReplayCliOptions {
+    worktree_dir: Option<PathBuf>,
+    keep: bool,
+    cleanup: bool,
+    reuse: bool,
+    fresh: bool,
+    verbose: u8,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct GlobalConfig {
+    replay: Option<ReplayConfig>,
+    logging: Option<LoggingConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ReplayConfig {
+    worktree_dir: Option<String>,
+    cleanup: Option<bool>,
+    reuse: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct LoggingConfig {
+    verbosity: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConfigSource {
+    Cli,
+    Git,
+    Global,
+    Default,
+}
+
+impl ConfigSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cli => "CLI flag",
+            Self::Git => "git config",
+            Self::Global => "global config",
+            Self::Default => "default",
+        }
+    }
+}
+
+struct Resolution<T> {
+    name: &'static str,
+    value: T,
+    source: ConfigSource,
+    checks: Vec<String>,
+    value_display: String,
+}
+
+impl<T> Resolution<T> {
+    fn log(&self, verbosity: u8) {
+        if verbosity >= 2 {
+            for line in &self.checks {
+                println!("{}", line);
+            }
+            println!(
+                "[config] -> using {}: {} (source: {})",
+                self.name,
+                self.value_display,
+                self.source.label()
+            );
+        } else if verbosity >= 1 {
+            println!(
+                "[config] {}: {} (from: {})",
+                self.name,
+                self.value_display,
+                self.source.label()
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WorktreeInfo {
+    path: PathBuf,
+    head: Option<String>,
+}
+
+fn cmd_replay(storage: &Storage, run_id: &str, opts: ReplayCliOptions) -> Result<()> {
     let run = storage.load_run(run_id)?;
+    let git = GitContext::from_current_dir()?;
+    let repo_root = git.repo_root().to_path_buf();
+
+    let global_config = load_global_config()?;
+    let git_worktree_dir = git_config_get(&repo_root, "runbox.worktreeDir")?;
+    let git_cleanup = git_config_get(&repo_root, "runbox.worktreeCleanup")?;
+    let git_reuse = git_config_get(&repo_root, "runbox.worktreeReuse")?;
+    let git_verbosity = git_config_get(&repo_root, "runbox.verbosity")?;
+
+    let cli_cleanup = if opts.cleanup {
+        Some(true)
+    } else if opts.keep {
+        Some(false)
+    } else {
+        None
+    };
+    let cli_reuse = if opts.reuse {
+        Some(true)
+    } else if opts.fresh {
+        Some(false)
+    } else {
+        None
+    };
+    let cli_verbosity = if opts.verbose > 0 {
+        Some(opts.verbose)
+    } else {
+        None
+    };
+
+    let global_replay = global_config.as_ref().and_then(|config| config.replay.as_ref());
+    let global_logging = global_config.as_ref().and_then(|config| config.logging.as_ref());
+
+    let verbosity_res = resolve_u8_setting(
+        "verbosity",
+        "-v/--verbose",
+        "git config runbox.verbosity",
+        "global config logging.verbosity",
+        cli_verbosity,
+        git_verbosity,
+        global_logging.and_then(|logging| logging.verbosity),
+        0,
+    )?;
+    let verbosity = verbosity_res.value;
+
+    let worktree_dir_res = resolve_worktree_dir(
+        &repo_root,
+        opts.worktree_dir,
+        git_worktree_dir,
+        global_replay.and_then(|replay| replay.worktree_dir.clone()),
+    )?;
+    let cleanup_res = resolve_bool_setting(
+        "cleanup",
+        "--cleanup/--keep",
+        "git config runbox.worktreeCleanup",
+        "global config replay.cleanup",
+        cli_cleanup,
+        git_cleanup,
+        global_replay.and_then(|replay| replay.cleanup),
+        false,
+    )?;
+    let reuse_res = resolve_bool_setting(
+        "reuse",
+        "--reuse/--fresh",
+        "git config runbox.worktreeReuse",
+        "global config replay.reuse",
+        cli_reuse,
+        git_reuse,
+        global_replay.and_then(|replay| replay.reuse),
+        true,
+    )?;
+
+    verbosity_res.log(verbosity);
+    worktree_dir_res.log(verbosity);
+    cleanup_res.log(verbosity);
+    reuse_res.log(verbosity);
 
     println!("Replaying: {}", run_id);
     println!("Command: {:?}", run.exec.argv);
     println!("Commit: {}", run.code_state.base_commit);
 
-    if run.code_state.patch.is_some() {
-        println!("Note: This run has a patch - you may need to restore the code state first");
+    let worktree_base = worktree_dir_res.value;
+    let worktree_path = worktree_base.join(&run.run_id);
+
+    log_at(
+        verbosity,
+        2,
+        format!(
+            "[worktree] checking existing worktree at {} for commit {}",
+            worktree_path.display(),
+            run.code_state.base_commit
+        ),
+    );
+
+    let worktrees = list_worktrees(&repo_root, verbosity)?;
+    let existing = worktrees.iter().find(|worktree| worktree.path == worktree_path);
+    let mut reused = false;
+
+    if let Some(existing) = existing {
+        if reuse_res.value {
+            if existing.head.as_deref() == Some(run.code_state.base_commit.as_str()) {
+                log_at(
+                    verbosity,
+                    2,
+                    format!(
+                        "[worktree] reusing existing worktree at {}",
+                        existing.path.display()
+                    ),
+                );
+                reused = true;
+            } else {
+                anyhow::bail!(
+                    "Worktree at {} is at commit {:?}, expected {}; use --fresh to recreate",
+                    existing.path.display(),
+                    existing.head.as_deref().unwrap_or("unknown"),
+                    run.code_state.base_commit
+                );
+            }
+        } else {
+            log_at(
+                verbosity,
+                2,
+                format!(
+                    "[worktree] removing existing worktree at {}",
+                    existing.path.display()
+                ),
+            );
+            remove_worktree(&repo_root, &existing.path, true, verbosity)?;
+        }
+    } else if worktree_path.exists() {
+        anyhow::bail!(
+            "Worktree path {} exists but is not a registered worktree",
+            worktree_path.display()
+        );
     }
 
-    // Execute
+    if !reused {
+        fs::create_dir_all(&worktree_base).with_context(|| {
+            format!(
+                "Failed to create worktree base directory: {}",
+                worktree_base.display()
+            )
+        })?;
+        log_at(
+            verbosity,
+            2,
+            format!(
+                "[worktree] no match, creating new at {}",
+                worktree_path.display()
+            ),
+        );
+        add_worktree(
+            &repo_root,
+            &worktree_path,
+            &run.code_state.base_commit,
+            verbosity,
+        )?;
+    }
+
+    if let Some(patch) = &run.code_state.patch {
+        log_at(
+            verbosity,
+            2,
+            format!("[git] fetching patch: {}", patch.ref_),
+        );
+        let patch_content = fetch_patch_content(&repo_root, &patch.ref_, verbosity)?;
+        log_at(
+            verbosity,
+            2,
+            format!("[git] applying patch: {}", patch.ref_),
+        );
+
+        if reused && patch_already_applied(&worktree_path, &patch_content, verbosity)? {
+            log_at(verbosity, 2, "[git] patch already applied, skipping");
+        } else {
+            apply_patch_to_worktree(&worktree_path, &patch_content, verbosity)?;
+        }
+    }
+
+    let exec_cwd = worktree_path.join(&run.exec.cwd);
+    log_at(verbosity, 2, format!("[exec] cwd: {}", exec_cwd.display()));
+    log_at(verbosity, 2, format!("[exec] argv: {:?}", run.exec.argv));
+
     println!("\nExecuting...");
     let status = Command::new(&run.exec.argv[0])
         .args(&run.exec.argv[1..])
-        .current_dir(&run.exec.cwd)
+        .current_dir(&exec_cwd)
         .envs(&run.exec.env)
         .status()
         .context("Failed to execute command")?;
+
+    log_at(
+        verbosity,
+        2,
+        format!(
+            "[exec] exit_code: {}",
+            status.code().unwrap_or(-1)
+        ),
+    );
+
+    if cleanup_res.value {
+        if reused {
+            log_at(
+                verbosity,
+                1,
+                "[worktree] cleanup requested, skipping reused worktree",
+            );
+        } else {
+            log_at(
+                verbosity,
+                2,
+                format!("[worktree] removing {}", worktree_path.display()),
+            );
+            remove_worktree(&repo_root, &worktree_path, true, verbosity)?;
+        }
+    }
 
     if status.success() {
         println!("\nReplay completed successfully");
@@ -390,6 +718,483 @@ fn cmd_replay(storage: &Storage, run_id: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn load_global_config() -> Result<Option<GlobalConfig>> {
+    let Some(config_dir) = dirs::config_dir() else {
+        return Ok(None);
+    };
+    let config_path = config_dir.join("runbox").join("config.toml");
+    if !config_path.exists() {
+        return Ok(None);
+    }
+
+    let contents = fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
+    let config: GlobalConfig = toml::from_str(&contents)
+        .with_context(|| format!("Failed to parse config file: {}", config_path.display()))?;
+    Ok(Some(config))
+}
+
+fn resolve_worktree_dir(
+    repo_root: &Path,
+    cli_value: Option<PathBuf>,
+    git_value: Option<String>,
+    global_value: Option<String>,
+) -> Result<Resolution<PathBuf>> {
+    let cli_value = cli_value.map(|path| normalize_path(repo_root, expand_tilde_path(&path)));
+    let git_value = match git_value {
+        Some(value) => Some(normalize_config_path(
+            repo_root,
+            &value,
+            "runbox.worktreeDir",
+        )?),
+        None => None,
+    };
+    let global_value = match global_value {
+        Some(value) => Some(normalize_config_path(
+            repo_root,
+            &value,
+            "replay.worktree_dir",
+        )?),
+        None => None,
+    };
+
+    let checks = vec![
+        format_config_check(
+            "--worktree-dir",
+            cli_value
+                .as_ref()
+                .map(|value| value.display().to_string()),
+        ),
+        format_config_check(
+            "git config runbox.worktreeDir",
+            git_value
+                .as_ref()
+                .map(|value| value.display().to_string()),
+        ),
+        format_config_check(
+            "global config replay.worktree_dir",
+            global_value
+                .as_ref()
+                .map(|value| value.display().to_string()),
+        ),
+    ];
+
+    let default_value = repo_root.join(".git-worktrees/replay");
+    let (value, source) = if let Some(value) = cli_value {
+        (value, ConfigSource::Cli)
+    } else if let Some(value) = git_value {
+        (value, ConfigSource::Git)
+    } else if let Some(value) = global_value {
+        (value, ConfigSource::Global)
+    } else {
+        (default_value, ConfigSource::Default)
+    };
+
+    Ok(Resolution {
+        name: "worktree_dir",
+        value_display: value.display().to_string(),
+        value,
+        source,
+        checks,
+    })
+}
+
+fn resolve_bool_setting(
+    name: &'static str,
+    cli_label: &'static str,
+    git_label: &'static str,
+    global_label: &'static str,
+    cli_value: Option<bool>,
+    git_value: Option<String>,
+    global_value: Option<bool>,
+    default_value: bool,
+) -> Result<Resolution<bool>> {
+    let git_value = match git_value {
+        Some(value) => Some(parse_bool(&value, git_label)?),
+        None => None,
+    };
+    let checks = vec![
+        format_config_check(
+            cli_label,
+            cli_value.map(|value| value.to_string()),
+        ),
+        format_config_check(
+            git_label,
+            git_value.map(|value| value.to_string()),
+        ),
+        format_config_check(
+            global_label,
+            global_value.map(|value| value.to_string()),
+        ),
+    ];
+
+    let (value, source) = if let Some(value) = cli_value {
+        (value, ConfigSource::Cli)
+    } else if let Some(value) = git_value {
+        (value, ConfigSource::Git)
+    } else if let Some(value) = global_value {
+        (value, ConfigSource::Global)
+    } else {
+        (default_value, ConfigSource::Default)
+    };
+
+    Ok(Resolution {
+        name,
+        value_display: value.to_string(),
+        value,
+        source,
+        checks,
+    })
+}
+
+fn resolve_u8_setting(
+    name: &'static str,
+    cli_label: &'static str,
+    git_label: &'static str,
+    global_label: &'static str,
+    cli_value: Option<u8>,
+    git_value: Option<String>,
+    global_value: Option<u8>,
+    default_value: u8,
+) -> Result<Resolution<u8>> {
+    let git_value = match git_value {
+        Some(value) => Some(parse_u8(&value, git_label)?),
+        None => None,
+    };
+    let checks = vec![
+        format_config_check(
+            cli_label,
+            cli_value.map(|value| value.to_string()),
+        ),
+        format_config_check(
+            git_label,
+            git_value.map(|value| value.to_string()),
+        ),
+        format_config_check(
+            global_label,
+            global_value.map(|value| value.to_string()),
+        ),
+    ];
+
+    let (value, source) = if let Some(value) = cli_value {
+        (value, ConfigSource::Cli)
+    } else if let Some(value) = git_value {
+        (value, ConfigSource::Git)
+    } else if let Some(value) = global_value {
+        (value, ConfigSource::Global)
+    } else {
+        (default_value, ConfigSource::Default)
+    };
+
+    Ok(Resolution {
+        name,
+        value_display: value.to_string(),
+        value,
+        source,
+        checks,
+    })
+}
+
+fn git_config_get(repo_root: &Path, key: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .current_dir(repo_root)
+        .args(["config", "--local", "--get", key])
+        .output()
+        .context("Failed to run git config")?;
+
+    if output.status.success() {
+        let value = String::from_utf8(output.stdout)?.trim().to_string();
+        if value.is_empty() {
+            anyhow::bail!("Git config {} is empty", key);
+        }
+        return Ok(Some(value));
+    }
+
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+
+    anyhow::bail!(
+        "Failed to read git config {}: {}",
+        key,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn normalize_config_path(repo_root: &Path, value: &str, label: &str) -> Result<PathBuf> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Config {} is empty", label);
+    }
+    let path = PathBuf::from(trimmed);
+    Ok(normalize_path(repo_root, expand_tilde_path(&path)))
+}
+
+fn expand_tilde_path(path: &Path) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    if path_str == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    } else if let Some(stripped) = path_str.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(stripped);
+        }
+    }
+    path.to_path_buf()
+}
+
+fn normalize_path(repo_root: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        repo_root.join(path)
+    }
+}
+
+fn format_config_check(label: &str, value: Option<String>) -> String {
+    let value = value.unwrap_or_else(|| "not set".to_string());
+    format!("[config] checking {}: {}", label, value)
+}
+
+fn parse_bool(value: &str, label: &str) -> Result<bool> {
+    let normalized = value.trim().to_lowercase();
+    match normalized.as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => anyhow::bail!("Invalid boolean for {}: {}", label, value),
+    }
+}
+
+fn parse_u8(value: &str, label: &str) -> Result<u8> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Config {} is empty", label);
+    }
+    trimmed
+        .parse::<u8>()
+        .with_context(|| format!("Invalid integer for {}: {}", label, value))
+}
+
+fn log_at(verbosity: u8, level: u8, message: impl AsRef<str>) {
+    if verbosity >= level {
+        println!("{}", message.as_ref());
+    }
+}
+
+fn list_worktrees(repo_root: &Path, verbosity: u8) -> Result<Vec<WorktreeInfo>> {
+    let output = run_git(
+        repo_root,
+        vec!["worktree".to_string(), "list".to_string(), "--porcelain".to_string()],
+        verbosity,
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    Ok(parse_worktrees(&stdout))
+}
+
+fn parse_worktrees(output: &str) -> Vec<WorktreeInfo> {
+    let mut worktrees = Vec::new();
+    let mut current: Option<WorktreeInfo> = None;
+
+    for line in output.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(worktree) = current.take() {
+                worktrees.push(worktree);
+            }
+            current = Some(WorktreeInfo {
+                path: PathBuf::from(path.trim()),
+                head: None,
+            });
+        } else if let Some(head) = line.strip_prefix("HEAD ") {
+            if let Some(worktree) = current.as_mut() {
+                worktree.head = Some(head.trim().to_string());
+            }
+        }
+    }
+
+    if let Some(worktree) = current {
+        worktrees.push(worktree);
+    }
+
+    worktrees
+}
+
+fn add_worktree(repo_root: &Path, path: &Path, commit: &str, verbosity: u8) -> Result<()> {
+    run_git(
+        repo_root,
+        vec![
+            "worktree".to_string(),
+            "add".to_string(),
+            path.display().to_string(),
+            commit.to_string(),
+        ],
+        verbosity,
+    )?;
+    Ok(())
+}
+
+fn remove_worktree(repo_root: &Path, path: &Path, force: bool, verbosity: u8) -> Result<()> {
+    let mut args = vec!["worktree".to_string(), "remove".to_string()];
+    if force {
+        args.push("--force".to_string());
+    }
+    args.push(path.display().to_string());
+    run_git(repo_root, args, verbosity)?;
+    Ok(())
+}
+
+fn fetch_patch_content(repo_root: &Path, patch_ref: &str, verbosity: u8) -> Result<String> {
+    run_git(
+        repo_root,
+        vec![
+            "fetch".to_string(),
+            "origin".to_string(),
+            patch_ref.to_string(),
+        ],
+        verbosity,
+    )?;
+    let output = run_git(
+        repo_root,
+        vec!["cat-file".to_string(), "-p".to_string(), "FETCH_HEAD".to_string()],
+        verbosity,
+    )?;
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+fn patch_already_applied(
+    worktree_path: &Path,
+    patch_content: &str,
+    verbosity: u8,
+) -> Result<bool> {
+    run_git_check(
+        worktree_path,
+        vec![
+            "apply".to_string(),
+            "--reverse".to_string(),
+            "--check".to_string(),
+        ],
+        patch_content,
+        verbosity,
+    )
+}
+
+fn apply_patch_to_worktree(
+    worktree_path: &Path,
+    patch_content: &str,
+    verbosity: u8,
+) -> Result<()> {
+    run_git_with_input(
+        worktree_path,
+        vec!["apply".to_string()],
+        patch_content,
+        verbosity,
+    )
+}
+
+fn run_git(current_dir: &Path, args: Vec<String>, verbosity: u8) -> Result<std::process::Output> {
+    if verbosity >= 3 {
+        println!("[git] git {}", args.join(" "));
+    }
+    let start = Instant::now();
+    let output = Command::new("git")
+        .current_dir(current_dir)
+        .args(&args)
+        .output()
+        .context("Failed to run git")?;
+    if verbosity >= 3 {
+        println!(
+            "[git] exit_code: {} ({}ms)",
+            output.status.code().unwrap_or(-1),
+            start.elapsed().as_millis()
+        );
+    }
+    if !output.status.success() {
+        anyhow::bail!(
+            "Git command failed: git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(output)
+}
+
+fn run_git_with_input(
+    current_dir: &Path,
+    args: Vec<String>,
+    input: &str,
+    verbosity: u8,
+) -> Result<()> {
+    if verbosity >= 3 {
+        println!("[git] git {} <stdin>", args.join(" "));
+    }
+    let start = Instant::now();
+    let mut child = Command::new("git")
+        .current_dir(current_dir)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to run git")?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        use std::io::Write;
+        stdin.write_all(input.as_bytes())?;
+    }
+
+    let output = child.wait_with_output()?;
+    if verbosity >= 3 {
+        println!(
+            "[git] exit_code: {} ({}ms)",
+            output.status.code().unwrap_or(-1),
+            start.elapsed().as_millis()
+        );
+    }
+    if !output.status.success() {
+        anyhow::bail!(
+            "Git command failed: git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+fn run_git_check(
+    current_dir: &Path,
+    args: Vec<String>,
+    input: &str,
+    verbosity: u8,
+) -> Result<bool> {
+    if verbosity >= 3 {
+        println!("[git] git {} <stdin>", args.join(" "));
+    }
+    let start = Instant::now();
+    let mut child = Command::new("git")
+        .current_dir(current_dir)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to run git")?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        use std::io::Write;
+        stdin.write_all(input.as_bytes())?;
+    }
+
+    let output = child.wait_with_output()?;
+    if verbosity >= 3 {
+        println!(
+            "[git] exit_code: {} ({}ms)",
+            output.status.code().unwrap_or(-1),
+            start.elapsed().as_millis()
+        );
+    }
+    Ok(output.status.success())
 }
 
 // === Validate Command ===

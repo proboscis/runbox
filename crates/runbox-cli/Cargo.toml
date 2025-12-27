@@ -18,3 +18,4 @@ anyhow = { workspace = true }
 uuid = { workspace = true }
 dirs = "5"
 dialoguer = "0.11"
+toml = "0.8"
