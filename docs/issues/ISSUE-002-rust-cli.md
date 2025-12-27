@@ -2,7 +2,9 @@
 type: issue
 id: ISSUE-002
 title: Rust CLI Implementation
-status: open
+status: resolved
+resolved_by: run-20251227-210405 (claude)
+resolved_at: 2025-12-28
 ---
 
 # Rust CLI Implementation

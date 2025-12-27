@@ -2,7 +2,7 @@
 type: issue
 id: ISSUE-001
 title: Run/RunTemplate/Playlist Spec
-status: open
+status: resolved
 ---
 
 # Run/RunTemplate/Playlist Spec
