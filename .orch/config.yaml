@@ -1,0 +1,6 @@
+# Runbox repo orch configuration
+# Issues are in docs/issues/ with type: issue frontmatter
+vault: ~/repos/runbox/docs/issues
+agent: claude
+worktree_root: .git-worktrees
+base_branch: main

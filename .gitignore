@@ -1,0 +1,13 @@
+/target
+Cargo.lock
+*.pyc
+__pycache__/
+.venv/
+*.egg-info/
+dist/
+build/
+.DS_Store
+
+# orch runtime files (keep config.yaml)
+.orch/*.log
+.orch/*.pid

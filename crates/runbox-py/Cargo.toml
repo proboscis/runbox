@@ -1,0 +1,15 @@
+[package]
+name = "runbox-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Python bindings for runbox"
+
+[lib]
+name = "runbox"
+crate-type = ["cdylib"]
+
+[dependencies]
+runbox-core = { workspace = true }
+pyo3 = { version = "0.20", features = ["extension-module"] }
+uuid = { workspace = true }
