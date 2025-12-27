@@ -2,12 +2,10 @@
 type: issue
 id: ISSUE-001
 title: Run/RunTemplate/Playlist Spec
-status: resolved
+status: open
 ---
 
 # Run/RunTemplate/Playlist Spec
-
-Spec は `specs/run.md` と `specs/run.cue` に定義済み。
 
 ## 概要
 
@@ -20,3 +18,10 @@ Spec は `specs/run.md` と `specs/run.cue` に定義済み。
 See:
 - [specs/run.md](../../specs/run.md)
 - [specs/run.cue](../../specs/run.cue)
+
+## Acceptance Criteria
+
+- [ ] CUE schema が `cue vet` で検証済み
+- [ ] JSON Schema の生成確認
+- [ ] 実装 (ISSUE-002) での spec 変更をマージ
+- [ ] Example JSON が schema に対して valid
