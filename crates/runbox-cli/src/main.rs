@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dialoguer::{theme::ColorfulTheme, Input};
 use runbox_core::{
-    BindingResolver, GitContext, Playlist, PlaylistItem, RunTemplate, Storage, Validator,
+    short_id, BindingResolver, GitContext, Playlist, PlaylistItem, RunTemplate, Storage, Validator,
 };
 use std::path::Path;
 use std::process::Command;
@@ -145,7 +145,8 @@ fn main() -> Result<()> {
 // === Run Command ===
 
 fn cmd_run(storage: &Storage, template_id: &str, bindings: Vec<String>, dry_run: bool) -> Result<()> {
-    let template = storage.load_template(template_id)?;
+    let resolved_template_id = storage.resolve_template_id(template_id)?;
+    let template = storage.load_template(&resolved_template_id)?;
 
     // Create interactive callback
     let interactive_callback: Box<dyn Fn(&str, Option<&serde_json::Value>) -> Result<String>> =
@@ -222,17 +223,18 @@ fn cmd_template_list(storage: &Storage) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<30} {:<40}", "ID", "NAME");
-    println!("{}", "-".repeat(70));
+    println!("{:<10} {:<40}", "ID", "NAME");
+    println!("{}", "-".repeat(50));
     for t in templates {
-        println!("{:<30} {:<40}", t.template_id, t.name);
+        println!("{:<10} {:<40}", short_id(&t.template_id), t.name);
     }
 
     Ok(())
 }
 
 fn cmd_template_show(storage: &Storage, template_id: &str) -> Result<()> {
-    let template = storage.load_template(template_id)?;
+    let resolved_id = storage.resolve_template_id(template_id)?;
+    let template = storage.load_template(&resolved_id)?;
     println!("{}", serde_json::to_string_pretty(&template)?);
     Ok(())
 }
@@ -254,8 +256,9 @@ fn cmd_template_create(storage: &Storage, path: &str) -> Result<()> {
 }
 
 fn cmd_template_delete(storage: &Storage, template_id: &str) -> Result<()> {
-    storage.delete_template(template_id)?;
-    println!("Template deleted: {}", template_id);
+    let resolved_id = storage.resolve_template_id(template_id)?;
+    storage.delete_template(&resolved_id)?;
+    println!("Template deleted: {}", short_id(&resolved_id));
     Ok(())
 }
 
@@ -269,17 +272,18 @@ fn cmd_playlist_list(storage: &Storage) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<30} {:<30} {:<10}", "ID", "NAME", "ITEMS");
-    println!("{}", "-".repeat(70));
+    println!("{:<10} {:<30} {:<10}", "ID", "NAME", "ITEMS");
+    println!("{}", "-".repeat(50));
     for p in playlists {
-        println!("{:<30} {:<30} {:<10}", p.playlist_id, p.name, p.items.len());
+        println!("{:<10} {:<30} {:<10}", short_id(&p.playlist_id), p.name, p.items.len());
     }
 
     Ok(())
 }
 
 fn cmd_playlist_show(storage: &Storage, playlist_id: &str) -> Result<()> {
-    let playlist = storage.load_playlist(playlist_id)?;
+    let resolved_id = storage.resolve_playlist_id(playlist_id)?;
+    let playlist = storage.load_playlist(&resolved_id)?;
     println!("{}", serde_json::to_string_pretty(&playlist)?);
     Ok(())
 }
@@ -306,27 +310,31 @@ fn cmd_playlist_add(
     template_id: &str,
     label: Option<String>,
 ) -> Result<()> {
-    let mut playlist = storage.load_playlist(playlist_id)?;
+    let resolved_playlist_id = storage.resolve_playlist_id(playlist_id)?;
+    let resolved_template_id = storage.resolve_template_id(template_id)?;
+    let mut playlist = storage.load_playlist(&resolved_playlist_id)?;
     playlist.items.push(PlaylistItem {
-        template_id: template_id.to_string(),
+        template_id: resolved_template_id.clone(),
         label,
     });
     storage.save_playlist(&playlist)?;
-    println!("Added {} to {}", template_id, playlist_id);
+    println!("Added {} to {}", short_id(&resolved_template_id), short_id(&resolved_playlist_id));
     Ok(())
 }
 
 fn cmd_playlist_remove(storage: &Storage, playlist_id: &str, template_id: &str) -> Result<()> {
-    let mut playlist = storage.load_playlist(playlist_id)?;
+    let resolved_playlist_id = storage.resolve_playlist_id(playlist_id)?;
+    let resolved_template_id = storage.resolve_template_id(template_id)?;
+    let mut playlist = storage.load_playlist(&resolved_playlist_id)?;
     let initial_len = playlist.items.len();
-    playlist.items.retain(|item| item.template_id != template_id);
+    playlist.items.retain(|item| item.template_id != resolved_template_id);
 
     if playlist.items.len() == initial_len {
-        anyhow::bail!("Template {} not found in playlist", template_id);
+        anyhow::bail!("Template {} not found in playlist", short_id(&resolved_template_id));
     }
 
     storage.save_playlist(&playlist)?;
-    println!("Removed {} from {}", template_id, playlist_id);
+    println!("Removed {} from {}", short_id(&resolved_template_id), short_id(&resolved_playlist_id));
     Ok(())
 }
 
@@ -340,23 +348,24 @@ fn cmd_history(storage: &Storage, limit: usize) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<50} {:<30}", "RUN ID", "COMMAND");
-    println!("{}", "-".repeat(80));
+    println!("{:<10} {:<50}", "ID", "COMMAND");
+    println!("{}", "-".repeat(60));
     for run in runs {
         let cmd = run.exec.argv.join(" ");
-        let cmd_truncated = if cmd.len() > 30 {
-            format!("{}...", &cmd[..27])
+        let cmd_truncated = if cmd.len() > 50 {
+            format!("{}...", &cmd[..47])
         } else {
             cmd
         };
-        println!("{:<50} {:<30}", run.run_id, cmd_truncated);
+        println!("{:<10} {:<50}", short_id(&run.run_id), cmd_truncated);
     }
 
     Ok(())
 }
 
 fn cmd_show(storage: &Storage, run_id: &str) -> Result<()> {
-    let run = storage.load_run(run_id)?;
+    let resolved_id = storage.resolve_run_id(run_id)?;
+    let run = storage.load_run(&resolved_id)?;
     println!("{}", serde_json::to_string_pretty(&run)?);
     Ok(())
 }
@@ -364,9 +373,10 @@ fn cmd_show(storage: &Storage, run_id: &str) -> Result<()> {
 // === Replay Command ===
 
 fn cmd_replay(storage: &Storage, run_id: &str) -> Result<()> {
-    let run = storage.load_run(run_id)?;
+    let resolved_id = storage.resolve_run_id(run_id)?;
+    let run = storage.load_run(&resolved_id)?;
 
-    println!("Replaying: {}", run_id);
+    println!("Replaying: {}", resolved_id);
     println!("Command: {:?}", run.exec.argv);
     println!("Commit: {}", run.code_state.base_commit);
 
