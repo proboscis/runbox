@@ -24,6 +24,8 @@ pub struct Run {
     pub timeline: Timeline,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconcile_reason: Option<String>,
 }
 
 /// Run execution status
@@ -134,6 +136,7 @@ impl Run {
                 ended_at: None,
             },
             exit_code: None,
+            reconcile_reason: None,
         }
     }
 
@@ -217,6 +220,7 @@ mod tests {
             log_ref: None,
             timeline: Timeline::default(),
             exit_code: None,
+            reconcile_reason: None,
         };
 
         let json = serde_json::to_string_pretty(&run).unwrap();
@@ -255,6 +259,7 @@ mod tests {
                 ended_at: None,
             },
             exit_code: None,
+            reconcile_reason: None,
         };
 
         let json = serde_json::to_string_pretty(&run).unwrap();
@@ -285,6 +290,7 @@ mod tests {
             log_ref: None,
             timeline: Timeline::default(),
             exit_code: None,
+            reconcile_reason: None,
         };
 
         assert_eq!(run.short_id(), "550e8400");

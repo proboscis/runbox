@@ -55,11 +55,12 @@ impl RuntimeAdapter for BackgroundAdapter {
         Ok(RuntimeHandle::Background { pid, pgid })
     }
 
-    fn stop(&self, handle: &RuntimeHandle) -> Result<()> {
+    fn stop(&self, handle: &RuntimeHandle, force: bool) -> Result<()> {
         if let RuntimeHandle::Background { pgid, .. } = handle {
-            // Send SIGTERM to the process group
+            // Send SIGTERM (default) or SIGKILL (force)
+            let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
             unsafe {
-                let ret = libc::killpg(*pgid as i32, libc::SIGTERM);
+                let ret = libc::killpg(*pgid as i32, signal);
                 if ret != 0 {
                     // Process may already be dead, which is fine
                     let errno = std::io::Error::last_os_error();
@@ -110,8 +111,8 @@ mod tests {
         // Should be alive
         assert!(adapter.is_alive(&handle));
 
-        // Stop it
-        adapter.stop(&handle).unwrap();
+        // Stop it (graceful SIGTERM)
+        adapter.stop(&handle, false).unwrap();
 
         // Give it a moment to die
         std::thread::sleep(std::time::Duration::from_millis(100));

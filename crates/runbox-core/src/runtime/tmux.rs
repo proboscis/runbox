@@ -62,28 +62,29 @@ impl RuntimeAdapter for TmuxAdapter {
         // Window name from short run_id
         let window_name = Self::short_id(run_id);
 
-        // Build the command string with output redirection
-        let cmd_str = format!(
-            "exec {} > {} 2>&1",
-            shell_escape_argv(&exec.argv),
-            shell_escape(log_path.to_string_lossy().as_ref())
-        );
-
-        // Build env vars for tmux
-        let env_str: String = exec
+        // Build env prefix (VAR=value format)
+        // Note: .envs() only affects tmux command, not the spawned shell
+        let env_prefix = exec
             .env
             .iter()
-            .map(|(k, v)| format!("{}={}", k, shell_escape(v)))
+            .map(|(k, v)| format!("{}={}", shell_escape(k), shell_escape(v)))
             .collect::<Vec<_>>()
             .join(" ");
 
-        let full_cmd = if env_str.is_empty() {
-            cmd_str
-        } else {
-            format!("{} {}", env_str, cmd_str)
-        };
+        // Build the command string with output redirection
+        // Use single quotes for log_path as per spec
+        let cmd_str = format!(
+            "{} exec {} > '{}' 2>&1",
+            env_prefix,
+            shell_escape_argv(&exec.argv),
+            log_path.display()
+        );
 
-        // Create new window and run command
+        // Trim leading space if no env vars
+        let cmd_str = cmd_str.trim_start();
+
+        // Create new window and run command with bash -lc
+        // Note: -c option sets the working directory for the new window
         let status = Command::new("tmux")
             .args([
                 "new-window",
@@ -93,7 +94,9 @@ impl RuntimeAdapter for TmuxAdapter {
                 &window_name,
                 "-c",
                 &exec.cwd,
-                &full_cmd,
+                "bash",
+                "-lc",
+                cmd_str,
             ])
             .status()
             .context("Failed to create tmux window")?;
@@ -108,7 +111,10 @@ impl RuntimeAdapter for TmuxAdapter {
         })
     }
 
-    fn stop(&self, handle: &RuntimeHandle) -> Result<()> {
+    fn stop(&self, handle: &RuntimeHandle, _force: bool) -> Result<()> {
+        // For tmux, kill-window sends SIGHUP to processes
+        // The force parameter doesn't change behavior for tmux
+        // (kill-window is the same regardless)
         if let RuntimeHandle::Tmux { session, window } = handle {
             let target = format!("{}:{}", session, window);
             let status = Command::new("tmux")

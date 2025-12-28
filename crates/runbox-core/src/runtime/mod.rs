@@ -27,7 +27,11 @@ pub trait RuntimeAdapter: Send + Sync {
     fn spawn(&self, exec: &Exec, run_id: &str, log_path: &Path) -> Result<RuntimeHandle>;
 
     /// Stop a running process
-    fn stop(&self, handle: &RuntimeHandle) -> Result<()>;
+    ///
+    /// # Arguments
+    /// * `handle` - The runtime handle
+    /// * `force` - If false, send SIGTERM; if true, send SIGKILL
+    fn stop(&self, handle: &RuntimeHandle, force: bool) -> Result<()>;
 
     /// Attach to a running process (terminal takeover)
     fn attach(&self, handle: &RuntimeHandle) -> Result<()>;
