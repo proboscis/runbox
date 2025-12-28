@@ -2,9 +2,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dialoguer::{theme::ColorfulTheme, Input};
 use runbox_core::{
-    short_id, BindingResolver, GitContext, Playlist, PlaylistItem, RunTemplate, Storage, Validator,
+    short_id, BindingResolver, ConfigResolver, GitContext, Playlist, PlaylistItem, RunTemplate,
+    Storage, Validator, VerboseLogger,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Parser)]
@@ -57,10 +58,34 @@ enum Commands {
         run_id: String,
     },
 
-    /// Replay a previous run
+    /// Replay a previous run in an isolated worktree
     Replay {
         /// Run ID
         run_id: String,
+
+        /// Override worktree directory
+        #[arg(long)]
+        worktree_dir: Option<PathBuf>,
+
+        /// Keep worktree after execution (default)
+        #[arg(long, conflicts_with = "cleanup")]
+        keep: bool,
+
+        /// Remove worktree after execution
+        #[arg(long, conflicts_with = "keep")]
+        cleanup: bool,
+
+        /// Reuse existing worktree if commit matches (default)
+        #[arg(long, conflicts_with = "fresh")]
+        reuse: bool,
+
+        /// Always create fresh worktree
+        #[arg(long, conflicts_with = "reuse")]
+        fresh: bool,
+
+        /// Verbose output (can be repeated: -v, -vv, -vvv)
+        #[arg(short, long, action = clap::ArgAction::Count)]
+        verbose: u8,
     },
 
     /// Validate a JSON file
@@ -137,7 +162,24 @@ fn main() -> Result<()> {
         },
         Commands::History { limit } => cmd_history(&storage, limit),
         Commands::Show { run_id } => cmd_show(&storage, &run_id),
-        Commands::Replay { run_id } => cmd_replay(&storage, &run_id),
+        Commands::Replay {
+            run_id,
+            worktree_dir,
+            keep,
+            cleanup,
+            reuse,
+            fresh,
+            verbose,
+        } => cmd_replay(
+            &storage,
+            &run_id,
+            worktree_dir,
+            keep,
+            cleanup,
+            reuse,
+            fresh,
+            verbose,
+        ),
         Commands::Validate { path } => cmd_validate(&path),
     }
 }
@@ -372,31 +414,155 @@ fn cmd_show(storage: &Storage, run_id: &str) -> Result<()> {
 
 // === Replay Command ===
 
-fn cmd_replay(storage: &Storage, run_id: &str) -> Result<()> {
+fn cmd_replay(
+    storage: &Storage,
+    run_id: &str,
+    worktree_dir: Option<PathBuf>,
+    keep: bool,
+    cleanup: bool,
+    reuse: bool,
+    fresh: bool,
+    verbose: u8,
+) -> Result<()> {
+    // Resolve short ID to full ID
     let resolved_id = storage.resolve_run_id(run_id)?;
     let run = storage.load_run(&resolved_id)?;
 
+    // Initialize git context from current directory
+    let git = GitContext::from_current_dir()?;
+
+    // Create config resolver
+    let config_resolver = ConfigResolver::new(Some(git.repo_root().to_path_buf()))?;
+
+    // Resolve verbosity
+    let resolved_verbosity = config_resolver.resolve_verbosity(verbose);
+    let logger = VerboseLogger::new(resolved_verbosity.value);
+
+    logger.log_v(
+        "config",
+        &format!(
+            "verbosity: {} (from: {})",
+            resolved_verbosity.value, resolved_verbosity.source
+        ),
+    );
+
+    // Resolve worktree directory
+    let resolved_worktree_dir = config_resolver.resolve_worktree_dir(worktree_dir.as_ref());
+    logger.log_v(
+        "config",
+        &format!(
+            "worktree_dir: {} (from: {})",
+            resolved_worktree_dir.value.display(),
+            resolved_worktree_dir.source
+        ),
+    );
+
+    // Resolve cleanup setting
+    let cli_cleanup = if cleanup {
+        Some(true)
+    } else if keep {
+        Some(false)
+    } else {
+        None
+    };
+    let resolved_cleanup = config_resolver.resolve_cleanup(cli_cleanup);
+    logger.log_v(
+        "config",
+        &format!(
+            "cleanup: {} (from: {})",
+            resolved_cleanup.value, resolved_cleanup.source
+        ),
+    );
+
+    // Resolve reuse setting
+    let cli_reuse = if fresh {
+        Some(false)
+    } else if reuse {
+        Some(true)
+    } else {
+        None
+    };
+    let resolved_reuse = config_resolver.resolve_reuse(cli_reuse);
+    logger.log_v(
+        "config",
+        &format!(
+            "reuse: {} (from: {})",
+            resolved_reuse.value, resolved_reuse.source
+        ),
+    );
+
+    // Print run info
     println!("Replaying: {}", resolved_id);
     println!("Command: {:?}", run.exec.argv);
     println!("Commit: {}", run.code_state.base_commit);
-
     if run.code_state.patch.is_some() {
-        println!("Note: This run has a patch - you may need to restore the code state first");
+        println!("Patch: yes");
+    }
+
+    // Restore code state in worktree
+    let worktree_result = git.restore_code_state_in_worktree(
+        &run.code_state,
+        run_id,
+        &resolved_worktree_dir.value,
+        resolved_reuse.value,
+        &logger,
+    )?;
+
+    if worktree_result.reused {
+        println!(
+            "Reusing existing worktree: {}",
+            worktree_result.worktree_path.display()
+        );
+    } else {
+        println!(
+            "Created worktree: {}",
+            worktree_result.worktree_path.display()
+        );
+    }
+
+    // Resolve the execution directory relative to worktree
+    let exec_cwd = if Path::new(&run.exec.cwd).is_absolute() {
+        // If cwd is absolute, make it relative to worktree
+        PathBuf::from(&run.exec.cwd)
+    } else {
+        // Relative path - combine with worktree
+        worktree_result.worktree_path.join(&run.exec.cwd)
+    };
+
+    logger.log_vv("exec", &format!("cwd: {}", exec_cwd.display()));
+    logger.log_vv("exec", &format!("argv: {:?}", run.exec.argv));
+    if !run.exec.env.is_empty() {
+        logger.log_vvv("exec", &format!("env: {:?}", run.exec.env));
     }
 
     // Execute
     println!("\nExecuting...");
     let status = Command::new(&run.exec.argv[0])
         .args(&run.exec.argv[1..])
-        .current_dir(&run.exec.cwd)
+        .current_dir(&exec_cwd)
         .envs(&run.exec.env)
         .status()
         .context("Failed to execute command")?;
+
+    let exit_code = status.code().unwrap_or(-1);
+    logger.log_vv("exec", &format!("exit_code: {}", exit_code));
 
     if status.success() {
         println!("\nReplay completed successfully");
     } else {
         println!("\nReplay failed with status: {:?}", status.code());
+    }
+
+    // Cleanup if requested
+    if resolved_cleanup.value {
+        println!("Cleaning up worktree...");
+        git.remove_worktree(&worktree_result.worktree_path, &logger)?;
+        println!("Worktree removed");
+    } else {
+        println!(
+            "Worktree kept at: {}",
+            worktree_result.worktree_path.display()
+        );
     }
 
     Ok(())
