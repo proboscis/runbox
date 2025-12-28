@@ -38,6 +38,7 @@ impl Storage {
         fs::create_dir_all(base_dir.join("runs"))?;
         fs::create_dir_all(base_dir.join("templates"))?;
         fs::create_dir_all(base_dir.join("playlists"))?;
+        fs::create_dir_all(base_dir.join("logs"))?;
 
         Ok(Self { base_dir })
     }
@@ -101,6 +102,16 @@ impl Storage {
         let path = self.base_dir.join("runs").join(format!("{}.json", run_id));
         fs::remove_file(&path).with_context(|| format!("Run not found: {}", run_id))?;
         Ok(())
+    }
+
+    /// Get the log path for a run
+    pub fn log_path(&self, run_id: &str) -> PathBuf {
+        self.base_dir.join("logs").join(format!("{}.log", run_id))
+    }
+
+    /// Get the logs directory
+    pub fn logs_dir(&self) -> PathBuf {
+        self.base_dir.join("logs")
     }
 
     // === Template operations ===

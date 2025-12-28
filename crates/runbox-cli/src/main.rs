@@ -1,12 +1,17 @@
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use anyhow::{bail, Context, Result};
+use chrono::Utc;
+use clap::{Parser, Subcommand, ValueEnum};
 use dialoguer::{theme::ColorfulTheme, Input};
 use runbox_core::{
-    short_id, BindingResolver, ConfigResolver, GitContext, Playlist, PlaylistItem, RunTemplate,
-    Storage, Validator, VerboseLogger,
+    short_id, BindingResolver, ConfigResolver, GitContext, LogRef, Playlist, PlaylistItem,
+    RunStatus, RunTemplate, RuntimeRegistry, Storage, Timeline, Validator, VerboseLogger,
 };
+use std::fs::File;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "runbox")]
@@ -14,6 +19,27 @@ use std::process::Command;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Runtime type for execution
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum RuntimeType {
+    /// Background process (default)
+    #[default]
+    Bg,
+    /// Background process (alias)
+    Background,
+    /// Tmux window
+    Tmux,
+}
+
+impl std::fmt::Display for RuntimeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RuntimeType::Bg | RuntimeType::Background => write!(f, "background"),
+            RuntimeType::Tmux => write!(f, "tmux"),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -28,9 +54,58 @@ enum Commands {
         #[arg(short, long)]
         binding: Vec<String>,
 
+        /// Runtime environment (bg, background, tmux)
+        #[arg(long, default_value = "bg")]
+        runtime: RuntimeType,
+
         /// Skip execution (dry run)
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// List running and recent runs
+    Ps {
+        /// Filter by status
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Show all runs (not just recent)
+        #[arg(short, long)]
+        all: bool,
+
+        /// Limit number of results
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+
+    /// Stop a running process
+    Stop {
+        /// Run ID (or short ID)
+        run_id: String,
+
+        /// Force kill (SIGKILL instead of SIGTERM)
+        #[arg(long, short)]
+        force: bool,
+    },
+
+    /// Show logs for a run
+    Logs {
+        /// Run ID (or short ID)
+        run_id: String,
+
+        /// Follow log output (like tail -f)
+        #[arg(short, long)]
+        follow: bool,
+
+        /// Number of lines to show (default: all)
+        #[arg(short, long)]
+        lines: Option<usize>,
+    },
+
+    /// Attach to a running process (tmux only)
+    Attach {
+        /// Run ID (or short ID)
+        run_id: String,
     },
 
     /// Manage templates
@@ -54,7 +129,7 @@ enum Commands {
 
     /// Show details of a run
     Show {
-        /// Run ID
+        /// Run ID (or short ID)
         run_id: String,
     },
 
@@ -138,8 +213,17 @@ fn main() -> Result<()> {
         Commands::Run {
             template,
             binding,
+            runtime,
             dry_run,
-        } => cmd_run(&storage, &template, binding, dry_run),
+        } => cmd_run(&storage, &template, binding, runtime, dry_run),
+        Commands::Ps { status, all, limit } => cmd_ps(&storage, status, all, limit),
+        Commands::Stop { run_id, force } => cmd_stop(&storage, &run_id, force),
+        Commands::Logs {
+            run_id,
+            follow,
+            lines,
+        } => cmd_logs(&storage, &run_id, follow, lines),
+        Commands::Attach { run_id } => cmd_attach(&storage, &run_id),
         Commands::Template { command } => match command {
             TemplateCommands::List => cmd_template_list(&storage),
             TemplateCommands::Show { template_id } => cmd_template_show(&storage, &template_id),
@@ -186,7 +270,13 @@ fn main() -> Result<()> {
 
 // === Run Command ===
 
-fn cmd_run(storage: &Storage, template_id: &str, bindings: Vec<String>, dry_run: bool) -> Result<()> {
+fn cmd_run(
+    storage: &Storage,
+    template_id: &str,
+    bindings: Vec<String>,
+    runtime: RuntimeType,
+    dry_run: bool,
+) -> Result<()> {
     let resolved_template_id = storage.resolve_template_id(template_id)?;
     let template = storage.load_template(&resolved_template_id)?;
 
@@ -222,7 +312,7 @@ fn cmd_run(storage: &Storage, template_id: &str, bindings: Vec<String>, dry_run:
     let code_state = git.build_code_state(&temp_run_id)?;
 
     // Build run
-    let run = resolver.build_run(&template, code_state)?;
+    let mut run = resolver.build_run(&template, code_state)?;
 
     // Validate
     run.validate()?;
@@ -233,26 +323,334 @@ fn cmd_run(storage: &Storage, template_id: &str, bindings: Vec<String>, dry_run:
         return Ok(());
     }
 
-    // Save run
-    let path = storage.save_run(&run)?;
-    println!("Run saved: {}", path.display());
+    // Get runtime adapter
+    let registry = RuntimeRegistry::new();
+    let runtime_name = runtime.to_string();
+    let adapter = registry
+        .get(&runtime_name)
+        .context(format!("Unknown runtime: {}", runtime_name))?;
 
-    // Execute
-    println!("\nExecuting: {:?}", run.exec.argv);
-    let status = Command::new(&run.exec.argv[0])
-        .args(&run.exec.argv[1..])
-        .current_dir(&run.exec.cwd)
-        .envs(&run.exec.env)
-        .status()
-        .context("Failed to execute command")?;
+    // Set up log path
+    let log_path = storage.log_path(&run.run_id);
 
-    if status.success() {
-        println!("\nRun completed successfully: {}", run.run_id);
-    } else {
-        println!("\nRun failed with status: {:?}", status.code());
+    // Update run with runtime info
+    run.runtime = runtime_name.clone();
+    run.log_ref = Some(LogRef {
+        path: log_path.clone(),
+    });
+    run.timeline = Timeline {
+        created_at: Some(Utc::now()),
+        started_at: None,
+        ended_at: None,
+    };
+    run.status = RunStatus::Pending;
+
+    // Save run (before spawning)
+    storage.save_run(&run)?;
+
+    // Spawn process
+    println!("Starting run: {}", run.run_id);
+    println!("Runtime: {}", runtime_name);
+    println!("Command: {:?}", run.exec.argv);
+
+    let handle = adapter.spawn(&run.exec, &run.run_id, &log_path)?;
+
+    // Update run with handle and status
+    run.handle = Some(handle);
+    run.status = RunStatus::Running;
+    run.timeline.started_at = Some(Utc::now());
+
+    // Save updated run
+    storage.save_run(&run)?;
+
+    println!("Run started: {}", run.run_id);
+    println!("Short ID: {}", run.short_id());
+    println!("Logs: {}", log_path.display());
+
+    if matches!(runtime, RuntimeType::Tmux) {
+        println!("Attach with: runbox attach {}", run.short_id());
     }
 
     Ok(())
+}
+
+// === Ps Command ===
+
+fn cmd_ps(storage: &Storage, status_filter: Option<String>, _all: bool, limit: usize) -> Result<()> {
+    // First, reconcile running processes
+    reconcile_runs(storage)?;
+
+    let runs = storage.list_runs(limit)?;
+
+    if runs.is_empty() {
+        println!("No runs found.");
+        return Ok(());
+    }
+
+    // Filter by status if specified
+    let runs: Vec<_> = if let Some(ref status_str) = status_filter {
+        runs.into_iter()
+            .filter(|r| r.status.to_string() == *status_str)
+            .collect()
+    } else {
+        runs
+    };
+
+    println!(
+        "{:<12} {:<10} {:<10} {:<30}",
+        "SHORT ID", "STATUS", "RUNTIME", "COMMAND"
+    );
+    println!("{}", "-".repeat(70));
+
+    for run in runs {
+        let cmd = run.exec.argv.join(" ");
+        let cmd_truncated = if cmd.len() > 30 {
+            format!("{}...", &cmd[..27])
+        } else {
+            cmd
+        };
+        let runtime_display = if run.runtime.is_empty() {
+            "-"
+        } else {
+            &run.runtime
+        };
+
+        println!(
+            "{:<12} {:<10} {:<10} {:<30}",
+            run.short_id(),
+            run.status,
+            runtime_display,
+            cmd_truncated
+        );
+    }
+
+    Ok(())
+}
+
+// === Stop Command ===
+
+fn cmd_stop(storage: &Storage, run_id: &str, force: bool) -> Result<()> {
+    let full_run_id = resolve_run_id(storage, run_id)?;
+    let mut run = storage.load_run(&full_run_id)?;
+
+    // CAS: Only allow stopping if status is Running
+    if run.status != RunStatus::Running {
+        bail!("Run {} is not running (status: {})", run_id, run.status);
+    }
+
+    let registry = RuntimeRegistry::new();
+    let adapter = registry
+        .get(&run.runtime)
+        .context(format!("Unknown runtime: {}", run.runtime))?;
+
+    if let Some(ref handle) = run.handle {
+        adapter.stop(handle, force)?;
+
+        // Update run status (CAS: don't overwrite ended_at if already set)
+        run.status = RunStatus::Killed;
+        if run.timeline.ended_at.is_none() {
+            run.timeline.ended_at = Some(Utc::now());
+        }
+        storage.save_run(&run)?;
+
+        if force {
+            println!("Force stopped run: {}", full_run_id);
+        } else {
+            println!("Stopped run: {}", full_run_id);
+        }
+    } else {
+        bail!("Run {} has no handle", run_id);
+    }
+
+    Ok(())
+}
+
+// === Logs Command ===
+
+fn cmd_logs(storage: &Storage, run_id: &str, follow: bool, lines: Option<usize>) -> Result<()> {
+    let full_run_id = resolve_run_id(storage, run_id)?;
+    let run = storage.load_run(&full_run_id)?;
+
+    let log_path = if let Some(ref log_ref) = run.log_ref {
+        &log_ref.path
+    } else {
+        // Fallback to default log path
+        &storage.log_path(&full_run_id)
+    };
+
+    if !log_path.exists() {
+        bail!("Log file not found: {}", log_path.display());
+    }
+
+    if follow {
+        // Tail -f mode
+        let mut file = File::open(log_path)?;
+
+        // Show existing content first
+        let reader = BufReader::new(&file);
+        for line in reader.lines() {
+            println!("{}", line?);
+        }
+
+        // Then follow new content
+        loop {
+            let pos = file.stream_position()?;
+            file.seek(SeekFrom::End(0))?;
+            let end = file.stream_position()?;
+            file.seek(SeekFrom::Start(pos))?;
+
+            if end > pos {
+                let reader = BufReader::new(&file);
+                for line_result in reader.lines() {
+                    println!("{}", line_result?);
+                }
+            }
+
+            // Check if process is still running
+            if run.status != RunStatus::Running {
+                // Do one final read then exit
+                thread::sleep(Duration::from_millis(100));
+                let reader = BufReader::new(&file);
+                for line_result in reader.lines() {
+                    println!("{}", line_result?);
+                }
+                break;
+            }
+
+            thread::sleep(Duration::from_millis(100));
+        }
+    } else {
+        // Show all or last N lines
+        let content = std::fs::read_to_string(log_path)?;
+        let all_lines: Vec<&str> = content.lines().collect();
+
+        let lines_to_show = if let Some(n) = lines {
+            let start = all_lines.len().saturating_sub(n);
+            &all_lines[start..]
+        } else {
+            &all_lines[..]
+        };
+
+        for line in lines_to_show {
+            println!("{}", line);
+        }
+    }
+
+    Ok(())
+}
+
+// === Attach Command ===
+
+fn cmd_attach(storage: &Storage, run_id: &str) -> Result<()> {
+    let full_run_id = resolve_run_id(storage, run_id)?;
+    let run = storage.load_run(&full_run_id)?;
+
+    if run.runtime != "tmux" {
+        bail!(
+            "Attach is only supported for tmux runtime (current: {})",
+            if run.runtime.is_empty() {
+                "none"
+            } else {
+                &run.runtime
+            }
+        );
+    }
+
+    let registry = RuntimeRegistry::new();
+    let adapter = registry
+        .get(&run.runtime)
+        .context(format!("Unknown runtime: {}", run.runtime))?;
+
+    if let Some(ref handle) = run.handle {
+        adapter.attach(handle)?;
+    } else {
+        bail!("Run {} has no handle", run_id);
+    }
+
+    Ok(())
+}
+
+/// Resolve a short ID or full ID to a full run ID
+fn resolve_run_id(storage: &Storage, id: &str) -> Result<String> {
+    // If it already starts with "run_", assume it's a full ID
+    if id.starts_with("run_") {
+        // Verify it exists
+        storage.load_run(id)?;
+        return Ok(id.to_string());
+    }
+
+    // Otherwise, search for a matching short ID
+    let runs = storage.list_runs(usize::MAX)?;
+    let matches: Vec<_> = runs
+        .iter()
+        .filter(|r| r.short_id().starts_with(id))
+        .collect();
+
+    match matches.len() {
+        0 => bail!("No run found matching: {}", id),
+        1 => Ok(matches[0].run_id.clone()),
+        _ => {
+            eprintln!("Multiple runs match '{}':", id);
+            for run in &matches {
+                eprintln!("  {} ({})", run.short_id(), run.run_id);
+            }
+            bail!("Ambiguous run ID: {}", id);
+        }
+    }
+}
+
+/// Reconcile run statuses by checking if processes are still alive
+/// Uses CAS-style updates: only update if Running, don't overwrite ended_at
+fn reconcile_runs(storage: &Storage) -> Result<()> {
+    let runs = storage.list_runs(usize::MAX)?;
+    let registry = RuntimeRegistry::new();
+
+    for mut run in runs {
+        // CAS: Only reconcile Running runs (don't transition Unknown back to Running)
+        if run.status != RunStatus::Running {
+            continue;
+        }
+
+        let Some(ref handle) = run.handle else {
+            // Running status but no handle - mark as unknown with reason
+            mark_unknown(&mut run, "no runtime handle");
+            storage.save_run(&run)?;
+            continue;
+        };
+
+        let Some(adapter) = registry.get(&run.runtime) else {
+            continue;
+        };
+
+        if !adapter.is_alive(handle) {
+            // Process is dead but status is still Running - mark as unknown with reason
+            let reason = match handle {
+                runbox_core::RuntimeHandle::Background { pid, .. } => {
+                    format!("process {} not found", pid)
+                }
+                runbox_core::RuntimeHandle::Tmux { session, window } => {
+                    format!("tmux window '{}:{}' not found", session, window)
+                }
+                runbox_core::RuntimeHandle::Zellij { session, tab } => {
+                    format!("zellij tab '{}:{}' not found", session, tab)
+                }
+            };
+            mark_unknown(&mut run, &reason);
+            storage.save_run(&run)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Mark a run as Unknown with a reason (CAS-style: don't overwrite ended_at)
+fn mark_unknown(run: &mut runbox_core::Run, reason: &str) {
+    run.status = RunStatus::Unknown;
+    run.reconcile_reason = Some(reason.to_string());
+    // CAS: Don't overwrite ended_at if already set
+    if run.timeline.ended_at.is_none() {
+        run.timeline.ended_at = Some(Utc::now());
+    }
 }
 
 // === Template Commands ===
@@ -408,7 +806,44 @@ fn cmd_history(storage: &Storage, limit: usize) -> Result<()> {
 fn cmd_show(storage: &Storage, run_id: &str) -> Result<()> {
     let resolved_id = storage.resolve_run_id(run_id)?;
     let run = storage.load_run(&resolved_id)?;
-    println!("{}", serde_json::to_string_pretty(&run)?);
+
+    // Display formatted output
+    println!("Run ID:     {}", run.run_id);
+    println!("Short ID:   {}", run.short_id());
+    println!("Status:     {}", run.status);
+    println!("Runtime:    {}", if run.runtime.is_empty() { "-" } else { &run.runtime });
+    println!();
+    println!("Command:    {:?}", run.exec.argv);
+    println!("Cwd:        {}", run.exec.cwd);
+    if !run.exec.env.is_empty() {
+        println!("Env:        {:?}", run.exec.env);
+    }
+    println!();
+    println!("Repo:       {}", run.code_state.repo_url);
+    println!("Commit:     {}", run.code_state.base_commit);
+    if run.code_state.patch.is_some() {
+        println!("Patch:      yes");
+    }
+    println!();
+    if let Some(ref timeline) = run.timeline.created_at.as_ref() {
+        println!("Created:    {}", timeline);
+    }
+    if let Some(ref timeline) = run.timeline.started_at.as_ref() {
+        println!("Started:    {}", timeline);
+    }
+    if let Some(ref timeline) = run.timeline.ended_at.as_ref() {
+        println!("Ended:      {}", timeline);
+    }
+    if let Some(exit_code) = run.exit_code {
+        println!("Exit Code:  {}", exit_code);
+    }
+    if let Some(ref reason) = run.reconcile_reason {
+        println!("Reconcile:  {}", reason);
+    }
+    if let Some(ref log_ref) = run.log_ref {
+        println!("Log:        {}", log_ref.path.display());
+    }
+
     Ok(())
 }
 
