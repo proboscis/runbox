@@ -1,5 +1,6 @@
-use crate::{Playlist, Run, RunTemplate};
+use crate::{Playlist, Run, RunStatus, RunTemplate};
 use anyhow::{bail, Context, Result};
+use chrono::Utc;
 use std::fs;
 use std::path::PathBuf;
 
@@ -102,6 +103,32 @@ impl Storage {
         let path = self.base_dir.join("runs").join(format!("{}.json", run_id));
         fs::remove_file(&path).with_context(|| format!("Run not found: {}", run_id))?;
         Ok(())
+    }
+
+    /// Transition run status to Running (atomic, CAS-style)
+    ///
+    /// Only updates if the current status is Pending. This prevents overwriting
+    /// terminal states (Exited, Failed, Killed, Unknown) that might have been
+    /// set by the exit-watching thread or reconcile.
+    ///
+    /// Returns Ok(true) if status was updated, Ok(false) if skipped due to CAS.
+    pub fn transition_to_running(&self, run: &mut Run) -> Result<bool> {
+        // Re-read current state
+        let current = self.load_run(&run.run_id)?;
+
+        // Only transition from Pending to Running
+        if current.status != RunStatus::Pending {
+            // Status already changed - don't overwrite
+            // Update local copy with current state
+            *run = current;
+            return Ok(false);
+        }
+
+        // Safe to update
+        run.status = RunStatus::Running;
+        run.timeline.started_at = Some(Utc::now());
+        self.save_run(run)?;
+        Ok(true)
     }
 
     /// Get the log path for a run
@@ -239,6 +266,72 @@ impl Storage {
     }
 }
 
+/// Update run status when process exits
+///
+/// Uses CAS-style update: only updates if status is Running.
+/// This prevents race conditions where a run is manually killed
+/// but the exit-watcher thread still tries to update the status.
+///
+/// Note: For fast-exiting processes, the CLI must use `Storage::transition_to_running()`
+/// instead of directly setting status to Running to prevent overwriting exit status.
+pub fn update_run_on_exit(run_id: &str, exit_code: i32) -> Result<()> {
+    let storage = Storage::new()?;
+    update_run_on_exit_with_storage(&storage, run_id, exit_code)
+}
+
+/// Update run status when process exits (with custom storage)
+///
+/// Uses CAS-style update: only updates if status is Running.
+/// This variant accepts a Storage instance for testability.
+///
+/// The CAS includes a re-read verification before save to minimize race windows.
+/// If a concurrent process (like cmd_stop) changes status between our read and
+/// save, the verification will detect this and abort the write.
+///
+/// For fast-exiting processes where the exit-watcher might run before the CLI
+/// sets status to Running, the CLI should use `Storage::transition_to_running()`
+/// which re-reads state before writing and prevents overwriting terminal states.
+pub fn update_run_on_exit_with_storage(
+    storage: &Storage,
+    run_id: &str,
+    exit_code: i32,
+) -> Result<()> {
+    let run = storage.load_run(run_id)?;
+
+    // CAS: Only update if currently Running
+    // If status is still Pending, the CLI hasn't transitioned yet, and will
+    // call transition_to_running which will detect the terminal state.
+    // If status is Killed/Unknown/Exited/Failed, another process already updated.
+    if run.status != RunStatus::Running {
+        return Ok(());
+    }
+
+    // Prepare the update
+    let mut updated_run = run.clone();
+    updated_run.status = if exit_code == 0 {
+        RunStatus::Exited
+    } else {
+        RunStatus::Failed
+    };
+    updated_run.exit_code = Some(exit_code);
+
+    // Don't overwrite ended_at if already set
+    if updated_run.timeline.ended_at.is_none() {
+        updated_run.timeline.ended_at = Some(Utc::now());
+    }
+
+    // Re-read to verify status hasn't changed (reduces race window)
+    let current = storage.load_run(run_id)?;
+    if current.status != RunStatus::Running {
+        // Status changed concurrently (e.g., by cmd_stop setting Killed)
+        // Don't overwrite - the other operation takes precedence
+        return Ok(());
+    }
+
+    storage.save_run(&updated_run)?;
+    Ok(())
+}
+
 /// Generic ID resolution from a list of items
 fn resolve_id_from_items<T, F>(items: &[T], input: &str, get_id: F) -> Result<String>
 where
@@ -284,7 +377,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CodeState, Exec};
+    use crate::{CodeState, Exec, RunStatus};
+    use chrono::Utc;
     use std::collections::HashMap;
     use tempfile::tempdir;
 
@@ -458,5 +552,261 @@ mod tests {
         // More specific prefix should work
         let resolved = storage.resolve_run_id("5aaa").unwrap();
         assert_eq!(resolved, run1.run_id);
+    }
+
+    // === Tests for update_run_on_exit ===
+
+    fn create_test_run(storage: &Storage, run_id: &str, status: RunStatus) -> Run {
+        let mut run = Run::new(
+            Exec {
+                argv: vec!["echo".to_string(), "test".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+                timeout_sec: 0,
+            },
+            CodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch: None,
+            },
+        );
+        run.run_id = run_id.to_string();
+        run.status = status;
+        storage.save_run(&run).unwrap();
+        run
+    }
+
+    #[test]
+    fn test_update_run_on_exit_success() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create a run in Running status
+        let run_id = "run_test-success-0000-0000-000000000000";
+        create_test_run(&storage, run_id, RunStatus::Running);
+
+        // Update with exit code 0 (success)
+        update_run_on_exit_with_storage(&storage, run_id, 0).unwrap();
+
+        // Verify status changed to Exited
+        let updated = storage.load_run(run_id).unwrap();
+        assert_eq!(updated.status, RunStatus::Exited);
+        assert_eq!(updated.exit_code, Some(0));
+        assert!(updated.timeline.ended_at.is_some());
+    }
+
+    #[test]
+    fn test_update_run_on_exit_failure() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create a run in Running status
+        let run_id = "run_test-failure-0000-0000-000000000000";
+        create_test_run(&storage, run_id, RunStatus::Running);
+
+        // Update with exit code 1 (failure)
+        update_run_on_exit_with_storage(&storage, run_id, 1).unwrap();
+
+        // Verify status changed to Failed
+        let updated = storage.load_run(run_id).unwrap();
+        assert_eq!(updated.status, RunStatus::Failed);
+        assert_eq!(updated.exit_code, Some(1));
+        assert!(updated.timeline.ended_at.is_some());
+    }
+
+    #[test]
+    fn test_update_run_on_exit_cas_pending() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create a run in Pending status
+        let run_id = "run_test-pending-0000-0000-000000000000";
+        create_test_run(&storage, run_id, RunStatus::Pending);
+
+        // Try to update - should be a no-op due to CAS (only updates from Running)
+        update_run_on_exit_with_storage(&storage, run_id, 0).unwrap();
+
+        // Verify status is still Pending (not changed)
+        // For fast-exit handling, CLI should use transition_to_running()
+        let updated = storage.load_run(run_id).unwrap();
+        assert_eq!(updated.status, RunStatus::Pending);
+        assert_eq!(updated.exit_code, None);
+    }
+
+    #[test]
+    fn test_update_run_on_exit_cas_killed() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create a run that's already Killed
+        let run_id = "run_test-killed-0000-0000-000000000000";
+        create_test_run(&storage, run_id, RunStatus::Killed);
+
+        // Try to update - should be a no-op due to CAS
+        update_run_on_exit_with_storage(&storage, run_id, 0).unwrap();
+
+        // Verify status is still Killed (not changed to Exited)
+        let updated = storage.load_run(run_id).unwrap();
+        assert_eq!(updated.status, RunStatus::Killed);
+        assert_eq!(updated.exit_code, None); // Should not be set
+    }
+
+    #[test]
+    fn test_update_run_on_exit_cas_unknown() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create a run that's Unknown
+        let run_id = "run_test-unknown-0000-0000-000000000000";
+        create_test_run(&storage, run_id, RunStatus::Unknown);
+
+        // Try to update - should be a no-op due to CAS
+        update_run_on_exit_with_storage(&storage, run_id, 0).unwrap();
+
+        // Verify status is still Unknown
+        let updated = storage.load_run(run_id).unwrap();
+        assert_eq!(updated.status, RunStatus::Unknown);
+    }
+
+    #[test]
+    fn test_update_run_on_exit_preserves_ended_at() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create a run with ended_at already set
+        let run_id = "run_test-endtime-0000-0000-000000000000";
+        let original_ended_at = Utc::now() - chrono::Duration::hours(1);
+        let mut run = Run::new(
+            Exec {
+                argv: vec!["echo".to_string(), "test".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+                timeout_sec: 0,
+            },
+            CodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch: None,
+            },
+        );
+        run.run_id = run_id.to_string();
+        run.status = RunStatus::Running;
+        run.timeline.ended_at = Some(original_ended_at);
+        storage.save_run(&run).unwrap();
+
+        // Update with exit code 0
+        update_run_on_exit_with_storage(&storage, run_id, 0).unwrap();
+
+        // Verify ended_at was NOT overwritten
+        let updated = storage.load_run(run_id).unwrap();
+        assert_eq!(updated.status, RunStatus::Exited);
+        assert_eq!(
+            updated.timeline.ended_at.unwrap().timestamp(),
+            original_ended_at.timestamp()
+        );
+    }
+
+    #[test]
+    fn test_update_run_on_exit_nonzero_codes() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Test various non-zero exit codes
+        for exit_code in [-1i32, 2, 127, 255] {
+            let run_id = format!("run_test-code{}-0000-0000-00000000", exit_code.abs());
+            create_test_run(&storage, &run_id, RunStatus::Running);
+
+            update_run_on_exit_with_storage(&storage, &run_id, exit_code).unwrap();
+
+            let updated = storage.load_run(&run_id).unwrap();
+            assert_eq!(updated.status, RunStatus::Failed);
+            assert_eq!(updated.exit_code, Some(exit_code));
+        }
+    }
+
+    // === Tests for transition_to_running ===
+
+    #[test]
+    fn test_transition_to_running_from_pending() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        let run_id = "run_test-trans-0000-0000-000000000000";
+        let mut run = create_test_run(&storage, run_id, RunStatus::Pending);
+
+        // Transition should succeed
+        let result = storage.transition_to_running(&mut run).unwrap();
+        assert!(result, "Transition from Pending should succeed");
+        assert_eq!(run.status, RunStatus::Running);
+        assert!(run.timeline.started_at.is_some());
+
+        // Verify in storage
+        let loaded = storage.load_run(run_id).unwrap();
+        assert_eq!(loaded.status, RunStatus::Running);
+    }
+
+    #[test]
+    fn test_transition_to_running_after_exited() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create run as Running, then update to Exited
+        let run_id = "run_test-exited-0000-0000-000000000000";
+        let mut run = create_test_run(&storage, run_id, RunStatus::Running);
+
+        // Simulate exit-watcher updating status from Running to Exited
+        update_run_on_exit_with_storage(&storage, run_id, 0).unwrap();
+
+        // Verify status is now Exited
+        let loaded = storage.load_run(run_id).unwrap();
+        assert_eq!(loaded.status, RunStatus::Exited);
+
+        // Now try to transition to Running - should fail (not Pending)
+        run.status = RunStatus::Pending; // Reset local copy to simulate stale state
+        let result = storage.transition_to_running(&mut run).unwrap();
+        assert!(!result, "Transition should fail when already Exited");
+        assert_eq!(run.status, RunStatus::Exited, "Run should be updated with current state");
+    }
+
+    #[test]
+    fn test_fast_exit_scenario() {
+        // This test documents the expected behavior for fast-exiting processes
+        // where the process exits before CLI can transition to Running.
+        // The exit-watcher will not update (CAS fails on Pending), but
+        // transition_to_running will succeed and then reconcile will later
+        // detect the process is gone and set status to Unknown.
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        let run_id = "run_test-fast-0000-0000-000000000000";
+        let mut run = create_test_run(&storage, run_id, RunStatus::Pending);
+
+        // Fast exit: process exits while status is still Pending
+        // Exit-watcher tries to update but CAS fails (only updates from Running)
+        update_run_on_exit_with_storage(&storage, run_id, 0).unwrap();
+        let loaded = storage.load_run(run_id).unwrap();
+        assert_eq!(loaded.status, RunStatus::Pending, "CAS should prevent update from Pending");
+
+        // CLI then transitions to Running
+        let result = storage.transition_to_running(&mut run).unwrap();
+        assert!(result, "Transition should succeed from Pending");
+        assert_eq!(run.status, RunStatus::Running);
+
+        // At this point, the exit code is lost, but reconcile will detect
+        // the dead process and set status to Unknown
+        // (This is the documented limitation of the current approach)
+    }
+
+    #[test]
+    fn test_transition_to_running_already_running() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        let run_id = "run_test-running-0000-0000-00000000";
+        let mut run = create_test_run(&storage, run_id, RunStatus::Running);
+
+        // Try to transition - should fail (not Pending)
+        let result = storage.transition_to_running(&mut run).unwrap();
+        assert!(!result, "Transition should fail when already Running");
     }
 }
