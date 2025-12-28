@@ -14,6 +14,6 @@ pub use git::{GitContext, WorktreeInfo, WorktreeReplayResult};
 pub use playlist::{Playlist, PlaylistItem};
 pub use run::{CodeState, Exec, LogRef, Patch, Run, RunStatus, RuntimeHandle, Timeline};
 pub use runtime::{BackgroundAdapter, RuntimeAdapter, RuntimeRegistry, TmuxAdapter};
-pub use storage::Storage;
+pub use storage::{short_id, Storage};
 pub use template::{Bindings, RunTemplate, TemplateCodeState, TemplateExec};
 pub use validation::{ValidationType, Validator};
