@@ -1,6 +1,7 @@
-use crate::{Playlist, Run, RunTemplate};
+use crate::{Playlist, Run, RunStatus, RunTemplate};
 use anyhow::{Context, Result};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::PathBuf;
 
 /// Storage for runs, templates, and playlists
@@ -23,6 +24,7 @@ impl Storage {
         fs::create_dir_all(base_dir.join("runs"))?;
         fs::create_dir_all(base_dir.join("templates"))?;
         fs::create_dir_all(base_dir.join("playlists"))?;
+        fs::create_dir_all(base_dir.join("logs"))?;
 
         Ok(Self { base_dir })
     }
@@ -32,14 +34,45 @@ impl Storage {
         &self.base_dir
     }
 
+    /// Get the logs directory
+    pub fn logs_dir(&self) -> PathBuf {
+        self.base_dir.join("logs")
+    }
+
+    /// Get log file path for a run
+    pub fn log_path(&self, run_id: &str) -> PathBuf {
+        self.logs_dir().join(format!("{}.log", run_id))
+    }
+
     // === Run operations ===
 
-    /// Save a run
+    /// Save a run atomically (write to .tmp then rename)
     pub fn save_run(&self, run: &Run) -> Result<PathBuf> {
         let path = self.base_dir.join("runs").join(format!("{}.json", run.run_id));
+        let tmp_path = self.base_dir.join("runs").join(format!("{}.json.tmp", run.run_id));
+
         let json = serde_json::to_string_pretty(run)?;
-        fs::write(&path, json)?;
+
+        // Write to temp file first
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+
+        // Atomic rename
+        fs::rename(&tmp_path, &path)?;
+
         Ok(path)
+    }
+
+    /// Update a run (load, modify, save)
+    pub fn update_run<F>(&self, run_id: &str, f: F) -> Result<Run>
+    where
+        F: FnOnce(&mut Run),
+    {
+        let mut run = self.load_run(run_id)?;
+        f(&mut run);
+        self.save_run(&run)?;
+        Ok(run)
     }
 
     /// Load a run by ID
@@ -81,10 +114,30 @@ impl Storage {
         Ok(runs)
     }
 
+    /// List runs filtered by status
+    pub fn list_runs_by_status(&self, status: Option<RunStatus>, limit: usize) -> Result<Vec<Run>> {
+        let runs = self.list_runs(limit * 10)?; // Fetch more to account for filtering
+        let filtered: Vec<Run> = runs
+            .into_iter()
+            .filter(|r| status.as_ref().map(|s| &r.status == s).unwrap_or(true))
+            .take(limit)
+            .collect();
+        Ok(filtered)
+    }
+
     /// Delete a run by ID
     pub fn delete_run(&self, run_id: &str) -> Result<()> {
         let path = self.base_dir.join("runs").join(format!("{}.json", run_id));
         fs::remove_file(&path).with_context(|| format!("Run not found: {}", run_id))?;
+        Ok(())
+    }
+
+    /// Delete a run's log file
+    pub fn delete_log(&self, run_id: &str) -> Result<()> {
+        let path = self.log_path(run_id);
+        if path.exists() {
+            fs::remove_file(&path)?;
+        }
         Ok(())
     }
 

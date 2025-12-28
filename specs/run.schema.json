@@ -76,6 +76,36 @@
                 "ref",
                 "sha256"
             ]
+        },
+        "#LogRef": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "path": {
+                    "type": "string"
+                }
+            },
+            "required": [
+                "path"
+            ]
+        },
+        "#Timeline": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "created_at": {
+                    "type": "string",
+                    "format": "date-time"
+                },
+                "started_at": {
+                    "type": "string",
+                    "format": "date-time"
+                },
+                "ended_at": {
+                    "type": "string",
+                    "format": "date-time"
+                }
+            }
         }
     },
     "type": "object",
@@ -93,6 +123,33 @@
         },
         "run_version": {
             "const": 0
+        },
+        "status": {
+            "type": "string",
+            "enum": ["pending", "running", "exited", "failed", "killed"],
+            "default": "pending"
+        },
+        "runtime": {
+            "type": "string",
+            "enum": ["background", "tmux", "zellij"],
+            "default": "background"
+        },
+        "session_ref": {
+            "type": "string",
+            "description": "Runtime-specific session reference (e.g., 'tmux:session=runbox;window=run_xxx')"
+        },
+        "log_ref": {
+            "$ref": "#/$defs/#LogRef"
+        },
+        "timeline": {
+            "$ref": "#/$defs/#Timeline"
+        },
+        "exit_code": {
+            "type": "integer"
+        },
+        "pid": {
+            "type": "integer",
+            "description": "Process ID for background runtime"
         }
     },
     "required": [

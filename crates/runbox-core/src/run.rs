@@ -1,13 +1,115 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// A fully-resolved, reproducible execution record
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Run {
     pub run_version: u32,
     pub run_id: String,
+
+    // Existing (required)
     pub exec: Exec,
     pub code_state: CodeState,
+
+    // New fields for execution management
+    #[serde(default)]
+    pub status: RunStatus,
+
+    #[serde(default)]
+    pub runtime: Runtime,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_ref: Option<LogRef>,
+
+    #[serde(default)]
+    pub timeline: Timeline,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+}
+
+/// Run execution status
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RunStatus {
+    #[default]
+    Pending,
+    Running,
+    Exited,
+    Failed,
+    Killed,
+}
+
+impl std::fmt::Display for RunStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunStatus::Pending => write!(f, "pending"),
+            RunStatus::Running => write!(f, "running"),
+            RunStatus::Exited => write!(f, "exited"),
+            RunStatus::Failed => write!(f, "failed"),
+            RunStatus::Killed => write!(f, "killed"),
+        }
+    }
+}
+
+/// Runtime environment for execution
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Runtime {
+    #[default]
+    Background,
+    Tmux,
+    Zellij,
+}
+
+impl std::fmt::Display for Runtime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Runtime::Background => write!(f, "background"),
+            Runtime::Tmux => write!(f, "tmux"),
+            Runtime::Zellij => write!(f, "zellij"),
+        }
+    }
+}
+
+impl std::str::FromStr for Runtime {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "bg" | "background" => Ok(Runtime::Background),
+            "tmux" => Ok(Runtime::Tmux),
+            "zellij" => Ok(Runtime::Zellij),
+            _ => Err(format!("Unknown runtime: {}. Valid values: bg, tmux, zellij", s)),
+        }
+    }
+}
+
+/// Log file reference
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogRef {
+    pub path: PathBuf,
+}
+
+/// Timeline tracking for run execution
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Timeline {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
 }
 
 /// Execution specification
@@ -56,7 +158,61 @@ impl Run {
             run_id,
             exec,
             code_state,
+            status: RunStatus::Pending,
+            runtime: Runtime::Background,
+            session_ref: None,
+            log_ref: None,
+            timeline: Timeline {
+                created_at: Some(Utc::now()),
+                started_at: None,
+                ended_at: None,
+            },
+            exit_code: None,
+            pid: None,
         }
+    }
+
+    /// Create a new Run with specific runtime
+    pub fn new_with_runtime(exec: Exec, code_state: CodeState, runtime: Runtime) -> Self {
+        let mut run = Self::new(exec, code_state);
+        run.runtime = runtime;
+        run
+    }
+
+    /// Mark the run as started
+    pub fn mark_started(&mut self) {
+        self.status = RunStatus::Running;
+        self.timeline.started_at = Some(Utc::now());
+    }
+
+    /// Mark the run as completed with exit code
+    pub fn mark_completed(&mut self, exit_code: i32) {
+        self.status = if exit_code == 0 {
+            RunStatus::Exited
+        } else {
+            RunStatus::Failed
+        };
+        self.exit_code = Some(exit_code);
+        self.timeline.ended_at = Some(Utc::now());
+    }
+
+    /// Mark the run as killed
+    pub fn mark_killed(&mut self) {
+        self.status = RunStatus::Killed;
+        self.timeline.ended_at = Some(Utc::now());
+    }
+
+    /// Check if the run is currently running
+    pub fn is_running(&self) -> bool {
+        self.status == RunStatus::Running
+    }
+
+    /// Check if the run has finished (exited, failed, or killed)
+    pub fn is_finished(&self) -> bool {
+        matches!(
+            self.status,
+            RunStatus::Exited | RunStatus::Failed | RunStatus::Killed
+        )
     }
 
     /// Validate the Run
@@ -121,10 +277,81 @@ mod tests {
                 base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
                 patch: None,
             },
+            status: RunStatus::Pending,
+            runtime: Runtime::Background,
+            session_ref: None,
+            log_ref: None,
+            timeline: Timeline::default(),
+            exit_code: None,
+            pid: None,
         };
 
         let json = serde_json::to_string_pretty(&run).unwrap();
         let parsed: Run = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.run_id, run.run_id);
+        assert_eq!(parsed.status, RunStatus::Pending);
+    }
+
+    #[test]
+    fn test_run_status_transitions() {
+        let mut run = Run::new(
+            Exec {
+                argv: vec!["test".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+                timeout_sec: 0,
+            },
+            CodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch: None,
+            },
+        );
+
+        assert_eq!(run.status, RunStatus::Pending);
+        assert!(run.timeline.created_at.is_some());
+        assert!(run.timeline.started_at.is_none());
+
+        run.mark_started();
+        assert_eq!(run.status, RunStatus::Running);
+        assert!(run.is_running());
+        assert!(run.timeline.started_at.is_some());
+
+        run.mark_completed(0);
+        assert_eq!(run.status, RunStatus::Exited);
+        assert!(run.is_finished());
+        assert_eq!(run.exit_code, Some(0));
+        assert!(run.timeline.ended_at.is_some());
+    }
+
+    #[test]
+    fn test_run_failed_status() {
+        let mut run = Run::new(
+            Exec {
+                argv: vec!["test".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+                timeout_sec: 0,
+            },
+            CodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch: None,
+            },
+        );
+
+        run.mark_started();
+        run.mark_completed(1);
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.exit_code, Some(1));
+    }
+
+    #[test]
+    fn test_runtime_from_str() {
+        assert_eq!("bg".parse::<Runtime>().unwrap(), Runtime::Background);
+        assert_eq!("background".parse::<Runtime>().unwrap(), Runtime::Background);
+        assert_eq!("tmux".parse::<Runtime>().unwrap(), Runtime::Tmux);
+        assert_eq!("zellij".parse::<Runtime>().unwrap(), Runtime::Zellij);
+        assert!("invalid".parse::<Runtime>().is_err());
     }
 }
