@@ -1,10 +1,13 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use dialoguer::{theme::ColorfulTheme, Input};
 use runbox_core::{
-    BindingResolver, ConfigResolver, GitContext, Playlist, PlaylistItem, RunTemplate, Storage,
+    available_runtimes, get_adapter, BindingResolver, ConfigResolver, GitContext, LogRef,
+    Playlist, PlaylistItem, Run, RunStatus, RunTemplate, RuntimeHandle, Storage, Timeline,
     Validator, VerboseLogger,
 };
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -31,6 +34,47 @@ enum Commands {
         /// Skip execution (dry run)
         #[arg(long)]
         dry_run: bool,
+
+        /// Runtime: background (bg) or tmux (default: background)
+        #[arg(long, default_value = "background")]
+        runtime: String,
+    },
+
+    /// List running and recent runs
+    Ps {
+        /// Filter by status (running, exited, failed, etc.)
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Number of runs to show (default: 20)
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+
+    /// Stop a running process
+    Stop {
+        /// Run ID (full or short)
+        run_id: String,
+    },
+
+    /// View logs for a run
+    Logs {
+        /// Run ID (full or short)
+        run_id: String,
+
+        /// Follow log output (like tail -f)
+        #[arg(short, long)]
+        follow: bool,
+
+        /// Number of lines to show (default: all)
+        #[arg(short = 'n', long)]
+        lines: Option<usize>,
+    },
+
+    /// Attach to a running process (tmux/zellij only)
+    Attach {
+        /// Run ID (full or short)
+        run_id: String,
     },
 
     /// Manage templates
@@ -139,7 +183,16 @@ fn main() -> Result<()> {
             template,
             binding,
             dry_run,
-        } => cmd_run(&storage, &template, binding, dry_run),
+            runtime,
+        } => cmd_run(&storage, &template, binding, dry_run, &runtime),
+        Commands::Ps { status, limit } => cmd_ps(&storage, status, limit),
+        Commands::Stop { run_id } => cmd_stop(&storage, &run_id),
+        Commands::Logs {
+            run_id,
+            follow,
+            lines,
+        } => cmd_logs(&storage, &run_id, follow, lines),
+        Commands::Attach { run_id } => cmd_attach(&storage, &run_id),
         Commands::Template { command } => match command {
             TemplateCommands::List => cmd_template_list(&storage),
             TemplateCommands::Show { template_id } => cmd_template_show(&storage, &template_id),
@@ -186,7 +239,17 @@ fn main() -> Result<()> {
 
 // === Run Command ===
 
-fn cmd_run(storage: &Storage, template_id: &str, bindings: Vec<String>, dry_run: bool) -> Result<()> {
+fn cmd_run(
+    storage: &Storage,
+    template_id: &str,
+    bindings: Vec<String>,
+    dry_run: bool,
+    runtime_name: &str,
+) -> Result<()> {
+    // Validate runtime
+    let adapter = get_adapter(runtime_name)
+        .ok_or_else(|| anyhow::anyhow!("Unknown runtime: {}. Available: {:?}", runtime_name, available_runtimes()))?;
+
     let template = storage.load_template(template_id)?;
 
     // Create interactive callback
@@ -220,8 +283,8 @@ fn cmd_run(storage: &Storage, template_id: &str, bindings: Vec<String>, dry_run:
     let temp_run_id = format!("run_{}", uuid::Uuid::new_v4());
     let code_state = git.build_code_state(&temp_run_id)?;
 
-    // Build run
-    let run = resolver.build_run(&template, code_state)?;
+    // Build run (this creates a Run with Pending status)
+    let mut run = resolver.build_run(&template, code_state)?;
 
     // Validate
     run.validate()?;
@@ -232,23 +295,44 @@ fn cmd_run(storage: &Storage, template_id: &str, bindings: Vec<String>, dry_run:
         return Ok(());
     }
 
-    // Save run
+    // Set runtime and log path
+    let log_path = storage.log_path(&run.run_id);
+    run.runtime = adapter.name().to_string();
+    run.log_ref = Some(LogRef {
+        path: log_path.clone(),
+    });
+    run.timeline = Timeline {
+        created_at: Some(Utc::now()),
+        started_at: None,
+        ended_at: None,
+    };
+
+    // Save run before spawning
+    storage.save_run(&run)?;
+
+    // Spawn the process
+    println!("Starting run: {}", run.run_id);
+    println!("Runtime: {}", adapter.name());
+    println!("Command: {:?}", run.exec.argv);
+
+    let handle = adapter.spawn(&run.exec, &run.run_id, &log_path)?;
+
+    // Update run with handle and status
+    run.handle = Some(handle);
+    run.status = RunStatus::Running;
+    run.timeline.started_at = Some(Utc::now());
+
+    // Save updated run
     let path = storage.save_run(&run)?;
+
+    println!("\nRun started: {}", run.run_id);
+    println!("Log file: {}", log_path.display());
     println!("Run saved: {}", path.display());
+    println!("\nUse 'runbox logs {}' to view output", run.short_id());
+    println!("Use 'runbox stop {}' to stop the run", run.short_id());
 
-    // Execute
-    println!("\nExecuting: {:?}", run.exec.argv);
-    let status = Command::new(&run.exec.argv[0])
-        .args(&run.exec.argv[1..])
-        .current_dir(&run.exec.cwd)
-        .envs(&run.exec.env)
-        .status()
-        .context("Failed to execute command")?;
-
-    if status.success() {
-        println!("\nRun completed successfully: {}", run.run_id);
-    } else {
-        println!("\nRun failed with status: {:?}", status.code());
+    if adapter.name() == "tmux" {
+        println!("Use 'runbox attach {}' to attach to tmux", run.short_id());
     }
 
     Ok(())
@@ -398,8 +482,330 @@ fn cmd_history(storage: &Storage, limit: usize) -> Result<()> {
 }
 
 fn cmd_show(storage: &Storage, run_id: &str) -> Result<()> {
-    let run = storage.load_run(run_id)?;
-    println!("{}", serde_json::to_string_pretty(&run)?);
+    let run = find_run(storage, run_id)?;
+
+    println!("Run ID:      {}", run.run_id);
+    println!("Short ID:    {}", run.short_id());
+    println!("Status:      {}", run.status);
+    println!("Runtime:     {}", if run.runtime.is_empty() { "none" } else { &run.runtime });
+    println!("Command:     {}", run.exec.argv.join(" "));
+    println!("Working Dir: {}", run.exec.cwd);
+
+    if !run.exec.env.is_empty() {
+        println!("Environment:");
+        for (k, v) in &run.exec.env {
+            println!("  {}={}", k, v);
+        }
+    }
+
+    println!("\nCode State:");
+    println!("  Repo:   {}", run.code_state.repo_url);
+    println!("  Commit: {}", run.code_state.base_commit);
+    if let Some(patch) = &run.code_state.patch {
+        println!("  Patch:  {}", patch.ref_);
+    }
+
+    println!("\nTimeline:");
+    if let Some(created) = &run.timeline.created_at {
+        println!("  Created: {}", created);
+    }
+    if let Some(started) = &run.timeline.started_at {
+        println!("  Started: {}", started);
+    }
+    if let Some(ended) = &run.timeline.ended_at {
+        println!("  Ended:   {}", ended);
+    }
+
+    if let Some(exit_code) = run.exit_code {
+        println!("\nExit Code: {}", exit_code);
+    }
+
+    if let Some(log_ref) = &run.log_ref {
+        println!("\nLog File: {}", log_ref.path.display());
+    }
+
+    if let Some(handle) = &run.handle {
+        println!("\nRuntime Handle:");
+        match handle {
+            RuntimeHandle::Background { pid, pgid } => {
+                println!("  Type: Background");
+                println!("  PID:  {}", pid);
+                println!("  PGID: {}", pgid);
+            }
+            RuntimeHandle::Tmux { session, window } => {
+                println!("  Type:    Tmux");
+                println!("  Session: {}", session);
+                println!("  Window:  {}", window);
+            }
+            RuntimeHandle::Zellij { session, tab } => {
+                println!("  Type:    Zellij");
+                println!("  Session: {}", session);
+                println!("  Tab:     {}", tab);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Find a run by full ID or short ID
+fn find_run(storage: &Storage, run_id: &str) -> Result<Run> {
+    // Try loading by full ID first
+    if let Ok(run) = storage.load_run(run_id) {
+        return Ok(run);
+    }
+
+    // Try prefixing with "run_" if not already
+    if !run_id.starts_with("run_") {
+        let full_id = format!("run_{}", run_id);
+        if let Ok(run) = storage.load_run(&full_id) {
+            return Ok(run);
+        }
+    }
+
+    // Search by short ID prefix
+    let runs = storage.list_runs(1000)?;
+    let matches: Vec<_> = runs
+        .into_iter()
+        .filter(|r| r.short_id().starts_with(run_id) || r.run_id.contains(run_id))
+        .collect();
+
+    match matches.len() {
+        0 => bail!("Run not found: {}", run_id),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        _ => {
+            println!("Multiple matches found:");
+            for r in &matches {
+                println!("  {} ({})", r.short_id(), r.run_id);
+            }
+            bail!("Ambiguous run ID: {}", run_id)
+        }
+    }
+}
+
+/// Reconcile run statuses by checking if processes are still alive
+fn reconcile_runs(storage: &Storage) -> Result<()> {
+    let runs = storage.list_runs(1000)?;
+
+    for mut run in runs {
+        if run.status != RunStatus::Running {
+            continue;
+        }
+
+        let Some(ref handle) = run.handle else {
+            // Running without handle is invalid
+            run.status = RunStatus::Unknown;
+            run.timeline.ended_at = Some(Utc::now());
+            storage.save_run(&run)?;
+            continue;
+        };
+
+        let Some(adapter) = get_adapter(&run.runtime) else {
+            continue;
+        };
+
+        if !adapter.is_alive(handle) {
+            // Process is dead but status is Running - mark as Unknown
+            run.status = RunStatus::Unknown;
+            run.timeline.ended_at = Some(Utc::now());
+            storage.save_run(&run)?;
+        }
+    }
+
+    Ok(())
+}
+
+// === Process Status Command ===
+
+fn cmd_ps(storage: &Storage, status_filter: Option<String>, limit: usize) -> Result<()> {
+    // Run reconcile to update stale statuses
+    reconcile_runs(storage)?;
+
+    let runs = storage.list_runs(limit)?;
+
+    let filtered: Vec<_> = if let Some(ref filter) = status_filter {
+        let filter_status = match filter.to_lowercase().as_str() {
+            "pending" => RunStatus::Pending,
+            "running" => RunStatus::Running,
+            "exited" => RunStatus::Exited,
+            "failed" => RunStatus::Failed,
+            "killed" => RunStatus::Killed,
+            "unknown" => RunStatus::Unknown,
+            _ => bail!("Invalid status: {}. Valid: pending, running, exited, failed, killed, unknown", filter),
+        };
+        runs.into_iter().filter(|r| r.status == filter_status).collect()
+    } else {
+        runs
+    };
+
+    if filtered.is_empty() {
+        if status_filter.is_some() {
+            println!("No runs with status '{}'", status_filter.unwrap());
+        } else {
+            println!("No runs found.");
+        }
+        return Ok(());
+    }
+
+    println!(
+        "{:<10} {:<10} {:<12} {:<40}",
+        "SHORT_ID", "STATUS", "RUNTIME", "COMMAND"
+    );
+    println!("{}", "-".repeat(75));
+
+    for run in filtered {
+        let cmd = run.exec.argv.join(" ");
+        let cmd_truncated = if cmd.len() > 38 {
+            format!("{}...", &cmd[..35])
+        } else {
+            cmd
+        };
+        let runtime = if run.runtime.is_empty() {
+            "-"
+        } else {
+            &run.runtime
+        };
+
+        println!(
+            "{:<10} {:<10} {:<12} {:<40}",
+            run.short_id(),
+            run.status,
+            runtime,
+            cmd_truncated
+        );
+    }
+
+    Ok(())
+}
+
+// === Stop Command ===
+
+fn cmd_stop(storage: &Storage, run_id: &str) -> Result<()> {
+    let mut run = find_run(storage, run_id)?;
+
+    if run.status != RunStatus::Running {
+        bail!(
+            "Run {} is not running (status: {})",
+            run.short_id(),
+            run.status
+        );
+    }
+
+    let Some(ref handle) = run.handle else {
+        bail!("Run {} has no runtime handle", run.short_id());
+    };
+
+    let adapter = get_adapter(&run.runtime)
+        .ok_or_else(|| anyhow::anyhow!("Unknown runtime: {}", run.runtime))?;
+
+    println!("Stopping run {}...", run.short_id());
+    adapter.stop(handle)?;
+
+    // Update run status
+    run.status = RunStatus::Killed;
+    run.timeline.ended_at = Some(Utc::now());
+    storage.save_run(&run)?;
+
+    println!("Run {} stopped", run.short_id());
+    Ok(())
+}
+
+// === Logs Command ===
+
+fn cmd_logs(storage: &Storage, run_id: &str, follow: bool, lines: Option<usize>) -> Result<()> {
+    let run = find_run(storage, run_id)?;
+
+    let Some(ref log_ref) = run.log_ref else {
+        bail!("Run {} has no log file", run.short_id());
+    };
+
+    if !log_ref.path.exists() {
+        bail!("Log file not found: {}", log_ref.path.display());
+    }
+
+    if follow {
+        // Follow mode - similar to tail -f
+        let mut file = std::fs::File::open(&log_ref.path)?;
+        let mut reader = BufReader::new(&mut file);
+
+        // Print existing content
+        let mut line = String::new();
+        while reader.read_line(&mut line)? > 0 {
+            print!("{}", line);
+            line.clear();
+        }
+
+        // Follow new content
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    // No new content - check if process is still running
+                    if run.status != RunStatus::Running {
+                        break;
+                    }
+                    // Also check if process is actually alive
+                    if let (Some(ref handle), Some(adapter)) =
+                        (&run.handle, get_adapter(&run.runtime))
+                    {
+                        if !adapter.is_alive(handle) {
+                            println!("\n[Process exited]");
+                            break;
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Ok(_) => {
+                    print!("{}", line);
+                }
+                Err(e) => {
+                    eprintln!("Error reading log: {}", e);
+                    break;
+                }
+            }
+        }
+    } else {
+        // Regular mode - print all or last N lines
+        let content = std::fs::read_to_string(&log_ref.path)?;
+
+        if let Some(n) = lines {
+            let all_lines: Vec<_> = content.lines().collect();
+            let start = if all_lines.len() > n {
+                all_lines.len() - n
+            } else {
+                0
+            };
+            for line in &all_lines[start..] {
+                println!("{}", line);
+            }
+        } else {
+            print!("{}", content);
+        }
+    }
+
+    Ok(())
+}
+
+// === Attach Command ===
+
+fn cmd_attach(storage: &Storage, run_id: &str) -> Result<()> {
+    let run = find_run(storage, run_id)?;
+
+    if run.runtime == "background" {
+        bail!("Cannot attach to background runtime. Use 'runbox logs -f {}' instead.", run.short_id());
+    }
+
+    let Some(ref handle) = run.handle else {
+        bail!("Run {} has no runtime handle", run.short_id());
+    };
+
+    let adapter = get_adapter(&run.runtime)
+        .ok_or_else(|| anyhow::anyhow!("Unknown runtime: {}", run.runtime))?;
+
+    println!("Attaching to run {}...", run.short_id());
+    adapter.attach(handle)?;
+
+    // Note: attach() calls exec() and replaces this process, so we never reach here
     Ok(())
 }
 

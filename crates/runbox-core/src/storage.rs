@@ -23,8 +23,19 @@ impl Storage {
         fs::create_dir_all(base_dir.join("runs"))?;
         fs::create_dir_all(base_dir.join("templates"))?;
         fs::create_dir_all(base_dir.join("playlists"))?;
+        fs::create_dir_all(base_dir.join("logs"))?;
 
         Ok(Self { base_dir })
+    }
+
+    /// Get the logs directory
+    pub fn logs_dir(&self) -> PathBuf {
+        self.base_dir.join("logs")
+    }
+
+    /// Get the log path for a run
+    pub fn log_path(&self, run_id: &str) -> PathBuf {
+        self.logs_dir().join(format!("{}.log", run_id))
     }
 
     /// Get the base directory
