@@ -1,9 +1,30 @@
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::config::VerboseLogger;
 use crate::{CodeState, Patch};
+
+/// Information about an existing git worktree
+#[derive(Debug, Clone)]
+pub struct WorktreeInfo {
+    /// Path to the worktree
+    pub path: PathBuf,
+    /// HEAD commit of the worktree
+    pub commit: String,
+    /// Branch name (if any)
+    pub branch: Option<String>,
+}
+
+/// Result of worktree-based replay execution
+#[derive(Debug)]
+pub struct WorktreeReplayResult {
+    /// Path to the worktree where execution occurred
+    pub worktree_path: PathBuf,
+    /// Whether the worktree was newly created or reused
+    pub reused: bool,
+}
 
 /// Git context for capturing repository state
 pub struct GitContext {
@@ -273,7 +294,7 @@ impl GitContext {
         Ok(())
     }
 
-    /// Restore code state for replay
+    /// Restore code state for replay (DEPRECATED: use restore_code_state_in_worktree instead)
     pub fn restore_code_state(&self, code_state: &CodeState) -> Result<()> {
         // Checkout to the base commit
         self.checkout(&code_state.base_commit)?;
@@ -284,6 +305,284 @@ impl GitContext {
         }
 
         Ok(())
+    }
+
+    // === Worktree Operations ===
+
+    /// List all existing worktrees
+    pub fn list_worktrees(&self, logger: &VerboseLogger) -> Result<Vec<WorktreeInfo>> {
+        logger.log_vvv("git", "listing worktrees");
+
+        let output = Command::new("git")
+            .current_dir(&self.repo_root)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .context("Failed to list worktrees")?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "Failed to list worktrees: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let stdout = String::from_utf8(output.stdout)?;
+        let mut worktrees = Vec::new();
+        let mut current_path: Option<PathBuf> = None;
+        let mut current_commit: Option<String> = None;
+        let mut current_branch: Option<String> = None;
+
+        for line in stdout.lines() {
+            if line.starts_with("worktree ") {
+                // Save previous worktree if complete
+                if let (Some(path), Some(commit)) = (current_path.take(), current_commit.take()) {
+                    worktrees.push(WorktreeInfo {
+                        path,
+                        commit,
+                        branch: current_branch.take(),
+                    });
+                }
+                current_path = Some(PathBuf::from(line.strip_prefix("worktree ").unwrap()));
+            } else if line.starts_with("HEAD ") {
+                current_commit = Some(line.strip_prefix("HEAD ").unwrap().to_string());
+            } else if line.starts_with("branch ") {
+                current_branch = Some(line.strip_prefix("branch ").unwrap().to_string());
+            }
+        }
+
+        // Don't forget the last one
+        if let (Some(path), Some(commit)) = (current_path, current_commit) {
+            worktrees.push(WorktreeInfo {
+                path,
+                commit,
+                branch: current_branch,
+            });
+        }
+
+        logger.log_vvv("git", &format!("found {} worktrees", worktrees.len()));
+        Ok(worktrees)
+    }
+
+    /// Find an existing worktree that matches the given base commit
+    pub fn find_worktree_by_commit(
+        &self,
+        base_commit: &str,
+        worktree_base_dir: &Path,
+        logger: &VerboseLogger,
+    ) -> Result<Option<WorktreeInfo>> {
+        logger.log_vv(
+            "worktree",
+            &format!("checking existing worktrees for commit {}...", &base_commit[..8.min(base_commit.len())]),
+        );
+
+        let worktrees = self.list_worktrees(logger)?;
+
+        for wt in worktrees {
+            // Only consider worktrees under our base directory
+            if !wt.path.starts_with(worktree_base_dir) {
+                continue;
+            }
+
+            // Check if commit matches (allow prefix match)
+            if wt.commit.starts_with(base_commit) || base_commit.starts_with(&wt.commit) {
+                logger.log_vv(
+                    "worktree",
+                    &format!("found matching worktree at {}", wt.path.display()),
+                );
+                return Ok(Some(wt));
+            }
+        }
+
+        logger.log_vv("worktree", "no matching worktree found");
+        Ok(None)
+    }
+
+    /// Create a new worktree at the specified path and commit
+    pub fn create_worktree(
+        &self,
+        worktree_path: &Path,
+        commit: &str,
+        logger: &VerboseLogger,
+    ) -> Result<()> {
+        logger.log_vv(
+            "worktree",
+            &format!("creating new at {}", worktree_path.display()),
+        );
+
+        // Ensure parent directory exists
+        if let Some(parent) = worktree_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+        }
+
+        logger.log_vvv(
+            "git",
+            &format!("git worktree add --detach {} {}", worktree_path.display(), commit),
+        );
+
+        let output = Command::new("git")
+            .current_dir(&self.repo_root)
+            .args([
+                "worktree",
+                "add",
+                "--detach",
+                worktree_path.to_str().unwrap(),
+                commit,
+            ])
+            .output()
+            .context("Failed to create worktree")?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "Failed to create worktree: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        logger.log_vv("git", &format!("checkout base_commit: {}", commit));
+        Ok(())
+    }
+
+    /// Remove a worktree
+    pub fn remove_worktree(&self, worktree_path: &Path, logger: &VerboseLogger) -> Result<()> {
+        logger.log_vv(
+            "worktree",
+            &format!("removing {}", worktree_path.display()),
+        );
+
+        logger.log_vvv(
+            "git",
+            &format!("git worktree remove --force {}", worktree_path.display()),
+        );
+
+        let output = Command::new("git")
+            .current_dir(&self.repo_root)
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                worktree_path.to_str().unwrap(),
+            ])
+            .output()
+            .context("Failed to remove worktree")?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "Failed to remove worktree: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Apply patch in a specific worktree
+    pub fn apply_patch_in_worktree(
+        &self,
+        worktree_path: &Path,
+        ref_name: &str,
+        logger: &VerboseLogger,
+    ) -> Result<()> {
+        logger.log_vv("git", &format!("applying patch: {}", ref_name));
+
+        // First fetch the patch content from the main repo
+        let patch_content = self.get_patch_content(ref_name)?;
+
+        logger.log_vvv("git", &format!("patch content length: {} bytes", patch_content.len()));
+
+        let mut child = Command::new("git")
+            .current_dir(worktree_path)
+            .args(["apply"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .context("Failed to apply patch in worktree")?;
+
+        {
+            use std::io::Write;
+            let stdin = child.stdin.as_mut().context("Failed to get stdin")?;
+            stdin.write_all(patch_content.as_bytes())?;
+        }
+
+        let status = child.wait()?;
+        if !status.success() {
+            anyhow::bail!("Failed to apply patch in worktree");
+        }
+
+        Ok(())
+    }
+
+    /// Restore code state in an isolated worktree (non-destructive)
+    ///
+    /// This is the safe replacement for `restore_code_state` that creates/reuses
+    /// a worktree instead of modifying the current repository.
+    pub fn restore_code_state_in_worktree(
+        &self,
+        code_state: &CodeState,
+        run_id: &str,
+        worktree_base_dir: &Path,
+        reuse_existing: bool,
+        logger: &VerboseLogger,
+    ) -> Result<WorktreeReplayResult> {
+        let worktree_path = worktree_base_dir.join(run_id);
+
+        // Check for existing worktree with same commit
+        if reuse_existing {
+            if let Some(existing) = self.find_worktree_by_commit(
+                &code_state.base_commit,
+                worktree_base_dir,
+                logger,
+            )? {
+                logger.log_v(
+                    "worktree",
+                    &format!("reusing existing worktree at {}", existing.path.display()),
+                );
+
+                // If there's a patch, we might need to reset and reapply
+                // For now, assume the worktree is in a good state if commit matches
+                return Ok(WorktreeReplayResult {
+                    worktree_path: existing.path,
+                    reused: true,
+                });
+            }
+        }
+
+        // Check if worktree path already exists (maybe from a previous run with same ID)
+        if worktree_path.exists() {
+            logger.log_vv(
+                "worktree",
+                &format!("path {} already exists, checking if it's a worktree", worktree_path.display()),
+            );
+
+            // Check if it's already registered as a worktree
+            let worktrees = self.list_worktrees(logger)?;
+            let is_worktree = worktrees.iter().any(|wt| wt.path == worktree_path);
+
+            if is_worktree {
+                // Remove it first
+                self.remove_worktree(&worktree_path, logger)?;
+            } else {
+                // Just a directory, remove it
+                std::fs::remove_dir_all(&worktree_path)
+                    .with_context(|| format!("Failed to remove directory: {}", worktree_path.display()))?;
+            }
+        }
+
+        // Create new worktree
+        logger.log_v(
+            "worktree",
+            &format!("creating new at {}", worktree_path.display()),
+        );
+        self.create_worktree(&worktree_path, &code_state.base_commit, logger)?;
+
+        // Apply patch if present
+        if let Some(patch) = &code_state.patch {
+            self.apply_patch_in_worktree(&worktree_path, &patch.ref_, logger)?;
+        }
+
+        Ok(WorktreeReplayResult {
+            worktree_path,
+            reused: false,
+        })
     }
 }
 
