@@ -502,7 +502,7 @@ fn cmd_replay(
     // Restore code state in worktree
     let worktree_result = git.restore_code_state_in_worktree(
         &run.code_state,
-        run_id,
+        &resolved_id,
         &resolved_worktree_dir.value,
         resolved_reuse.value,
         &logger,
