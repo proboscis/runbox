@@ -1,5 +1,7 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// A fully-resolved, reproducible execution record
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8,6 +10,72 @@ pub struct Run {
     pub run_id: String,
     pub exec: Exec,
     pub code_state: CodeState,
+
+    // Execution state fields
+    #[serde(default)]
+    pub status: RunStatus,
+    #[serde(default)]
+    pub runtime: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle: Option<RuntimeHandle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_ref: Option<LogRef>,
+    #[serde(default)]
+    pub timeline: Timeline,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+/// Run status
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunStatus {
+    #[default]
+    Pending,
+    Running,
+    Exited,
+    Failed,
+    Killed,
+    Unknown,
+}
+
+impl std::fmt::Display for RunStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunStatus::Pending => write!(f, "pending"),
+            RunStatus::Running => write!(f, "running"),
+            RunStatus::Exited => write!(f, "exited"),
+            RunStatus::Failed => write!(f, "failed"),
+            RunStatus::Killed => write!(f, "killed"),
+            RunStatus::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+/// Runtime-specific handle data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum RuntimeHandle {
+    Background { pid: u32, pgid: u32 },
+    Tmux { session: String, window: String },
+    Zellij { session: String, tab: String },
+}
+
+/// Reference to log file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogRef {
+    pub path: PathBuf,
+}
+
+/// Timeline of run events
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Timeline {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
 }
 
 /// Execution specification
@@ -56,6 +124,26 @@ impl Run {
             run_id,
             exec,
             code_state,
+            status: RunStatus::Pending,
+            runtime: String::new(),
+            handle: None,
+            log_ref: None,
+            timeline: Timeline {
+                created_at: Some(Utc::now()),
+                started_at: None,
+                ended_at: None,
+            },
+            exit_code: None,
+        }
+    }
+
+    /// Get short ID (first 8 chars of UUID portion)
+    pub fn short_id(&self) -> &str {
+        // run_id format: "run_{uuid}"
+        if self.run_id.len() >= 12 {
+            &self.run_id[4..12]
+        } else {
+            &self.run_id
         }
     }
 
@@ -121,10 +209,53 @@ mod tests {
                 base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
                 patch: None,
             },
+            status: RunStatus::Pending,
+            runtime: String::new(),
+            handle: None,
+            log_ref: None,
+            timeline: Timeline::default(),
+            exit_code: None,
         };
 
         let json = serde_json::to_string_pretty(&run).unwrap();
         let parsed: Run = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.run_id, run.run_id);
+    }
+
+    #[test]
+    fn test_short_id() {
+        let run = Run {
+            run_version: 0,
+            run_id: "run_550e8400-e29b-41d4-a716-446655440000".to_string(),
+            exec: Exec {
+                argv: vec!["echo".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+                timeout_sec: 0,
+            },
+            code_state: CodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch: None,
+            },
+            status: RunStatus::Pending,
+            runtime: String::new(),
+            handle: None,
+            log_ref: None,
+            timeline: Timeline::default(),
+            exit_code: None,
+        };
+
+        assert_eq!(run.short_id(), "550e8400");
+    }
+
+    #[test]
+    fn test_run_status_display() {
+        assert_eq!(RunStatus::Pending.to_string(), "pending");
+        assert_eq!(RunStatus::Running.to_string(), "running");
+        assert_eq!(RunStatus::Exited.to_string(), "exited");
+        assert_eq!(RunStatus::Failed.to_string(), "failed");
+        assert_eq!(RunStatus::Killed.to_string(), "killed");
+        assert_eq!(RunStatus::Unknown.to_string(), "unknown");
     }
 }
