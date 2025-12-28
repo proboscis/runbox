@@ -3,8 +3,9 @@ use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use dialoguer::{theme::ColorfulTheme, Input};
 use runbox_core::{
-    short_id, BindingResolver, ConfigResolver, GitContext, LogRef, Playlist, PlaylistItem,
-    RunStatus, RunTemplate, RuntimeRegistry, Storage, Timeline, Validator, VerboseLogger,
+    default_pid_path, default_socket_path, short_id, BindingResolver, ConfigResolver,
+    DaemonClient, GitContext, LogRef, Playlist, PlaylistItem, RunStatus, RunTemplate,
+    RuntimeRegistry, Storage, Timeline, Validator, VerboseLogger,
 };
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -168,6 +169,24 @@ enum Commands {
         /// Path to JSON file
         path: String,
     },
+
+    /// Manage the background daemon (for debugging)
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonCommands {
+    /// Start the daemon in foreground mode
+    Start,
+    /// Stop the running daemon
+    Stop,
+    /// Check daemon status
+    Status,
+    /// Ping the daemon
+    Ping,
 }
 
 #[derive(Subcommand)]
@@ -265,7 +284,137 @@ fn main() -> Result<()> {
             verbose,
         ),
         Commands::Validate { path } => cmd_validate(&path),
+        Commands::Daemon { command } => match command {
+            DaemonCommands::Start => cmd_daemon_start(),
+            DaemonCommands::Stop => cmd_daemon_stop(),
+            DaemonCommands::Status => cmd_daemon_status(),
+            DaemonCommands::Ping => cmd_daemon_ping(),
+        },
     }
+}
+
+// === Daemon Commands ===
+
+fn cmd_daemon_start() -> Result<()> {
+    use std::process::Command as StdCommand;
+
+    // Find the daemon binary
+    let daemon_path = which_daemon()?;
+
+    println!("Starting daemon in foreground mode...");
+    println!("Daemon path: {}", daemon_path.display());
+    println!("Socket: {}", default_socket_path().display());
+    println!("Press Ctrl+C to stop");
+
+    // Start daemon in foreground
+    let status = StdCommand::new(&daemon_path)
+        .arg("--foreground")
+        .status()
+        .with_context(|| format!("Failed to start daemon from {}", daemon_path.display()))?;
+
+    if status.success() {
+        println!("Daemon exited normally");
+    } else {
+        bail!("Daemon exited with status: {:?}", status.code());
+    }
+
+    Ok(())
+}
+
+fn cmd_daemon_stop() -> Result<()> {
+    let client = DaemonClient::new();
+
+    if !client.is_running() {
+        println!("Daemon is not running");
+        return Ok(());
+    }
+
+    println!("Stopping daemon...");
+    client.shutdown()?;
+    println!("Daemon stopped");
+
+    Ok(())
+}
+
+fn cmd_daemon_status() -> Result<()> {
+    let socket_path = default_socket_path();
+    let pid_path = default_pid_path();
+
+    println!("Socket path: {}", socket_path.display());
+    println!("PID file:    {}", pid_path.display());
+
+    // Check if socket exists
+    if !socket_path.exists() {
+        println!("Status:      not running (no socket)");
+        return Ok(());
+    }
+
+    // Try to connect
+    let client = DaemonClient::new();
+    if client.is_running() {
+        // Read PID if available
+        if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
+            println!("PID:         {}", pid_str.trim());
+        }
+        println!("Status:      running");
+    } else {
+        println!("Status:      not running (socket exists but not responding)");
+    }
+
+    Ok(())
+}
+
+fn cmd_daemon_ping() -> Result<()> {
+    let client = DaemonClient::new();
+
+    println!("Pinging daemon...");
+
+    match client.ping() {
+        Ok(true) => {
+            println!("Daemon is alive (pong received)");
+            Ok(())
+        }
+        Ok(false) => {
+            bail!("Daemon responded but ping failed");
+        }
+        Err(e) => {
+            bail!("Failed to ping daemon: {}", e);
+        }
+    }
+}
+
+/// Find the daemon binary path
+fn which_daemon() -> Result<PathBuf> {
+    // First, check if RUNBOX_DAEMON_PATH env var is set
+    if let Ok(path) = std::env::var("RUNBOX_DAEMON_PATH") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    // Check if runbox-daemon is in the same directory as the current executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let daemon_path = dir.join("runbox-daemon");
+            if daemon_path.exists() {
+                return Ok(daemon_path);
+            }
+        }
+    }
+
+    // Check PATH
+    if let Ok(path_env) = std::env::var("PATH") {
+        for dir in path_env.split(':') {
+            let daemon_path = PathBuf::from(dir).join("runbox-daemon");
+            if daemon_path.exists() {
+                return Ok(daemon_path);
+            }
+        }
+    }
+
+    // Fallback to hoping it's in PATH
+    Ok(PathBuf::from("runbox-daemon"))
 }
 
 // === Run Command ===
