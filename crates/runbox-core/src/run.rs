@@ -24,6 +24,9 @@ pub struct Run {
     pub timeline: Timeline,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    /// Reason for Unknown status (set by reconcile)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconcile_reason: Option<String>,
 }
 
 /// Run status
@@ -134,6 +137,7 @@ impl Run {
                 ended_at: None,
             },
             exit_code: None,
+            reconcile_reason: None,
         }
     }
 
@@ -215,6 +219,7 @@ mod tests {
             log_ref: None,
             timeline: Timeline::default(),
             exit_code: None,
+            reconcile_reason: None,
         };
 
         let json = serde_json::to_string_pretty(&run).unwrap();
@@ -244,6 +249,7 @@ mod tests {
             log_ref: None,
             timeline: Timeline::default(),
             exit_code: None,
+            reconcile_reason: None,
         };
 
         assert_eq!(run.short_id(), "550e8400");
@@ -257,5 +263,27 @@ mod tests {
         assert_eq!(RunStatus::Failed.to_string(), "failed");
         assert_eq!(RunStatus::Killed.to_string(), "killed");
         assert_eq!(RunStatus::Unknown.to_string(), "unknown");
+    }
+
+    #[test]
+    fn test_backwards_compatibility() {
+        // Test that old JSON without new fields can still be deserialized
+        let old_json = r#"{
+            "run_version": 0,
+            "run_id": "run_test123",
+            "exec": {
+                "argv": ["echo", "hello"],
+                "cwd": "."
+            },
+            "code_state": {
+                "repo_url": "git@github.com:org/repo.git",
+                "base_commit": "a1b2c3d4e5f6789012345678901234567890abcd"
+            }
+        }"#;
+
+        let run: Run = serde_json::from_str(old_json).unwrap();
+        assert_eq!(run.run_id, "run_test123");
+        assert_eq!(run.status, RunStatus::Pending);
+        assert!(run.handle.is_none());
     }
 }

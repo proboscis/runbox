@@ -82,6 +82,10 @@ enum Commands {
     Stop {
         /// Run ID (or short ID)
         run_id: String,
+
+        /// Force kill (SIGKILL instead of SIGTERM)
+        #[arg(long, short)]
+        force: bool,
     },
 
     /// Show logs for a run
@@ -213,7 +217,7 @@ fn main() -> Result<()> {
             dry_run,
         } => cmd_run(&storage, &template, binding, runtime, dry_run),
         Commands::Ps { status, all, limit } => cmd_ps(&storage, status, all, limit),
-        Commands::Stop { run_id } => cmd_stop(&storage, &run_id),
+        Commands::Stop { run_id, force } => cmd_stop(&storage, &run_id, force),
         Commands::Logs {
             run_id,
             follow,
@@ -424,10 +428,11 @@ fn cmd_ps(storage: &Storage, status_filter: Option<String>, _all: bool, limit: u
 
 // === Stop Command ===
 
-fn cmd_stop(storage: &Storage, run_id: &str) -> Result<()> {
+fn cmd_stop(storage: &Storage, run_id: &str, force: bool) -> Result<()> {
     let full_run_id = resolve_run_id(storage, run_id)?;
     let mut run = storage.load_run(&full_run_id)?;
 
+    // CAS: Only allow stopping if status is Running
     if run.status != RunStatus::Running {
         bail!("Run {} is not running (status: {})", run_id, run.status);
     }
@@ -438,14 +443,20 @@ fn cmd_stop(storage: &Storage, run_id: &str) -> Result<()> {
         .context(format!("Unknown runtime: {}", run.runtime))?;
 
     if let Some(ref handle) = run.handle {
-        adapter.stop(handle)?;
+        adapter.stop(handle, force)?;
 
-        // Update run status
+        // Update run status (CAS: don't overwrite ended_at if already set)
         run.status = RunStatus::Killed;
-        run.timeline.ended_at = Some(Utc::now());
+        if run.timeline.ended_at.is_none() {
+            run.timeline.ended_at = Some(Utc::now());
+        }
         storage.save_run(&run)?;
 
-        println!("Stopped run: {}", full_run_id);
+        if force {
+            println!("Force stopped run: {}", full_run_id);
+        } else {
+            println!("Stopped run: {}", full_run_id);
+        }
     } else {
         bail!("Run {} has no handle", run_id);
     }
@@ -588,19 +599,20 @@ fn resolve_run_id(storage: &Storage, id: &str) -> Result<String> {
 }
 
 /// Reconcile run statuses by checking if processes are still alive
+/// Uses CAS-style updates: only update if Running, don't overwrite ended_at
 fn reconcile_runs(storage: &Storage) -> Result<()> {
     let runs = storage.list_runs(usize::MAX)?;
     let registry = RuntimeRegistry::new();
 
     for mut run in runs {
+        // CAS: Only reconcile Running runs (don't transition Unknown back to Running)
         if run.status != RunStatus::Running {
             continue;
         }
 
         let Some(ref handle) = run.handle else {
-            // Running status but no handle - mark as unknown
-            run.status = RunStatus::Unknown;
-            run.timeline.ended_at = Some(Utc::now());
+            // Running status but no handle - mark as unknown with reason
+            mark_unknown(&mut run, "no runtime handle");
             storage.save_run(&run)?;
             continue;
         };
@@ -610,14 +622,34 @@ fn reconcile_runs(storage: &Storage) -> Result<()> {
         };
 
         if !adapter.is_alive(handle) {
-            // Process is dead but status is still Running
-            run.status = RunStatus::Unknown;
-            run.timeline.ended_at = Some(Utc::now());
+            // Process is dead but status is still Running - mark as unknown with reason
+            let reason = match handle {
+                runbox_core::RuntimeHandle::Background { pid, .. } => {
+                    format!("process {} not found", pid)
+                }
+                runbox_core::RuntimeHandle::Tmux { session, window } => {
+                    format!("tmux window '{}:{}' not found", session, window)
+                }
+                runbox_core::RuntimeHandle::Zellij { session, tab } => {
+                    format!("zellij tab '{}:{}' not found", session, tab)
+                }
+            };
+            mark_unknown(&mut run, &reason);
             storage.save_run(&run)?;
         }
     }
 
     Ok(())
+}
+
+/// Mark a run as Unknown with a reason (CAS-style: don't overwrite ended_at)
+fn mark_unknown(run: &mut runbox_core::Run, reason: &str) {
+    run.status = RunStatus::Unknown;
+    run.reconcile_reason = Some(reason.to_string());
+    // CAS: Don't overwrite ended_at if already set
+    if run.timeline.ended_at.is_none() {
+        run.timeline.ended_at = Some(Utc::now());
+    }
 }
 
 // === Template Commands ===
@@ -796,6 +828,9 @@ fn cmd_show(storage: &Storage, run_id: &str) -> Result<()> {
     }
     if let Some(exit_code) = run.exit_code {
         println!("Exit Code:  {}", exit_code);
+    }
+    if let Some(ref reason) = run.reconcile_reason {
+        println!("Reconcile:  {}", reason);
     }
     if let Some(ref log_ref) = run.log_ref {
         println!("Log:        {}", log_ref.path.display());

@@ -66,37 +66,35 @@ impl RuntimeAdapter for TmuxAdapter {
 
         let window_name = Self::window_name(run_id);
 
+        // Build environment prefix (VAR=value VAR2=value2 ...)
+        let env_prefix = exec
+            .env
+            .iter()
+            .map(|(k, v)| format!("{}={}", Self::shell_escape(k), Self::shell_escape(v)))
+            .collect::<Vec<_>>()
+            .join(" ");
+
         // Build the command string with proper escaping
         let argv_escaped: Vec<String> = exec.argv.iter().map(|s| Self::shell_escape(s)).collect();
         let cmd_str = argv_escaped.join(" ");
 
-        // Wrap command to redirect output to log file
-        let full_cmd = format!(
-            "exec {} > {} 2>&1",
-            cmd_str,
-            Self::shell_escape(&log_path.to_string_lossy())
-        );
-
-        // Build environment exports
-        let env_exports: String = exec
-            .env
-            .iter()
-            .map(|(k, v)| format!("export {}={}", k, Self::shell_escape(v)))
-            .collect::<Vec<_>>()
-            .join("; ");
-
-        let shell_cmd = if env_exports.is_empty() {
-            format!("cd {} && {}", Self::shell_escape(&exec.cwd), full_cmd)
+        // Build full command with env prefix and log redirection
+        let full_cmd = if env_prefix.is_empty() {
+            format!(
+                "exec {} > '{}' 2>&1",
+                cmd_str,
+                log_path.display()
+            )
         } else {
             format!(
-                "cd {} && {} && {}",
-                Self::shell_escape(&exec.cwd),
-                env_exports,
-                full_cmd
+                "{} exec {} > '{}' 2>&1",
+                env_prefix,
+                cmd_str,
+                log_path.display()
             )
         };
 
-        // Create new window in the session
+        // Create new window in the session with -c for cwd and bash -lc for execution
         let output = Command::new("tmux")
             .args([
                 "new-window",
@@ -104,9 +102,11 @@ impl RuntimeAdapter for TmuxAdapter {
                 &self.session_name,
                 "-n",
                 &window_name,
-                "sh",
                 "-c",
-                &shell_cmd,
+                &exec.cwd,
+                "bash",
+                "-lc",
+                &full_cmd,
             ])
             .output()
             .context("Failed to create tmux window")?;
@@ -122,11 +122,13 @@ impl RuntimeAdapter for TmuxAdapter {
         })
     }
 
-    fn stop(&self, handle: &RuntimeHandle) -> Result<()> {
+    fn stop(&self, handle: &RuntimeHandle, _force: bool) -> Result<()> {
         if let RuntimeHandle::Tmux { session, window } = handle {
             let target = format!("{}:{}", session, window);
 
             // Kill the window (this also kills the process)
+            // Note: tmux kill-window sends SIGHUP to the process
+            // The force flag is not used for tmux as it handles termination internally
             let output = Command::new("tmux")
                 .args(["kill-window", "-t", &target])
                 .output()
@@ -179,13 +181,16 @@ impl RuntimeAdapter for TmuxAdapter {
 
     fn is_alive(&self, handle: &RuntimeHandle) -> bool {
         if let RuntimeHandle::Tmux { session, window } = handle {
-            let target = format!("{}:{}", session, window);
-
-            // Check if the window exists
+            // Note: has-session only checks session, not windows
+            // Use list-windows to check if specific window exists
             Command::new("tmux")
-                .args(["has-session", "-t", &target])
+                .args(["list-windows", "-t", session, "-F", "#{window_name}"])
                 .output()
-                .map(|o| o.status.success())
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .any(|line| line == window)
+                })
                 .unwrap_or(false)
         } else {
             false

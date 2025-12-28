@@ -70,31 +70,23 @@ impl RuntimeAdapter for BackgroundAdapter {
         Ok(RuntimeHandle::Background { pid, pgid })
     }
 
-    fn stop(&self, handle: &RuntimeHandle) -> Result<()> {
+    fn stop(&self, handle: &RuntimeHandle, force: bool) -> Result<()> {
         if let RuntimeHandle::Background { pid, pgid } = handle {
-            // First try SIGTERM to the process group
+            // Choose signal based on force flag
+            let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+
+            // Send signal to the process group
             // SAFETY: killpg is safe with valid pgid
-            let result = unsafe { libc::killpg(*pgid as i32, libc::SIGTERM) };
+            let result = unsafe { libc::killpg(*pgid as i32, signal) };
             if result != 0 {
                 let err = std::io::Error::last_os_error();
                 // ESRCH means no such process - try killing just the pid
                 if err.raw_os_error() == Some(libc::ESRCH) {
                     // Process group doesn't exist, try direct kill
-                    unsafe { libc::kill(*pid as i32, libc::SIGTERM) };
+                    unsafe { libc::kill(*pid as i32, signal) };
                 } else {
                     return Err(err.into());
                 }
-            }
-
-            // Give it a moment to terminate gracefully
-            std::thread::sleep(std::time::Duration::from_millis(100));
-
-            // If still alive, send SIGKILL
-            if self.is_alive(handle) {
-                unsafe {
-                    libc::killpg(*pgid as i32, libc::SIGKILL);
-                    libc::kill(*pid as i32, libc::SIGKILL);
-                };
             }
 
             Ok(())
@@ -155,8 +147,8 @@ mod tests {
         // Process should be alive
         assert!(adapter.is_alive(&handle));
 
-        // Stop the process
-        adapter.stop(&handle).unwrap();
+        // Stop the process (use force=true for reliable test termination)
+        adapter.stop(&handle, true).unwrap();
 
         // Wait for process to terminate with retries
         // is_alive() will reap any zombie processes
