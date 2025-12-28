@@ -23,8 +23,19 @@ impl Storage {
         fs::create_dir_all(base_dir.join("runs"))?;
         fs::create_dir_all(base_dir.join("templates"))?;
         fs::create_dir_all(base_dir.join("playlists"))?;
+        fs::create_dir_all(base_dir.join("logs"))?;
 
         Ok(Self { base_dir })
+    }
+
+    /// Get the logs directory
+    pub fn logs_dir(&self) -> PathBuf {
+        self.base_dir.join("logs")
+    }
+
+    /// Get the log file path for a run
+    pub fn log_path(&self, run_id: &str) -> PathBuf {
+        self.logs_dir().join(format!("{}.log", run_id))
     }
 
     /// Get the base directory
@@ -86,6 +97,58 @@ impl Storage {
         let path = self.base_dir.join("runs").join(format!("{}.json", run_id));
         fs::remove_file(&path).with_context(|| format!("Run not found: {}", run_id))?;
         Ok(())
+    }
+
+    /// Save a run atomically (write to tmp file, then rename)
+    pub fn save_run_atomic(&self, run: &Run) -> Result<PathBuf> {
+        let path = self
+            .base_dir
+            .join("runs")
+            .join(format!("{}.json", run.run_id));
+        let tmp_path = self
+            .base_dir
+            .join("runs")
+            .join(format!("{}.json.tmp", run.run_id));
+
+        let json = serde_json::to_string_pretty(run)?;
+        fs::write(&tmp_path, json)?;
+        fs::rename(&tmp_path, &path)?;
+        Ok(path)
+    }
+
+    /// Update a run atomically with a closure
+    pub fn update_run<F>(&self, run_id: &str, update_fn: F) -> Result<Run>
+    where
+        F: FnOnce(&mut Run),
+    {
+        let mut run = self.load_run(run_id)?;
+        update_fn(&mut run);
+        self.save_run_atomic(&run)?;
+        Ok(run)
+    }
+
+    /// List runs filtered by status
+    pub fn list_runs_by_status(
+        &self,
+        status: Option<&crate::RunStatus>,
+        limit: usize,
+    ) -> Result<Vec<Run>> {
+        let runs = self.list_runs(if status.is_some() {
+            usize::MAX
+        } else {
+            limit
+        })?;
+
+        let filtered: Vec<Run> = if let Some(s) = status {
+            runs.into_iter()
+                .filter(|r| &r.status == s)
+                .take(limit)
+                .collect()
+        } else {
+            runs
+        };
+
+        Ok(filtered)
     }
 
     // === Template operations ===
