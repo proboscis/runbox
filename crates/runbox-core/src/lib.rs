@@ -12,6 +12,6 @@ pub use config::{ConfigResolver, ConfigSource, ResolvedValue, RunboxConfig, Verb
 pub use git::{GitContext, WorktreeInfo, WorktreeReplayResult};
 pub use playlist::{Playlist, PlaylistItem};
 pub use run::{CodeState, Exec, Patch, Run};
-pub use storage::Storage;
+pub use storage::{short_id, Storage};
 pub use template::{Bindings, RunTemplate, TemplateCodeState, TemplateExec};
 pub use validation::{ValidationType, Validator};
