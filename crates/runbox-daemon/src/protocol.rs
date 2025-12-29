@@ -1,56 +1,16 @@
 //! Protocol messages for CLI <-> Daemon communication
 //!
-//! Uses JSON messages over Unix socket with length-prefix framing:
-//! [4-byte length (big endian)][JSON payload]
+//! Re-exports types from runbox-core to avoid duplication.
 
-use runbox_core::Exec;
+// Re-export protocol types from runbox-core
+pub use runbox_core::daemon::{Request, Response};
+
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::path::PathBuf;
-
-/// Request from CLI to Daemon
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum Request {
-    /// Spawn a new process
-    Spawn {
-        run_id: String,
-        exec: Exec,
-        log_path: PathBuf,
-    },
-    /// Stop a running process
-    Stop { run_id: String, force: bool },
-    /// Get status of a process
-    Status { run_id: String },
-    /// Ping to check if daemon is alive
-    Ping,
-    /// Request graceful shutdown
-    Shutdown,
-}
-
-/// Response from Daemon to CLI
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum Response {
-    /// Process spawned successfully
-    Spawned { pid: u32, pgid: u32 },
-    /// Process stopped
-    Stopped,
-    /// Process status
-    Status {
-        alive: bool,
-        exit_code: Option<i32>,
-        signal: Option<i32>,
-    },
-    /// Pong response
-    Pong,
-    /// Shutdown acknowledged
-    ShutdownAck,
-    /// Error occurred
-    Error { message: String },
-}
 
 /// Read a framed message from a stream
+///
+/// Uses length-prefix framing: [4-byte length (big endian)][JSON payload]
 pub fn read_message<R: Read, T: for<'de> Deserialize<'de>>(reader: &mut R) -> std::io::Result<T> {
     // Read length prefix (4 bytes, big endian)
     let mut len_buf = [0u8; 4];
@@ -79,6 +39,8 @@ pub fn read_message<R: Read, T: for<'de> Deserialize<'de>>(reader: &mut R) -> st
 }
 
 /// Write a framed message to a stream
+///
+/// Uses length-prefix framing: [4-byte length (big endian)][JSON payload]
 pub fn write_message<W: Write, T: Serialize>(writer: &mut W, msg: &T) -> std::io::Result<()> {
     let json = serde_json::to_vec(msg).map_err(|e| {
         std::io::Error::new(
@@ -101,8 +63,10 @@ pub fn write_message<W: Write, T: Serialize>(writer: &mut W, msg: &T) -> std::io
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runbox_core::Exec;
     use std::collections::HashMap;
     use std::io::Cursor;
+    use std::path::PathBuf;
 
     #[test]
     fn test_request_serialization() {

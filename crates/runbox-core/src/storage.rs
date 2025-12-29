@@ -1,6 +1,7 @@
-use crate::{Playlist, Run, RunTemplate};
+use crate::{Playlist, Run, RunStatus, RunTemplate};
 use anyhow::{bail, Context, Result};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::PathBuf;
 
 /// Normalize an ID for matching by removing prefix and hyphens, converting to lowercase
@@ -50,12 +51,110 @@ impl Storage {
 
     // === Run operations ===
 
-    /// Save a run
+    /// Save a run (with atomic write via rename)
     pub fn save_run(&self, run: &Run) -> Result<PathBuf> {
         let path = self.base_dir.join("runs").join(format!("{}.json", run.run_id));
+        let temp_path = self.base_dir.join("runs").join(format!("{}.json.tmp", run.run_id));
+
         let json = serde_json::to_string_pretty(run)?;
-        fs::write(&path, json)?;
+
+        // Write to temp file first
+        let mut file = File::create(&temp_path)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?; // Ensure data is flushed to disk
+        drop(file);
+
+        // Atomic rename
+        fs::rename(&temp_path, &path)?;
+
         Ok(path)
+    }
+
+    /// Save a run only if current status is one of the expected statuses
+    /// Returns Ok(true) if saved, Ok(false) if status didn't match
+    /// The update_fn is called with the current run to allow merging fields
+    pub fn save_run_if_status_with<F>(
+        &self,
+        run_id: &str,
+        expected_statuses: &[RunStatus],
+        update_fn: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce(&mut Run),
+    {
+        let path = self.base_dir.join("runs").join(format!("{}.json", run_id));
+        let lock_path = self.base_dir.join("runs").join(format!("{}.json.lock", run_id));
+
+        // Acquire exclusive lock
+        let lock_file = File::create(&lock_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = lock_file.as_raw_fd();
+            // LOCK_EX = exclusive lock, blocking
+            let result = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            if result != 0 {
+                bail!("Failed to acquire lock on {}", lock_path.display());
+            }
+        }
+
+        // Read current state while holding lock
+        if !path.exists() {
+            // File doesn't exist, can't update
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let fd = lock_file.as_raw_fd();
+                unsafe { libc::flock(fd, libc::LOCK_UN) };
+            }
+            bail!("Run not found: {}", run_id);
+        }
+
+        let current_json = fs::read_to_string(&path)?;
+        let mut current_run: Run = serde_json::from_str(&current_json)?;
+
+        if !expected_statuses.contains(&current_run.status) {
+            // Status doesn't match, don't save
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let fd = lock_file.as_raw_fd();
+                unsafe { libc::flock(fd, libc::LOCK_UN) };
+            }
+            return Ok(false);
+        }
+
+        // Apply updates to the fresh copy
+        update_fn(&mut current_run);
+
+        // Write atomically
+        let temp_path = self.base_dir.join("runs").join(format!("{}.json.tmp", run_id));
+        let json = serde_json::to_string_pretty(&current_run)?;
+
+        let mut file = File::create(&temp_path)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+
+        fs::rename(&temp_path, &path)?;
+
+        // Release lock (automatically released when lock_file is dropped, but explicit is clearer)
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = lock_file.as_raw_fd();
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+        }
+
+        Ok(true)
+    }
+
+    /// Simple version that just replaces the run if status matches
+    pub fn save_run_if_status(&self, run: &Run, expected_statuses: &[RunStatus]) -> Result<bool> {
+        let run_clone = run.clone();
+        self.save_run_if_status_with(&run.run_id, expected_statuses, |current| {
+            *current = run_clone;
+        })
     }
 
     /// Load a run by ID

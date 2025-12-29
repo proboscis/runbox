@@ -15,7 +15,10 @@ mod server;
 use anyhow::{Context, Result};
 use process_manager::ProcessManager;
 use runbox_core::Storage;
-use server::{default_pid_path, default_socket_path, remove_pid_file, write_pid_file, Server};
+use server::{
+    acquire_daemon_lock, default_socket_path, lock_path_for_socket, pid_path_for_socket,
+    remove_pid_file, write_pid_file, Server,
+};
 use std::path::PathBuf;
 
 /// Daemonize the current process using double-fork
@@ -111,13 +114,17 @@ fn setup_signal_handlers(shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>
 }
 
 fn run_daemon(socket_path: PathBuf, foreground: bool) -> Result<()> {
-    // Write PID file
-    let pid_path = default_pid_path();
-    write_pid_file(&pid_path)?;
+    // Acquire exclusive lock first to prevent duplicate daemons
+    // Lock path is derived from socket path so different sockets can coexist
+    let lock_path = lock_path_for_socket(&socket_path);
+    let _lock_file = acquire_daemon_lock(&lock_path)?;
+    // Note: lock_file must stay in scope to maintain the lock
 
-    // Set up cleanup on exit
+    // Set up paths for cleanup (derived from socket path for multi-daemon support)
+    let pid_path = pid_path_for_socket(&socket_path);
     let pid_path_cleanup = pid_path.clone();
     let socket_path_cleanup = socket_path.clone();
+    let lock_path_cleanup = lock_path.clone();
 
     // Create storage and process manager
     let storage = Storage::new()?;
@@ -126,8 +133,11 @@ fn run_daemon(socket_path: PathBuf, foreground: bool) -> Result<()> {
     // Reconcile any processes from before restart
     process_manager.reconcile_on_start()?;
 
-    // Create server
+    // Create server (binds socket)
     let server = Server::new(socket_path, process_manager)?;
+
+    // Write PID file AFTER successful socket bind
+    write_pid_file(&pid_path)?;
 
     // Set up signal handlers
     setup_signal_handlers(server.shutdown_handle())?;
@@ -145,6 +155,9 @@ fn run_daemon(socket_path: PathBuf, foreground: bool) -> Result<()> {
     remove_pid_file(&pid_path_cleanup);
     if socket_path_cleanup.exists() {
         let _ = std::fs::remove_file(&socket_path_cleanup);
+    }
+    if lock_path_cleanup.exists() {
+        let _ = std::fs::remove_file(&lock_path_cleanup);
     }
 
     result

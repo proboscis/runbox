@@ -151,10 +151,13 @@ impl DaemonClient {
         }
 
         // Daemon not running, try to start it
+        // The daemon uses a lockfile to prevent duplicate starts,
+        // so it's safe to attempt starting even if another process is doing the same
         self.start_daemon()?;
 
         // Retry connection with backoff
-        let max_retries = 10;
+        // Use longer max retries since daemon may take time to start (especially on first run)
+        let max_retries = 20;
         let mut retry_delay = Duration::from_millis(50);
 
         for attempt in 1..=max_retries {
@@ -171,7 +174,8 @@ impl DaemonClient {
                         attempt,
                         e
                     );
-                    retry_delay = std::cmp::min(retry_delay * 2, Duration::from_secs(1));
+                    // Cap at 500ms to be responsive
+                    retry_delay = std::cmp::min(retry_delay * 2, Duration::from_millis(500));
                 }
             }
         }

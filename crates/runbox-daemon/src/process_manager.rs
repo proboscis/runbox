@@ -17,8 +17,10 @@ use std::thread::{self, JoinHandle};
 struct ManagedProcess {
     pid: u32,
     pgid: u32,
-    /// Thread handle for the wait thread (None if already joined)
+    /// Thread handle for the wait thread (None if already joined or adopted)
     wait_handle: Option<JoinHandle<ProcessResult>>,
+    /// True if this process was adopted (not spawned by us)
+    adopted: bool,
 }
 
 /// Result of waiting for a process
@@ -52,6 +54,11 @@ impl ProcessManager {
 
     /// Spawn a new process
     pub fn spawn(&self, run_id: &str, exec: &Exec, log_path: &Path) -> Result<(u32, u32)> {
+        // Validate argv
+        if exec.argv.is_empty() {
+            bail!("Cannot spawn process: argv is empty");
+        }
+
         // Create log file for stdout/stderr
         let log_file = File::create(log_path)?;
         let log_file_err = log_file.try_clone()?;
@@ -91,8 +98,21 @@ impl ProcessManager {
         let processes_clone = Arc::clone(&self.processes);
 
         let wait_handle = thread::spawn(move || {
-            let storage = Storage::with_base_dir(storage_base_dir).expect("Failed to create storage");
-            wait_for_process(child, run_id_owned, storage, processes_clone)
+            match Storage::with_base_dir(storage_base_dir) {
+                Ok(storage) => wait_for_process(child, run_id_owned, storage, processes_clone),
+                Err(e) => {
+                    log::error!("Failed to create storage for wait thread: {}. Exit status won't be captured.", e);
+                    // Still wait on the child to prevent zombie, but can't update storage
+                    let mut c = child;
+                    let _ = c.wait();
+                    processes_clone.lock().unwrap().remove(&run_id_owned);
+                    ProcessResult {
+                        run_id: run_id_owned,
+                        exit_code: None,
+                        signal: None,
+                    }
+                }
+            }
         });
 
         // Store in managed processes
@@ -103,6 +123,7 @@ impl ProcessManager {
                 pid,
                 pgid,
                 wait_handle: Some(wait_handle),
+                adopted: false,
             },
         );
 
@@ -123,9 +144,16 @@ impl ProcessManager {
         let result = unsafe { libc::killpg(process.pgid as i32, signal) };
         if result != 0 {
             let err = std::io::Error::last_os_error();
-            // ESRCH means no such process - try killing just the pid
+            // ESRCH means no such process group - try killing just the pid
             if err.raw_os_error() == Some(libc::ESRCH) {
-                unsafe { libc::kill(process.pid as i32, signal) };
+                let pid_result = unsafe { libc::kill(process.pid as i32, signal) };
+                if pid_result != 0 {
+                    let pid_err = std::io::Error::last_os_error();
+                    // ESRCH is ok - process already dead
+                    if pid_err.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(pid_err.into());
+                    }
+                }
             } else {
                 return Err(err.into());
             }
@@ -170,17 +198,25 @@ impl ProcessManager {
     pub fn cleanup_completed(&self) {
         let mut processes = self.processes.lock().unwrap();
 
-        // Join any completed wait threads
         let mut completed = Vec::new();
+        let mut adopted_dead = Vec::new();
+
         for (run_id, process) in processes.iter_mut() {
-            if let Some(handle) = &process.wait_handle {
+            if process.adopted {
+                // For adopted processes, poll with kill(pid, 0)
+                let alive = unsafe { libc::kill(process.pid as i32, 0) == 0 };
+                if !alive {
+                    adopted_dead.push(run_id.clone());
+                }
+            } else if let Some(handle) = &process.wait_handle {
+                // For spawned processes, check if wait thread finished
                 if handle.is_finished() {
                     completed.push(run_id.clone());
                 }
             }
         }
 
-        // Remove completed processes
+        // Remove completed spawned processes
         for run_id in completed {
             if let Some(mut process) = processes.remove(&run_id) {
                 if let Some(handle) = process.wait_handle.take() {
@@ -188,6 +224,69 @@ impl ProcessManager {
                 }
             }
         }
+
+        // Handle dead adopted processes
+        // Note: we need to drop the lock before updating storage
+        drop(processes);
+
+        for run_id in adopted_dead {
+            // Update run status to Unknown (we can't get exit code for adopted processes)
+            if let Err(e) = self.update_adopted_on_exit(&run_id) {
+                log::error!("Failed to update adopted run {}: {}", run_id, e);
+            }
+            // Remove from tracking
+            self.processes.lock().unwrap().remove(&run_id);
+        }
+    }
+
+    /// Update an adopted process's run status when it exits
+    fn update_adopted_on_exit(&self, run_id: &str) -> Result<()> {
+        let mut run = self.storage.load_run(run_id)?;
+
+        // Only update if still in a running state
+        match run.status {
+            RunStatus::Running | RunStatus::Pending => {
+                run.status = RunStatus::Unknown;
+                run.reconcile_reason = Some("process exited while adopted (exit code unavailable)".to_string());
+            }
+            RunStatus::Killed => {
+                // CLI stopped it, just fill in timeline fields
+            }
+            _ => {
+                // Already in terminal state
+                return Ok(());
+            }
+        }
+
+        // Ensure timeline is complete
+        let now = Utc::now();
+        if run.timeline.started_at.is_none() {
+            run.timeline.started_at = Some(now);
+        }
+        if run.timeline.ended_at.is_none() {
+            run.timeline.ended_at = Some(now);
+        }
+
+        self.storage.save_run(&run)?;
+        log::info!("Updated adopted run {} - process exited", run_id);
+
+        Ok(())
+    }
+
+    /// Adopt an existing process (not spawned by us) for monitoring
+    /// We can't get its exit status via wait(), but we can detect when it dies
+    fn adopt(&self, run_id: &str, pid: u32, pgid: u32) {
+        let mut processes = self.processes.lock().unwrap();
+        processes.insert(
+            run_id.to_string(),
+            ManagedProcess {
+                pid,
+                pgid,
+                wait_handle: None, // Can't wait on a non-child process
+                adopted: true,
+            },
+        );
+        log::info!("Adopted process {} for run {}", pid, run_id);
     }
 
     /// Reconcile processes after daemon restart
@@ -197,17 +296,53 @@ impl ProcessManager {
         let runs = self.storage.list_runs(usize::MAX)?;
 
         for mut run in runs {
-            if run.status != RunStatus::Running {
+            // Consider both Running and Pending with background handles
+            // Pending can have a live process if daemon restarted between spawn and CLI update
+            if run.status != RunStatus::Running && run.status != RunStatus::Pending {
+                continue;
+            }
+
+            // Skip if not a background runtime
+            if let Some(ref handle) = run.handle {
+                if !matches!(handle, runbox_core::RuntimeHandle::Background { .. }) {
+                    continue;
+                }
+            } else if run.status == RunStatus::Pending {
+                // Pending without handle - skip, process hasn't spawned yet
                 continue;
             }
 
             // Check if the process is still alive
             if let Some(ref handle) = run.handle {
-                if let runbox_core::RuntimeHandle::Background { pid, .. } = handle {
+                if let runbox_core::RuntimeHandle::Background { pid, pgid } = handle {
                     // Check if process exists
                     let alive = unsafe { libc::kill(*pid as i32, 0) == 0 };
 
-                    if !alive {
+                    if alive {
+                        // Process is alive - adopt it so we can monitor for exit
+                        log::info!(
+                            "Run {} has alive process {} - adopting for monitoring",
+                            run.run_id,
+                            pid
+                        );
+                        self.adopt(&run.run_id, *pid, *pgid);
+
+                        // If still Pending, upgrade to Running and set started_at
+                        if run.status == RunStatus::Pending {
+                            run.status = RunStatus::Running;
+                            if run.timeline.started_at.is_none() {
+                                run.timeline.started_at = Some(Utc::now());
+                            }
+                            run.reconcile_reason = Some(
+                                "daemon adopted live process, upgraded from Pending".to_string()
+                            );
+                            self.storage.save_run(&run)?;
+                            log::info!(
+                                "Run {} upgraded from Pending to Running",
+                                run.run_id
+                            );
+                        }
+                    } else {
                         // Process is dead but was Running - mark as Unknown
                         log::warn!(
                             "Run {} has dead process {} - marking as Unknown",
@@ -219,8 +354,12 @@ impl ProcessManager {
                             "daemon restarted, process {} not found",
                             pid
                         ));
+                        let now = Utc::now();
+                        if run.timeline.started_at.is_none() {
+                            run.timeline.started_at = Some(now);
+                        }
                         if run.timeline.ended_at.is_none() {
-                            run.timeline.ended_at = Some(Utc::now());
+                            run.timeline.ended_at = Some(now);
                         }
                         self.storage.save_run(&run)?;
                     }
@@ -230,8 +369,12 @@ impl ProcessManager {
                 log::warn!("Run {} is Running but has no handle - marking as Unknown", run.run_id);
                 run.status = RunStatus::Unknown;
                 run.reconcile_reason = Some("daemon restarted, no runtime handle".to_string());
+                let now = Utc::now();
+                if run.timeline.started_at.is_none() {
+                    run.timeline.started_at = Some(now);
+                }
                 if run.timeline.ended_at.is_none() {
-                    run.timeline.ended_at = Some(Utc::now());
+                    run.timeline.ended_at = Some(now);
                 }
                 self.storage.save_run(&run)?;
             }
@@ -308,18 +451,8 @@ fn update_run_on_exit(
 ) -> Result<()> {
     let mut run = storage.load_run(run_id)?;
 
-    // CAS: Only update if still Running
-    if run.status != RunStatus::Running {
-        log::warn!(
-            "Run {} is not Running (status: {}), skipping update",
-            run_id,
-            run.status
-        );
-        return Ok(());
-    }
-
-    // Determine new status
-    run.status = match (exit_code, signal) {
+    // Determine new status based on exit code/signal
+    let new_status = match (exit_code, signal) {
         (Some(0), _) => RunStatus::Exited,
         (Some(_), _) => RunStatus::Failed,
         (None, Some(sig)) => {
@@ -333,20 +466,54 @@ fn update_run_on_exit(
         (None, None) => RunStatus::Unknown,
     };
 
-    // Set exit code
-    if let Some(code) = exit_code {
-        run.exit_code = Some(code);
-    } else if let Some(sig) = signal {
-        // Convention: exit code = 128 + signal number
-        run.exit_code = Some(128 + sig);
-    }
+    // Determine which statuses we can update from
+    let expected_statuses = [
+        RunStatus::Running, // normal case
+        RunStatus::Pending, // fast-exit race
+        RunStatus::Killed,  // CLI stopped, we update exit_code/timeline
+    ];
 
-    // Set ended_at (CAS: don't overwrite if already set)
-    if run.timeline.ended_at.is_none() {
-        run.timeline.ended_at = Some(Utc::now());
-    }
+    // Use CAS-style save with lock to prevent CLI/daemon race
+    // The closure receives the fresh run read under lock
+    let saved = storage.save_run_if_status_with(run_id, &expected_statuses, |current| {
+        // Determine new status based on current status
+        let final_status = match current.status {
+            RunStatus::Running | RunStatus::Pending => new_status.clone(),
+            RunStatus::Killed => RunStatus::Killed, // Keep as Killed
+            _ => return, // Won't happen due to expected_statuses check
+        };
 
-    storage.save_run(&run)?;
+        // Apply updates
+        current.status = final_status;
+
+        // Set exit code (don't overwrite if already set)
+        if current.exit_code.is_none() {
+            if let Some(code) = exit_code {
+                current.exit_code = Some(code);
+            } else if let Some(sig) = signal {
+                // Convention: exit code = 128 + signal number
+                current.exit_code = Some(128 + sig);
+            }
+        }
+
+        // Set started_at if not set (fast-exit case: Pending -> terminal)
+        if current.timeline.started_at.is_none() {
+            current.timeline.started_at = Some(Utc::now());
+        }
+
+        // Set ended_at (don't overwrite if already set)
+        if current.timeline.ended_at.is_none() {
+            current.timeline.ended_at = Some(Utc::now());
+        }
+    })?;
+
+    if !saved {
+        log::warn!(
+            "Run {} status changed during update, skipping (CAS failed)",
+            run_id
+        );
+        return Ok(());
+    }
 
     log::info!(
         "Updated run {} status to {} (exit_code: {:?})",

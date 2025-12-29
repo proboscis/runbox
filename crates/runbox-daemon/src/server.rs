@@ -4,8 +4,8 @@
 
 use crate::process_manager::ProcessManager;
 use crate::protocol::{read_message, write_message, Request, Response};
-use anyhow::{Context, Result};
-use std::fs;
+use anyhow::{bail, Context, Result};
+use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -25,11 +25,55 @@ pub fn default_socket_path() -> PathBuf {
 
 /// Get the default PID file path
 pub fn default_pid_path() -> PathBuf {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"));
+    pid_path_for_socket(&default_socket_path())
+}
 
-    runtime_dir.join("runbox").join("daemon.pid")
+/// Get the PID file path for a given socket path
+/// This ensures each socket gets its own PID file, allowing multiple daemons
+pub fn pid_path_for_socket(socket_path: &Path) -> PathBuf {
+    // Use the socket path with .pid extension
+    socket_path.with_extension("pid")
+}
+
+/// Get the default lock file path
+pub fn default_lock_path() -> PathBuf {
+    lock_path_for_socket(&default_socket_path())
+}
+
+/// Get the lock file path for a given socket path
+/// This ensures each socket gets its own lock, allowing multiple daemons
+pub fn lock_path_for_socket(socket_path: &Path) -> PathBuf {
+    // Use the socket path with .lock extension
+    socket_path.with_extension("lock")
+}
+
+/// Acquire an exclusive lock on the lock file
+/// Returns the lock file handle (must be kept open to maintain lock)
+pub fn acquire_daemon_lock(lock_path: &Path) -> Result<File> {
+    // Ensure parent directory exists
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Open/create the lock file
+    let lock_file = File::create(lock_path)
+        .with_context(|| format!("Failed to create lock file: {}", lock_path.display()))?;
+
+    // Try to acquire exclusive lock (non-blocking)
+    // SAFETY: flock is safe with valid fd
+    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&lock_file);
+    let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+
+    if result != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            bail!("Another daemon instance is already running");
+        }
+        return Err(err.into());
+    }
+
+    log::debug!("Acquired daemon lock: {}", lock_path.display());
+    Ok(lock_file)
 }
 
 /// Unix socket server
