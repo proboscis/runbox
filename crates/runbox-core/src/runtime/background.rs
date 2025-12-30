@@ -1,8 +1,10 @@
 //! Background process adapter
 //!
-//! Runs processes in the background using process groups for proper cleanup.
+//! Runs processes in the background via the runbox-daemon for proper exit status capture.
+//! Falls back to direct spawn if daemon is unavailable.
 
 use super::RuntimeAdapter;
+use crate::daemon::DaemonClient;
 use crate::run::{Exec, RuntimeHandle};
 use anyhow::{bail, Result};
 use std::fs::File;
@@ -11,26 +13,23 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// Adapter for running processes in the background
-pub struct BackgroundAdapter;
+pub struct BackgroundAdapter {
+    /// Whether to use the daemon for spawning (default: true)
+    use_daemon: bool,
+}
 
 impl BackgroundAdapter {
     pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for BackgroundAdapter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RuntimeAdapter for BackgroundAdapter {
-    fn name(&self) -> &str {
-        "background"
+        Self { use_daemon: true }
     }
 
-    fn spawn(&self, exec: &Exec, _run_id: &str, log_path: &Path) -> Result<RuntimeHandle> {
+    /// Create an adapter that doesn't use the daemon (for testing)
+    pub fn without_daemon() -> Self {
+        Self { use_daemon: false }
+    }
+
+    /// Spawn a process directly (without daemon)
+    fn spawn_direct(&self, exec: &Exec, _run_id: &str, log_path: &Path) -> Result<RuntimeHandle> {
         // Create log file for stdout/stderr
         let log_file = File::create(log_path)?;
         let log_file_err = log_file.try_clone()?;
@@ -64,10 +63,56 @@ impl RuntimeAdapter for BackgroundAdapter {
 
         // Note: We intentionally don't call child.wait() here.
         // The process runs in the background.
-        // Status updates are handled by reconcile or a separate mechanism.
+        // When not using daemon, status updates are handled by reconcile.
         std::mem::forget(child);
 
         Ok(RuntimeHandle::Background { pid, pgid })
+    }
+
+    /// Spawn a process via the daemon
+    fn spawn_via_daemon(
+        &self,
+        exec: &Exec,
+        run_id: &str,
+        log_path: &Path,
+    ) -> Result<RuntimeHandle> {
+        let client = DaemonClient::new();
+        let (pid, pgid) = client.spawn(run_id, exec, log_path)?;
+        Ok(RuntimeHandle::Background { pid, pgid })
+    }
+}
+
+impl Default for BackgroundAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RuntimeAdapter for BackgroundAdapter {
+    fn name(&self) -> &str {
+        "background"
+    }
+
+    fn spawn(&self, exec: &Exec, run_id: &str, log_path: &Path) -> Result<RuntimeHandle> {
+        if self.use_daemon {
+            // Try to spawn via daemon first
+            match self.spawn_via_daemon(exec, run_id, log_path) {
+                Ok(handle) => {
+                    log::debug!("Spawned process via daemon: {:?}", handle);
+                    return Ok(handle);
+                }
+                Err(e) => {
+                    // Log warning and fall back to direct spawn
+                    log::warn!(
+                        "Failed to spawn via daemon, falling back to direct spawn: {}",
+                        e
+                    );
+                }
+            }
+        }
+
+        // Fall back to direct spawn
+        self.spawn_direct(exec, run_id, log_path)
     }
 
     fn stop(&self, handle: &RuntimeHandle, force: bool) -> Result<()> {
@@ -131,7 +176,8 @@ mod tests {
 
     #[test]
     fn test_spawn_and_stop() {
-        let adapter = BackgroundAdapter::new();
+        // Use direct spawn for testing (no daemon needed)
+        let adapter = BackgroundAdapter::without_daemon();
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("test.log");
 
@@ -165,7 +211,8 @@ mod tests {
 
     #[test]
     fn test_spawn_with_output() {
-        let adapter = BackgroundAdapter::new();
+        // Use direct spawn for testing (no daemon needed)
+        let adapter = BackgroundAdapter::without_daemon();
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("test.log");
 

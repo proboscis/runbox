@@ -1,6 +1,7 @@
-use crate::{Playlist, Run, RunTemplate};
+use crate::{Playlist, Run, RunStatus, RunTemplate};
 use anyhow::{bail, Context, Result};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::PathBuf;
 
 /// Normalize an ID for matching by removing prefix and hyphens, converting to lowercase
@@ -56,12 +57,110 @@ impl Storage {
 
     // === Run operations ===
 
-    /// Save a run
+    /// Save a run (with atomic write via rename)
     pub fn save_run(&self, run: &Run) -> Result<PathBuf> {
         let path = self.base_dir.join("runs").join(format!("{}.json", run.run_id));
+        let temp_path = self.base_dir.join("runs").join(format!("{}.json.tmp", run.run_id));
+
         let json = serde_json::to_string_pretty(run)?;
-        fs::write(&path, json)?;
+
+        // Write to temp file first
+        let mut file = File::create(&temp_path)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?; // Ensure data is flushed to disk
+        drop(file);
+
+        // Atomic rename
+        fs::rename(&temp_path, &path)?;
+
         Ok(path)
+    }
+
+    /// Save a run only if current status is one of the expected statuses
+    /// Returns Ok(true) if saved, Ok(false) if status didn't match
+    /// The update_fn is called with the current run to allow merging fields
+    pub fn save_run_if_status_with<F>(
+        &self,
+        run_id: &str,
+        expected_statuses: &[RunStatus],
+        update_fn: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce(&mut Run),
+    {
+        let path = self.base_dir.join("runs").join(format!("{}.json", run_id));
+        let lock_path = self.base_dir.join("runs").join(format!("{}.json.lock", run_id));
+
+        // Acquire exclusive lock
+        let lock_file = File::create(&lock_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = lock_file.as_raw_fd();
+            // LOCK_EX = exclusive lock, blocking
+            let result = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            if result != 0 {
+                bail!("Failed to acquire lock on {}", lock_path.display());
+            }
+        }
+
+        // Read current state while holding lock
+        if !path.exists() {
+            // File doesn't exist, can't update
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let fd = lock_file.as_raw_fd();
+                unsafe { libc::flock(fd, libc::LOCK_UN) };
+            }
+            bail!("Run not found: {}", run_id);
+        }
+
+        let current_json = fs::read_to_string(&path)?;
+        let mut current_run: Run = serde_json::from_str(&current_json)?;
+
+        if !expected_statuses.contains(&current_run.status) {
+            // Status doesn't match, don't save
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let fd = lock_file.as_raw_fd();
+                unsafe { libc::flock(fd, libc::LOCK_UN) };
+            }
+            return Ok(false);
+        }
+
+        // Apply updates to the fresh copy
+        update_fn(&mut current_run);
+
+        // Write atomically
+        let temp_path = self.base_dir.join("runs").join(format!("{}.json.tmp", run_id));
+        let json = serde_json::to_string_pretty(&current_run)?;
+
+        let mut file = File::create(&temp_path)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+
+        fs::rename(&temp_path, &path)?;
+
+        // Release lock (automatically released when lock_file is dropped, but explicit is clearer)
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = lock_file.as_raw_fd();
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+        }
+
+        Ok(true)
+    }
+
+    /// Simple version that just replaces the run if status matches
+    pub fn save_run_if_status(&self, run: &Run, expected_statuses: &[RunStatus]) -> Result<bool> {
+        let run_clone = run.clone();
+        self.save_run_if_status_with(&run.run_id, expected_statuses, |current| {
+            *current = run_clone;
+        })
     }
 
     /// Load a run by ID
@@ -464,5 +563,102 @@ mod tests {
         // More specific prefix should work
         let resolved = storage.resolve_run_id("5aaa").unwrap();
         assert_eq!(resolved, run1.run_id);
+    }
+
+    #[test]
+    fn test_save_run_if_status_with_match() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create a run with Running status
+        let mut run = Run::new(
+            Exec {
+                argv: vec!["echo".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+                timeout_sec: 0,
+            },
+            CodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch: None,
+            },
+        );
+        run.status = crate::RunStatus::Running;
+        storage.save_run(&run).unwrap();
+
+        // CAS update should succeed when status matches
+        let result = storage.save_run_if_status_with(
+            &run.run_id,
+            &[crate::RunStatus::Running],
+            |current| {
+                current.status = crate::RunStatus::Exited;
+                current.exit_code = Some(0);
+            },
+        ).unwrap();
+
+        assert!(result, "CAS should succeed when status matches");
+
+        // Verify the update was applied
+        let loaded = storage.load_run(&run.run_id).unwrap();
+        assert_eq!(loaded.status, crate::RunStatus::Exited);
+        assert_eq!(loaded.exit_code, Some(0));
+    }
+
+    #[test]
+    fn test_save_run_if_status_with_mismatch() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create a run with Exited status
+        let mut run = Run::new(
+            Exec {
+                argv: vec!["echo".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+                timeout_sec: 0,
+            },
+            CodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch: None,
+            },
+        );
+        run.status = crate::RunStatus::Exited;
+        run.exit_code = Some(0);
+        storage.save_run(&run).unwrap();
+
+        // CAS update should fail when status doesn't match
+        let result = storage.save_run_if_status_with(
+            &run.run_id,
+            &[crate::RunStatus::Running], // Expecting Running but it's Exited
+            |current| {
+                current.status = crate::RunStatus::Unknown;
+                current.exit_code = Some(99);
+            },
+        ).unwrap();
+
+        assert!(!result, "CAS should fail when status doesn't match");
+
+        // Verify the run was NOT modified
+        let loaded = storage.load_run(&run.run_id).unwrap();
+        assert_eq!(loaded.status, crate::RunStatus::Exited);
+        assert_eq!(loaded.exit_code, Some(0));
+    }
+
+    #[test]
+    fn test_save_run_if_status_not_found() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // CAS update should error when run doesn't exist
+        let result = storage.save_run_if_status_with(
+            "run_nonexistent",
+            &[crate::RunStatus::Running],
+            |_| {},
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
     }
 }

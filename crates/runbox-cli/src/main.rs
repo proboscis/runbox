@@ -3,8 +3,9 @@ use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use dialoguer::{theme::ColorfulTheme, Input};
 use runbox_core::{
-    short_id, BindingResolver, ConfigResolver, GitContext, LogRef, Playlist, PlaylistItem,
-    RunStatus, RunTemplate, RuntimeRegistry, Storage, Timeline, Validator, VerboseLogger,
+    default_pid_path, default_socket_path, short_id, BindingResolver, ConfigResolver,
+    DaemonClient, GitContext, LogRef, Playlist, PlaylistItem, RunStatus, RunTemplate,
+    RuntimeRegistry, Storage, Timeline, Validator, VerboseLogger,
 };
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -168,6 +169,24 @@ enum Commands {
         /// Path to JSON file
         path: String,
     },
+
+    /// Manage the background daemon (for debugging)
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonCommands {
+    /// Start the daemon in foreground mode
+    Start,
+    /// Stop the running daemon
+    Stop,
+    /// Check daemon status
+    Status,
+    /// Ping the daemon
+    Ping,
 }
 
 #[derive(Subcommand)]
@@ -269,7 +288,137 @@ fn main() -> Result<()> {
             verbose,
         ),
         Commands::Validate { path } => cmd_validate(&path),
+        Commands::Daemon { command } => match command {
+            DaemonCommands::Start => cmd_daemon_start(),
+            DaemonCommands::Stop => cmd_daemon_stop(),
+            DaemonCommands::Status => cmd_daemon_status(),
+            DaemonCommands::Ping => cmd_daemon_ping(),
+        },
     }
+}
+
+// === Daemon Commands ===
+
+fn cmd_daemon_start() -> Result<()> {
+    use std::process::Command as StdCommand;
+
+    // Find the daemon binary
+    let daemon_path = which_daemon()?;
+
+    println!("Starting daemon in foreground mode...");
+    println!("Daemon path: {}", daemon_path.display());
+    println!("Socket: {}", default_socket_path().display());
+    println!("Press Ctrl+C to stop");
+
+    // Start daemon in foreground
+    let status = StdCommand::new(&daemon_path)
+        .arg("--foreground")
+        .status()
+        .with_context(|| format!("Failed to start daemon from {}", daemon_path.display()))?;
+
+    if status.success() {
+        println!("Daemon exited normally");
+    } else {
+        bail!("Daemon exited with status: {:?}", status.code());
+    }
+
+    Ok(())
+}
+
+fn cmd_daemon_stop() -> Result<()> {
+    let client = DaemonClient::new();
+
+    if !client.is_running() {
+        println!("Daemon is not running");
+        return Ok(());
+    }
+
+    println!("Stopping daemon...");
+    client.shutdown()?;
+    println!("Daemon stopped");
+
+    Ok(())
+}
+
+fn cmd_daemon_status() -> Result<()> {
+    let socket_path = default_socket_path();
+    let pid_path = default_pid_path();
+
+    println!("Socket path: {}", socket_path.display());
+    println!("PID file:    {}", pid_path.display());
+
+    // Check if socket exists
+    if !socket_path.exists() {
+        println!("Status:      not running (no socket)");
+        return Ok(());
+    }
+
+    // Try to connect
+    let client = DaemonClient::new();
+    if client.is_running() {
+        // Read PID if available
+        if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
+            println!("PID:         {}", pid_str.trim());
+        }
+        println!("Status:      running");
+    } else {
+        println!("Status:      not running (socket exists but not responding)");
+    }
+
+    Ok(())
+}
+
+fn cmd_daemon_ping() -> Result<()> {
+    let client = DaemonClient::new();
+
+    println!("Pinging daemon...");
+
+    match client.ping() {
+        Ok(true) => {
+            println!("Daemon is alive (pong received)");
+            Ok(())
+        }
+        Ok(false) => {
+            bail!("Daemon responded but ping failed");
+        }
+        Err(e) => {
+            bail!("Failed to ping daemon: {}", e);
+        }
+    }
+}
+
+/// Find the daemon binary path
+fn which_daemon() -> Result<PathBuf> {
+    // First, check if RUNBOX_DAEMON_PATH env var is set
+    if let Ok(path) = std::env::var("RUNBOX_DAEMON_PATH") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    // Check if runbox-daemon is in the same directory as the current executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let daemon_path = dir.join("runbox-daemon");
+            if daemon_path.exists() {
+                return Ok(daemon_path);
+            }
+        }
+    }
+
+    // Check PATH
+    if let Ok(path_env) = std::env::var("PATH") {
+        for dir in path_env.split(':') {
+            let daemon_path = PathBuf::from(dir).join("runbox-daemon");
+            if daemon_path.exists() {
+                return Ok(daemon_path);
+            }
+        }
+    }
+
+    // Fallback to hoping it's in PATH
+    Ok(PathBuf::from("runbox-daemon"))
 }
 
 // === Run Command ===
@@ -359,13 +508,35 @@ fn cmd_run(
 
     let handle = adapter.spawn(&run.exec, &run.run_id, &log_path)?;
 
-    // Update run with handle and status
-    run.handle = Some(handle);
-    run.status = RunStatus::Running;
-    run.timeline.started_at = Some(Utc::now());
+    // CAS-style update with lock: only update if still Pending
+    // This prevents overwriting terminal state if process exited very fast
+    let saved = storage.save_run_if_status_with(
+        &run.run_id,
+        &[RunStatus::Pending],
+        |current| {
+            current.handle = Some(handle.clone());
+            current.status = RunStatus::Running;
+            current.timeline.started_at = Some(Utc::now());
+        }
+    )?;
 
-    // Save updated run
-    storage.save_run(&run)?;
+    if !saved {
+        // Process already exited - daemon captured the status
+        // Just update handle if not set (using another CAS)
+        let _ = storage.save_run_if_status_with(
+            &run.run_id,
+            &[RunStatus::Exited, RunStatus::Failed, RunStatus::Unknown],
+            |current| {
+                if current.handle.is_none() {
+                    current.handle = Some(handle.clone());
+                }
+            }
+        );
+        log::debug!(
+            "Run {} already exited - daemon captured status",
+            run.run_id
+        );
+    }
 
     println!("Run started: {}", run.run_id);
     println!("Short ID: {}", run.short_id());
@@ -435,7 +606,7 @@ fn cmd_ps(storage: &Storage, status_filter: Option<String>, _all: bool, limit: u
 
 fn cmd_stop(storage: &Storage, run_id: &str, force: bool) -> Result<()> {
     let full_run_id = resolve_run_id(storage, run_id)?;
-    let mut run = storage.load_run(&full_run_id)?;
+    let run = storage.load_run(&full_run_id)?;
 
     // CAS: Only allow stopping if status is Running
     if run.status != RunStatus::Running {
@@ -450,12 +621,19 @@ fn cmd_stop(storage: &Storage, run_id: &str, force: bool) -> Result<()> {
     if let Some(ref handle) = run.handle {
         adapter.stop(handle, force)?;
 
-        // Update run status (CAS: don't overwrite ended_at if already set)
-        run.status = RunStatus::Killed;
-        if run.timeline.ended_at.is_none() {
-            run.timeline.ended_at = Some(Utc::now());
-        }
-        storage.save_run(&run)?;
+        // CAS-style update with lock: only update if still in stoppable state
+        // This prevents overwriting daemon's exit capture
+        let _ = storage.save_run_if_status_with(
+            &full_run_id,
+            &[RunStatus::Running, RunStatus::Pending],
+            |current| {
+                current.status = RunStatus::Killed;
+                if current.timeline.ended_at.is_none() {
+                    current.timeline.ended_at = Some(Utc::now());
+                }
+            }
+        );
+        // Note: if CAS failed, daemon already set terminal state, which is fine
 
         if force {
             println!("Force stopped run: {}", full_run_id);
@@ -604,57 +782,68 @@ fn resolve_run_id(storage: &Storage, id: &str) -> Result<String> {
 }
 
 /// Reconcile run statuses by checking if processes are still alive
-/// Uses CAS-style updates: only update if Running, don't overwrite ended_at
+/// Uses CAS-style updates with locking: only update if Running
 fn reconcile_runs(storage: &Storage) -> Result<()> {
     let runs = storage.list_runs(usize::MAX)?;
     let registry = RuntimeRegistry::new();
 
-    for mut run in runs {
-        // CAS: Only reconcile Running runs (don't transition Unknown back to Running)
+    for run in runs {
+        // Only reconcile Running runs
         if run.status != RunStatus::Running {
             continue;
         }
 
-        let Some(ref handle) = run.handle else {
-            // Running status but no handle - mark as unknown with reason
-            mark_unknown(&mut run, "no runtime handle");
-            storage.save_run(&run)?;
-            continue;
+        let reason = match &run.handle {
+            None => {
+                // Running status but no handle
+                Some("no runtime handle".to_string())
+            }
+            Some(handle) => {
+                let Some(adapter) = registry.get(&run.runtime) else {
+                    continue;
+                };
+
+                if !adapter.is_alive(handle) {
+                    // Process is dead but status is still Running
+                    let reason = match handle {
+                        runbox_core::RuntimeHandle::Background { pid, .. } => {
+                            format!("process {} not found", pid)
+                        }
+                        runbox_core::RuntimeHandle::Tmux { session, window } => {
+                            format!("tmux window '{}:{}' not found", session, window)
+                        }
+                        runbox_core::RuntimeHandle::Zellij { session, tab } => {
+                            format!("zellij tab '{}:{}' not found", session, tab)
+                        }
+                    };
+                    Some(reason)
+                } else {
+                    None // Still alive, no update needed
+                }
+            }
         };
 
-        let Some(adapter) = registry.get(&run.runtime) else {
-            continue;
-        };
-
-        if !adapter.is_alive(handle) {
-            // Process is dead but status is still Running - mark as unknown with reason
-            let reason = match handle {
-                runbox_core::RuntimeHandle::Background { pid, .. } => {
-                    format!("process {} not found", pid)
+        if let Some(reason) = reason {
+            // Use CAS-style save with lock
+            let _ = storage.save_run_if_status_with(
+                &run.run_id,
+                &[RunStatus::Running],
+                |current| {
+                    current.status = RunStatus::Unknown;
+                    current.reconcile_reason = Some(reason.clone());
+                    let now = Utc::now();
+                    if current.timeline.started_at.is_none() {
+                        current.timeline.started_at = Some(now);
+                    }
+                    if current.timeline.ended_at.is_none() {
+                        current.timeline.ended_at = Some(now);
+                    }
                 }
-                runbox_core::RuntimeHandle::Tmux { session, window } => {
-                    format!("tmux window '{}:{}' not found", session, window)
-                }
-                runbox_core::RuntimeHandle::Zellij { session, tab } => {
-                    format!("zellij tab '{}:{}' not found", session, tab)
-                }
-            };
-            mark_unknown(&mut run, &reason);
-            storage.save_run(&run)?;
+            );
         }
     }
 
     Ok(())
-}
-
-/// Mark a run as Unknown with a reason (CAS-style: don't overwrite ended_at)
-fn mark_unknown(run: &mut runbox_core::Run, reason: &str) {
-    run.status = RunStatus::Unknown;
-    run.reconcile_reason = Some(reason.to_string());
-    // CAS: Don't overwrite ended_at if already set
-    if run.timeline.ended_at.is_none() {
-        run.timeline.ended_at = Some(Utc::now());
-    }
 }
 
 // === Template Commands ===

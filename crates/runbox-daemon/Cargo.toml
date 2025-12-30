@@ -1,28 +1,27 @@
 [package]
-name = "runbox-cli"
+name = "runbox-daemon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CLI for runbox"
+description = "Background daemon for runbox process management"
 
 [[bin]]
-name = "runbox"
+name = "runbox-daemon"
 path = "src/main.rs"
 
 [dependencies]
 runbox-core = { workspace = true }
-clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
-uuid = { workspace = true }
+thiserror = { workspace = true }
+libc = "0.2"
 dirs = "5"
-dialoguer = "0.11"
 chrono = { version = "0.4", features = ["serde"] }
 log = "0.4"
+env_logger = "0.11"
+signal-hook = "0.3"
+nix = { version = "0.29", features = ["process", "signal", "fs"] }
 
 [dev-dependencies]
-assert_cmd = "2"
-predicates = "3"
 tempfile = "3"
-serde_json = { workspace = true }
