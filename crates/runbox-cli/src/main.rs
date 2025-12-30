@@ -207,7 +207,11 @@ enum PlaylistCommands {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let storage = Storage::new()?;
+    let storage = if let Ok(home) = std::env::var("RUNBOX_HOME") {
+        Storage::with_base_dir(PathBuf::from(home))?
+    } else {
+        Storage::new()?
+    };
 
     match cli.command {
         Commands::Run {
