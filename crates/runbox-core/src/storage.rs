@@ -24,11 +24,15 @@ pub struct Storage {
 }
 
 impl Storage {
-    /// Create a new Storage with XDG data directory
+    /// Create a new Storage with XDG data directory or RUNBOX_HOME if set
     pub fn new() -> Result<Self> {
-        let base_dir = dirs::data_dir()
-            .context("Could not find data directory")?
-            .join("runbox");
+        let base_dir = if let Ok(home) = std::env::var("RUNBOX_HOME") {
+            PathBuf::from(home)
+        } else {
+            dirs::data_dir()
+                .context("Could not find data directory")?
+                .join("runbox")
+        };
         Self::with_base_dir(base_dir)
     }
 
