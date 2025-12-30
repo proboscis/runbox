@@ -1,5 +1,6 @@
 pub mod binding;
 pub mod config;
+pub mod daemon;
 pub mod git;
 pub mod playlist;
 pub mod run;
@@ -10,6 +11,7 @@ pub mod validation;
 
 pub use binding::BindingResolver;
 pub use config::{ConfigResolver, ConfigSource, ResolvedValue, RunboxConfig, VerboseLogger};
+pub use daemon::{default_pid_path, default_socket_path, DaemonClient, Request, Response};
 pub use git::{GitContext, WorktreeInfo, WorktreeReplayResult};
 pub use playlist::{Playlist, PlaylistItem};
 pub use run::{CodeState, Exec, LogRef, Patch, Run, RunStatus, RuntimeHandle, Timeline};
