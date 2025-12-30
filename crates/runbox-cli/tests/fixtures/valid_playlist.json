@@ -1,0 +1,8 @@
+{
+    "playlist_id": "pl_daily_tasks",
+    "name": "Daily Tasks",
+    "items": [
+        {"template_id": "tpl_runner"},
+        {"template_id": "tpl_eval", "label": "Evaluation"}
+    ]
+}
