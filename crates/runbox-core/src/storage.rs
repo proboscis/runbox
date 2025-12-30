@@ -24,7 +24,9 @@ pub struct Storage {
 }
 
 impl Storage {
-    /// Create a new Storage with XDG data directory or RUNBOX_HOME if set
+    /// Create a new Storage
+    ///
+    /// Uses RUNBOX_HOME environment variable if set, otherwise uses XDG data directory
     pub fn new() -> Result<Self> {
         let base_dir = if let Ok(home) = std::env::var("RUNBOX_HOME") {
             PathBuf::from(home)
