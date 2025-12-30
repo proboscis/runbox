@@ -126,4 +126,54 @@ mod tests {
 
         assert!(matches!(parsed, Request::Ping));
     }
+
+    #[test]
+    fn test_read_message_rejects_oversize() {
+        // Create a message with length > 1MB
+        let mut buf = Vec::new();
+        let huge_len: u32 = 2 * 1024 * 1024; // 2MB
+        buf.extend_from_slice(&huge_len.to_be_bytes());
+        buf.extend_from_slice(b"{}"); // Some payload
+
+        let mut cursor = Cursor::new(buf);
+        let result: std::io::Result<Request> = read_message(&mut cursor);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn test_read_message_invalid_json() {
+        // Create a message with invalid JSON
+        let invalid_json = b"not valid json";
+        let mut buf = Vec::new();
+        let len = invalid_json.len() as u32;
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(invalid_json);
+
+        let mut cursor = Cursor::new(buf);
+        let result: std::io::Result<Request> = read_message(&mut cursor);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("Invalid JSON"));
+    }
+
+    #[test]
+    fn test_read_message_truncated() {
+        // Create a message that claims more data than available
+        let mut buf = Vec::new();
+        let len: u32 = 100;
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(b"{}"); // Only 2 bytes, not 100
+
+        let mut cursor = Cursor::new(buf);
+        let result: std::io::Result<Request> = read_message(&mut cursor);
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+    }
 }

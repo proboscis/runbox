@@ -558,4 +558,101 @@ mod tests {
         let resolved = storage.resolve_run_id("5aaa").unwrap();
         assert_eq!(resolved, run1.run_id);
     }
+
+    #[test]
+    fn test_save_run_if_status_with_match() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create a run with Running status
+        let mut run = Run::new(
+            Exec {
+                argv: vec!["echo".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+                timeout_sec: 0,
+            },
+            CodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch: None,
+            },
+        );
+        run.status = crate::RunStatus::Running;
+        storage.save_run(&run).unwrap();
+
+        // CAS update should succeed when status matches
+        let result = storage.save_run_if_status_with(
+            &run.run_id,
+            &[crate::RunStatus::Running],
+            |current| {
+                current.status = crate::RunStatus::Exited;
+                current.exit_code = Some(0);
+            },
+        ).unwrap();
+
+        assert!(result, "CAS should succeed when status matches");
+
+        // Verify the update was applied
+        let loaded = storage.load_run(&run.run_id).unwrap();
+        assert_eq!(loaded.status, crate::RunStatus::Exited);
+        assert_eq!(loaded.exit_code, Some(0));
+    }
+
+    #[test]
+    fn test_save_run_if_status_with_mismatch() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create a run with Exited status
+        let mut run = Run::new(
+            Exec {
+                argv: vec!["echo".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+                timeout_sec: 0,
+            },
+            CodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch: None,
+            },
+        );
+        run.status = crate::RunStatus::Exited;
+        run.exit_code = Some(0);
+        storage.save_run(&run).unwrap();
+
+        // CAS update should fail when status doesn't match
+        let result = storage.save_run_if_status_with(
+            &run.run_id,
+            &[crate::RunStatus::Running], // Expecting Running but it's Exited
+            |current| {
+                current.status = crate::RunStatus::Unknown;
+                current.exit_code = Some(99);
+            },
+        ).unwrap();
+
+        assert!(!result, "CAS should fail when status doesn't match");
+
+        // Verify the run was NOT modified
+        let loaded = storage.load_run(&run.run_id).unwrap();
+        assert_eq!(loaded.status, crate::RunStatus::Exited);
+        assert_eq!(loaded.exit_code, Some(0));
+    }
+
+    #[test]
+    fn test_save_run_if_status_not_found() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // CAS update should error when run doesn't exist
+        let result = storage.save_run_if_status_with(
+            "run_nonexistent",
+            &[crate::RunStatus::Running],
+            |_| {},
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
 }

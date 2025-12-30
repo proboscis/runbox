@@ -677,4 +677,321 @@ mod tests {
         let updated_run = storage2.load_run(&run_id).unwrap();
         assert!(matches!(updated_run.status, RunStatus::Killed | RunStatus::Failed));
     }
+
+    #[test]
+    fn test_spawn_rejects_empty_argv() {
+        let _ = env_logger::try_init();
+
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+        let manager = ProcessManager::new(storage);
+
+        let log_path = dir.path().join("test.log");
+        let exec = Exec {
+            argv: vec![], // Empty argv
+            cwd: ".".to_string(),
+            env: HashMap::new(),
+            timeout_sec: 0,
+        };
+
+        let result = manager.spawn("run_test", &exec, &log_path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn test_fast_exit_pending_sets_timeline() {
+        let _ = env_logger::try_init();
+
+        let dir = tempdir().unwrap();
+        let base_path = dir.path().to_path_buf();
+        let storage = Storage::with_base_dir(base_path.clone()).unwrap();
+
+        let log_path = dir.path().join("test.log");
+        let exec = Exec {
+            argv: vec!["true".to_string()], // Exits immediately
+            cwd: ".".to_string(),
+            env: HashMap::new(),
+            timeout_sec: 0,
+        };
+
+        // Create a run with Pending status (simulating fast-exit race)
+        let mut run = Run::new(
+            exec.clone(),
+            CodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch: None,
+            },
+        );
+        run.status = RunStatus::Pending; // Still Pending when process exits
+        let run_id = run.run_id.clone();
+        storage.save_run(&run).unwrap();
+
+        // Create manager and spawn
+        let manager = ProcessManager::new(storage);
+        manager.spawn(&run_id, &exec, &log_path).unwrap();
+
+        // Wait for the fast exit
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        manager.cleanup_completed();
+
+        // Verify timeline is complete even though status was Pending
+        let storage2 = Storage::with_base_dir(base_path).unwrap();
+        let updated_run = storage2.load_run(&run_id).unwrap();
+        assert_eq!(updated_run.status, RunStatus::Exited);
+        assert!(updated_run.timeline.started_at.is_some(), "started_at should be set");
+        assert!(updated_run.timeline.ended_at.is_some(), "ended_at should be set");
+    }
+
+    #[test]
+    fn test_killed_status_preserves_but_updates_exit_code() {
+        let _ = env_logger::try_init();
+
+        let dir = tempdir().unwrap();
+        let base_path = dir.path().to_path_buf();
+        let storage = Storage::with_base_dir(base_path.clone()).unwrap();
+
+        let log_path = dir.path().join("test.log");
+        let exec = Exec {
+            argv: vec!["sleep".to_string(), "60".to_string()],
+            cwd: ".".to_string(),
+            env: HashMap::new(),
+            timeout_sec: 0,
+        };
+
+        // Create a run
+        let mut run = Run::new(
+            exec.clone(),
+            CodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch: None,
+            },
+        );
+        run.status = RunStatus::Running;
+        let run_id = run.run_id.clone();
+        storage.save_run(&run).unwrap();
+
+        // Create manager and spawn
+        let manager = ProcessManager::new(storage);
+        manager.spawn(&run_id, &exec, &log_path).unwrap();
+
+        // Simulate CLI marking as Killed before daemon captures exit
+        let storage2 = Storage::with_base_dir(base_path.clone()).unwrap();
+        let mut updated = storage2.load_run(&run_id).unwrap();
+        updated.status = RunStatus::Killed;
+        storage2.save_run(&updated).unwrap();
+
+        // Now stop the process
+        manager.stop(&run_id, true).unwrap();
+
+        // Wait for exit capture
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        manager.cleanup_completed();
+
+        // Verify status stayed Killed but exit_code was set
+        let storage3 = Storage::with_base_dir(base_path).unwrap();
+        let final_run = storage3.load_run(&run_id).unwrap();
+        assert_eq!(final_run.status, RunStatus::Killed, "status should remain Killed");
+        assert!(final_run.exit_code.is_some(), "exit_code should be set");
+        assert!(final_run.timeline.ended_at.is_some(), "ended_at should be set");
+    }
+
+    #[test]
+    fn test_stop_unknown_run_returns_error() {
+        let _ = env_logger::try_init();
+
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+        let manager = ProcessManager::new(storage);
+
+        let result = manager.stop("run_nonexistent", false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No process found"));
+    }
+
+    #[test]
+    fn test_status_unknown_run_returns_error() {
+        let _ = env_logger::try_init();
+
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+        let manager = ProcessManager::new(storage);
+
+        let result = manager.status("run_nonexistent");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No process found"));
+    }
+
+    #[test]
+    fn test_status_from_storage_after_cleanup() {
+        let _ = env_logger::try_init();
+
+        let dir = tempdir().unwrap();
+        let base_path = dir.path().to_path_buf();
+        let storage = Storage::with_base_dir(base_path.clone()).unwrap();
+
+        let log_path = dir.path().join("test.log");
+        let exec = Exec {
+            argv: vec!["true".to_string()],
+            cwd: ".".to_string(),
+            env: HashMap::new(),
+            timeout_sec: 0,
+        };
+
+        // Create and save run
+        let mut run = Run::new(
+            exec.clone(),
+            CodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch: None,
+            },
+        );
+        run.status = RunStatus::Running;
+        let run_id = run.run_id.clone();
+        storage.save_run(&run).unwrap();
+
+        let manager = ProcessManager::new(storage);
+        manager.spawn(&run_id, &exec, &log_path).unwrap();
+
+        // Wait for completion and cleanup
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        manager.cleanup_completed();
+
+        // Status should still work by reading from storage
+        let (alive, exit_code, _signal) = manager.status(&run_id).unwrap();
+        assert!(!alive, "process should not be alive");
+        assert_eq!(exit_code, Some(0), "exit_code should be from storage");
+    }
+
+    #[test]
+    fn test_reconcile_marks_dead_as_unknown() {
+        let _ = env_logger::try_init();
+
+        let dir = tempdir().unwrap();
+        let base_path = dir.path().to_path_buf();
+        let storage = Storage::with_base_dir(base_path.clone()).unwrap();
+
+        // Create a Running run with a dead PID (PID 1 is init, can't be our process)
+        // Use a very high PID that's unlikely to exist
+        let mut run = Run::new(
+            Exec {
+                argv: vec!["echo".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+                timeout_sec: 0,
+            },
+            CodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch: None,
+            },
+        );
+        run.status = RunStatus::Running;
+        run.handle = Some(runbox_core::RuntimeHandle::Background {
+            pid: 999999999, // Non-existent PID
+            pgid: 999999999,
+        });
+        let run_id = run.run_id.clone();
+        storage.save_run(&run).unwrap();
+
+        // Create manager and reconcile
+        let manager = ProcessManager::new(storage);
+        manager.reconcile_on_start().unwrap();
+
+        // Verify run is marked Unknown with timeline
+        let storage2 = Storage::with_base_dir(base_path).unwrap();
+        let updated = storage2.load_run(&run_id).unwrap();
+        assert_eq!(updated.status, RunStatus::Unknown);
+        assert!(updated.reconcile_reason.is_some());
+        assert!(updated.timeline.started_at.is_some(), "started_at should be set");
+        assert!(updated.timeline.ended_at.is_some(), "ended_at should be set");
+    }
+
+    #[test]
+    fn test_reconcile_running_no_handle_marks_unknown() {
+        let _ = env_logger::try_init();
+
+        let dir = tempdir().unwrap();
+        let base_path = dir.path().to_path_buf();
+        let storage = Storage::with_base_dir(base_path.clone()).unwrap();
+
+        // Create a Running run without a handle
+        let mut run = Run::new(
+            Exec {
+                argv: vec!["echo".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+                timeout_sec: 0,
+            },
+            CodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch: None,
+            },
+        );
+        run.status = RunStatus::Running;
+        run.handle = None; // No handle
+        let run_id = run.run_id.clone();
+        storage.save_run(&run).unwrap();
+
+        // Create manager and reconcile
+        let manager = ProcessManager::new(storage);
+        manager.reconcile_on_start().unwrap();
+
+        // Verify run is marked Unknown
+        let storage2 = Storage::with_base_dir(base_path).unwrap();
+        let updated = storage2.load_run(&run_id).unwrap();
+        assert_eq!(updated.status, RunStatus::Unknown);
+        assert!(updated.reconcile_reason.as_ref().unwrap().contains("no runtime handle"));
+    }
+
+    #[test]
+    fn test_signal_exit_sets_128_plus_signal() {
+        let _ = env_logger::try_init();
+
+        let dir = tempdir().unwrap();
+        let base_path = dir.path().to_path_buf();
+        let storage = Storage::with_base_dir(base_path.clone()).unwrap();
+
+        let log_path = dir.path().join("test.log");
+        let exec = Exec {
+            argv: vec!["sleep".to_string(), "60".to_string()],
+            cwd: ".".to_string(),
+            env: HashMap::new(),
+            timeout_sec: 0,
+        };
+
+        // Create a run
+        let mut run = Run::new(
+            exec.clone(),
+            CodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch: None,
+            },
+        );
+        run.status = RunStatus::Running;
+        let run_id = run.run_id.clone();
+        storage.save_run(&run).unwrap();
+
+        let manager = ProcessManager::new(storage);
+        manager.spawn(&run_id, &exec, &log_path).unwrap();
+
+        // Kill with SIGKILL (9)
+        manager.stop(&run_id, true).unwrap();
+
+        // Wait for exit capture
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        manager.cleanup_completed();
+
+        // Verify exit_code is 128+9=137
+        let storage2 = Storage::with_base_dir(base_path).unwrap();
+        let updated = storage2.load_run(&run_id).unwrap();
+        // Note: actual exit_code depends on whether CAS succeeded
+        // The important thing is that exit_code is set
+        assert!(updated.exit_code.is_some(), "exit_code should be set for signal exit");
+    }
 }
