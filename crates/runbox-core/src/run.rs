@@ -3,6 +3,26 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Source of how a run was created
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunSource {
+    /// Run created from a template
+    #[default]
+    Template,
+    /// Run created directly from command line
+    Direct,
+}
+
+impl std::fmt::Display for RunSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunSource::Template => write!(f, "template"),
+            RunSource::Direct => write!(f, "direct"),
+        }
+    }
+}
+
 /// A fully-resolved, reproducible execution record
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Run {
@@ -27,6 +47,9 @@ pub struct Run {
     /// Reason for Unknown status (set by reconcile)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reconcile_reason: Option<String>,
+    /// Source of how this run was created (template or direct)
+    #[serde(default)]
+    pub source: RunSource,
 }
 
 /// Run status
@@ -138,7 +161,15 @@ impl Run {
             },
             exit_code: None,
             reconcile_reason: None,
+            source: RunSource::Template,
         }
+    }
+
+    /// Create a new Run for direct command execution
+    pub fn new_direct(exec: Exec, code_state: CodeState) -> Self {
+        let mut run = Self::new(exec, code_state);
+        run.source = RunSource::Direct;
+        run
     }
 
     /// Get short ID (first 8 chars of UUID portion)
@@ -220,6 +251,7 @@ mod tests {
             timeline: Timeline::default(),
             exit_code: None,
             reconcile_reason: None,
+            source: RunSource::Template,
         };
 
         let json = serde_json::to_string_pretty(&run).unwrap();
@@ -250,6 +282,7 @@ mod tests {
             timeline: Timeline::default(),
             exit_code: None,
             reconcile_reason: None,
+            source: RunSource::Template,
         };
 
         assert_eq!(run.short_id(), "550e8400");
@@ -263,6 +296,12 @@ mod tests {
         assert_eq!(RunStatus::Failed.to_string(), "failed");
         assert_eq!(RunStatus::Killed.to_string(), "killed");
         assert_eq!(RunStatus::Unknown.to_string(), "unknown");
+    }
+
+    #[test]
+    fn test_run_source_display() {
+        assert_eq!(RunSource::Template.to_string(), "template");
+        assert_eq!(RunSource::Direct.to_string(), "direct");
     }
 
     #[test]
@@ -285,5 +324,25 @@ mod tests {
         assert_eq!(run.run_id, "run_test123");
         assert_eq!(run.status, RunStatus::Pending);
         assert!(run.handle.is_none());
+        // Source should default to Template
+        assert_eq!(run.source, RunSource::Template);
+    }
+
+    #[test]
+    fn test_new_direct() {
+        let exec = Exec {
+            argv: vec!["echo".to_string(), "hello".to_string()],
+            cwd: ".".to_string(),
+            env: HashMap::new(),
+            timeout_sec: 0,
+        };
+        let code_state = CodeState {
+            repo_url: "git@github.com:org/repo.git".to_string(),
+            base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+            patch: None,
+        };
+
+        let run = Run::new_direct(exec, code_state);
+        assert_eq!(run.source, RunSource::Direct);
     }
 }

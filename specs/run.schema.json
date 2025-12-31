@@ -76,6 +76,11 @@
                 "ref",
                 "sha256"
             ]
+        },
+        "#Source": {
+            "type": "string",
+            "enum": ["template", "direct"],
+            "description": "Source of how the run was created (template-based or direct command)"
         }
     },
     "type": "object",
@@ -93,6 +98,9 @@
         },
         "run_version": {
             "const": 0
+        },
+        "source": {
+            "$ref": "#/$defs/#Source"
         }
     },
     "required": [
