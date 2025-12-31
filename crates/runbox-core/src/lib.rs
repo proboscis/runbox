@@ -14,7 +14,7 @@ pub use config::{ConfigResolver, ConfigSource, ResolvedValue, RunboxConfig, Verb
 pub use daemon::{default_pid_path, default_socket_path, DaemonClient, Request, Response};
 pub use git::{GitContext, WorktreeInfo, WorktreeReplayResult};
 pub use playlist::{Playlist, PlaylistItem};
-pub use run::{CodeState, Exec, LogRef, Patch, Run, RunStatus, RuntimeHandle, Timeline};
+pub use run::{CodeState, Exec, LogRef, Patch, Run, RunSource, RunStatus, RuntimeHandle, Timeline};
 pub use runtime::{BackgroundAdapter, RuntimeAdapter, RuntimeRegistry, TmuxAdapter};
 pub use storage::{short_id, Storage};
 pub use template::{Bindings, RunTemplate, TemplateCodeState, TemplateExec};

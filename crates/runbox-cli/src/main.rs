@@ -3,9 +3,9 @@ use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use dialoguer::{theme::ColorfulTheme, Input};
 use runbox_core::{
-    default_pid_path, default_socket_path, short_id, BindingResolver, ConfigResolver,
-    DaemonClient, GitContext, LogRef, Playlist, PlaylistItem, RunStatus, RunTemplate,
-    RuntimeRegistry, Storage, Timeline, Validator, VerboseLogger,
+    default_pid_path, default_socket_path, short_id, BindingResolver, CodeState, ConfigResolver,
+    DaemonClient, Exec, GitContext, LogRef, Playlist, PlaylistItem, Run, RunSource, RunStatus,
+    RunTemplate, RuntimeRegistry, Storage, Timeline, Validator, VerboseLogger,
 };
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -45,13 +45,16 @@ impl std::fmt::Display for RuntimeType {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run from a template
+    /// Run from a template or execute a command directly
+    ///
+    /// To run from a template: runbox run --template <id> [--binding key=value]
+    /// To run directly: runbox run -- <command...>
     Run {
-        /// Template ID
+        /// Template ID (for template-based runs)
         #[arg(short, long)]
-        template: String,
+        template: Option<String>,
 
-        /// Variable bindings (key=value)
+        /// Variable bindings (key=value) for template runs
         #[arg(short, long)]
         binding: Vec<String>,
 
@@ -59,9 +62,60 @@ enum Commands {
         #[arg(long, default_value = "bg")]
         runtime: RuntimeType,
 
+        /// Command timeout in seconds (0 = no timeout)
+        #[arg(long, default_value = "0")]
+        timeout: u64,
+
+        /// Additional environment variables (KEY=VALUE)
+        #[arg(long = "env", short = 'e')]
+        env_vars: Vec<String>,
+
+        /// Working directory (default: current)
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+
+        /// Skip git context capture (for direct runs)
+        #[arg(long)]
+        no_git: bool,
+
         /// Skip execution (dry run)
         #[arg(long)]
         dry_run: bool,
+
+        /// Command to execute directly (everything after --)
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+
+    /// Log a command execution (alias for `runbox run --`)
+    Log {
+        /// Runtime environment (bg, background, tmux)
+        #[arg(long, default_value = "bg")]
+        runtime: RuntimeType,
+
+        /// Command timeout in seconds (0 = no timeout)
+        #[arg(long, default_value = "0")]
+        timeout: u64,
+
+        /// Additional environment variables (KEY=VALUE)
+        #[arg(long = "env", short = 'e')]
+        env_vars: Vec<String>,
+
+        /// Working directory (default: current)
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+
+        /// Skip git context capture
+        #[arg(long)]
+        no_git: bool,
+
+        /// Skip execution (dry run)
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Command to execute (everything after --)
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
     },
 
     /// List running and recent runs
@@ -237,8 +291,32 @@ fn main() -> Result<()> {
             template,
             binding,
             runtime,
+            timeout,
+            env_vars,
+            cwd,
+            no_git,
             dry_run,
-        } => cmd_run(&storage, &template, binding, runtime, dry_run),
+            command,
+        } => {
+            if let Some(template_id) = template {
+                // Template-based run
+                cmd_run_template(&storage, &template_id, binding, runtime, dry_run)
+            } else if !command.is_empty() {
+                // Direct command execution
+                cmd_run_direct(&storage, command, runtime, timeout, env_vars, cwd, no_git, dry_run)
+            } else {
+                bail!("Either --template or a command after -- is required.\n\nUsage:\n  runbox run --template <id>  # Run from template\n  runbox run -- <command>     # Run command directly")
+            }
+        }
+        Commands::Log {
+            runtime,
+            timeout,
+            env_vars,
+            cwd,
+            no_git,
+            dry_run,
+            command,
+        } => cmd_run_direct(&storage, command, runtime, timeout, env_vars, cwd, no_git, dry_run),
         Commands::Ps { status, all, limit } => cmd_ps(&storage, status, all, limit),
         Commands::Stop { run_id, force } => cmd_stop(&storage, &run_id, force),
         Commands::Logs {
@@ -421,9 +499,10 @@ fn which_daemon() -> Result<PathBuf> {
     Ok(PathBuf::from("runbox-daemon"))
 }
 
-// === Run Command ===
+// === Run Commands ===
 
-fn cmd_run(
+/// Run a command from a template
+fn cmd_run_template(
     storage: &Storage,
     template_id: &str,
     bindings: Vec<String>,
@@ -497,6 +576,7 @@ fn cmd_run(
         ended_at: None,
     };
     run.status = RunStatus::Pending;
+    run.source = RunSource::Template;
 
     // Save run (before spawning)
     storage.save_run(&run)?;
@@ -523,6 +603,147 @@ fn cmd_run(
     if !saved {
         // Process already exited - daemon captured the status
         // Just update handle if not set (using another CAS)
+        let _ = storage.save_run_if_status_with(
+            &run.run_id,
+            &[RunStatus::Exited, RunStatus::Failed, RunStatus::Unknown],
+            |current| {
+                if current.handle.is_none() {
+                    current.handle = Some(handle.clone());
+                }
+            }
+        );
+        log::debug!(
+            "Run {} already exited - daemon captured status",
+            run.run_id
+        );
+    }
+
+    println!("Run started: {}", run.run_id);
+    println!("Short ID: {}", run.short_id());
+    println!("Logs: {}", log_path.display());
+
+    if matches!(runtime, RuntimeType::Tmux) {
+        println!("Attach with: runbox attach {}", run.short_id());
+    }
+
+    Ok(())
+}
+
+/// Run a command directly without a template
+fn cmd_run_direct(
+    storage: &Storage,
+    command: Vec<String>,
+    runtime: RuntimeType,
+    timeout: u64,
+    env_vars: Vec<String>,
+    cwd: Option<PathBuf>,
+    no_git: bool,
+    dry_run: bool,
+) -> Result<()> {
+    if command.is_empty() {
+        bail!("No command specified. Usage: runbox run -- <command>");
+    }
+
+    // Generate run_id
+    let run_id = format!("run_{}", uuid::Uuid::new_v4());
+
+    // Parse environment variables
+    let mut env = std::collections::HashMap::new();
+    for env_var in env_vars {
+        if let Some((key, value)) = env_var.split_once('=') {
+            env.insert(key.to_string(), value.to_string());
+        } else {
+            bail!("Invalid environment variable format: '{}'. Use KEY=VALUE", env_var);
+        }
+    }
+
+    // Determine working directory
+    let cwd_str = if let Some(ref dir) = cwd {
+        dir.to_string_lossy().to_string()
+    } else {
+        std::env::current_dir()?.to_string_lossy().to_string()
+    };
+
+    // Build exec
+    let exec = Exec {
+        argv: command.clone(),
+        cwd: cwd_str,
+        env,
+        timeout_sec: timeout,
+    };
+
+    // Build code state (optionally skip git)
+    let code_state = if no_git {
+        // Create a placeholder code state when git is skipped
+        CodeState {
+            repo_url: "none".to_string(),
+            base_commit: "0".repeat(40),  // Placeholder 40-char SHA
+            patch: None,
+        }
+    } else {
+        let git = GitContext::from_current_dir()?;
+        git.build_code_state(&run_id)?
+    };
+
+    // Create run
+    let mut run = Run::new_direct(exec, code_state);
+    run.run_id = run_id;
+
+    // Validate
+    run.validate()?;
+
+    if dry_run {
+        println!("Dry run - would execute:");
+        println!("{}", serde_json::to_string_pretty(&run)?);
+        return Ok(());
+    }
+
+    // Get runtime adapter
+    let registry = RuntimeRegistry::new();
+    let runtime_name = runtime.to_string();
+    let adapter = registry
+        .get(&runtime_name)
+        .context(format!("Unknown runtime: {}", runtime_name))?;
+
+    // Set up log path
+    let log_path = storage.log_path(&run.run_id);
+
+    // Update run with runtime info
+    run.runtime = runtime_name.clone();
+    run.log_ref = Some(LogRef {
+        path: log_path.clone(),
+    });
+    run.timeline = Timeline {
+        created_at: Some(Utc::now()),
+        started_at: None,
+        ended_at: None,
+    };
+    run.status = RunStatus::Pending;
+
+    // Save run (before spawning)
+    storage.save_run(&run)?;
+
+    // Spawn process
+    println!("Starting run: {}", run.run_id);
+    println!("Source: direct");
+    println!("Runtime: {}", runtime_name);
+    println!("Command: {:?}", run.exec.argv);
+
+    let handle = adapter.spawn(&run.exec, &run.run_id, &log_path)?;
+
+    // CAS-style update with lock: only update if still Pending
+    let saved = storage.save_run_if_status_with(
+        &run.run_id,
+        &[RunStatus::Pending],
+        |current| {
+            current.handle = Some(handle.clone());
+            current.status = RunStatus::Running;
+            current.timeline.started_at = Some(Utc::now());
+        }
+    )?;
+
+    if !saved {
+        // Process already exited - daemon captured the status
         let _ = storage.save_run_if_status_with(
             &run.run_id,
             &[RunStatus::Exited, RunStatus::Failed, RunStatus::Unknown],
@@ -1004,6 +1225,7 @@ fn cmd_show(storage: &Storage, run_id: &str) -> Result<()> {
     println!("Run ID:     {}", run.run_id);
     println!("Short ID:   {}", run.short_id());
     println!("Status:     {}", run.status);
+    println!("Source:     {}", run.source);
     println!("Runtime:    {}", if run.runtime.is_empty() { "-" } else { &run.runtime });
     println!();
     println!("Command:    {:?}", run.exec.argv);
