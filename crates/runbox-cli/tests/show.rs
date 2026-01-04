@@ -111,6 +111,7 @@ fn test_show_all_fields() {
             "ended_at": "2024-01-15T10:05:00Z"
         },
         "exit_code": 0,
+        "reconcile_reason": "manual",
         "log_ref": {
             "path": "/tmp/test.log"
         }
@@ -138,12 +139,15 @@ fn test_show_all_fields() {
         .stdout(predicate::str::contains("Command:"))
         .stdout(predicate::str::contains("make"))
         .stdout(predicate::str::contains("Cwd:"))
+        .stdout(predicate::str::contains("Env:"))
+        .stdout(predicate::str::contains("DEBUG"))
         // Verify code_state fields
         .stdout(predicate::str::contains("Repo:"))
         .stdout(predicate::str::contains("git@github.com:example/project.git"))
         .stdout(predicate::str::contains("Commit:"))
         .stdout(predicate::str::contains("deadbeef"))
         .stdout(predicate::str::contains("Patch:"))
+        .stdout(predicate::str::contains("yes"))
         // Verify timeline
         .stdout(predicate::str::contains("Created:"))
         .stdout(predicate::str::contains("Started:"))
@@ -151,6 +155,9 @@ fn test_show_all_fields() {
         // Verify exit code
         .stdout(predicate::str::contains("Exit Code:"))
         .stdout(predicate::str::contains("0"))
+        // Verify reconcile reason
+        .stdout(predicate::str::contains("Reconcile:"))
+        .stdout(predicate::str::contains("manual"))
         // Verify log reference
         .stdout(predicate::str::contains("Log:"));
 }
