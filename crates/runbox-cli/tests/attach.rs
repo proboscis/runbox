@@ -6,6 +6,8 @@ use tempfile::TempDir;
 #[test]
 fn test_attach_not_found() {
     let temp = TempDir::new().unwrap();
+    let runs_dir = temp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
 
     Command::cargo_bin("runbox")
         .unwrap()
@@ -171,9 +173,16 @@ fn test_attach_tmux() {
     )
     .unwrap();
 
-    // Note: We can't fully test attach as it requires an interactive terminal.
     // The attach command will fail because stdout is not a TTY,
-    // but we can verify it gets past the validation stage.
+    // but we can verify it gets past validation and reaches tmux.
+    Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .env_remove("TMUX")
+        .args(["attach", "c3d4e5f6"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("terminal"));
 
     // Clean up tmux session
     let _ = StdCommand::new("tmux")
