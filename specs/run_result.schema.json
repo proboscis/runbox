@@ -1,0 +1,93 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+        "#Execution": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "started_at": {
+                    "type": "string",
+                    "format": "date-time"
+                },
+                "finished_at": {
+                    "type": "string",
+                    "format": "date-time"
+                },
+                "exit_code": {
+                    "type": "integer"
+                },
+                "duration_ms": {
+                    "type": "integer",
+                    "minimum": 0
+                }
+            },
+            "required": [
+                "started_at",
+                "finished_at",
+                "exit_code",
+                "duration_ms"
+            ]
+        },
+        "#Output": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "stdout_ref": {
+                    "type": "string"
+                },
+                "stderr_ref": {
+                    "type": "string"
+                }
+            }
+        },
+        "#Artifact": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "name": {
+                    "type": "string"
+                },
+                "path": {
+                    "type": "string"
+                },
+                "ref": {
+                    "type": "string"
+                }
+            },
+            "required": [
+                "name",
+                "path",
+                "ref"
+            ]
+        }
+    },
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+        "result_id": {
+            "type": "string",
+            "pattern": "^result_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "run_id": {
+            "type": "string",
+            "pattern": "^run_"
+        },
+        "execution": {
+            "$ref": "#/$defs/#Execution"
+        },
+        "output": {
+            "$ref": "#/$defs/#Output"
+        },
+        "artifacts": {
+            "type": "array",
+            "items": {
+                "$ref": "#/$defs/#Artifact"
+            }
+        }
+    },
+    "required": [
+        "result_id",
+        "run_id",
+        "execution"
+    ]
+}

@@ -1,14 +1,15 @@
-use crate::{Playlist, Run, RunStatus, RunTemplate};
+use crate::{Playlist, Run, RunResult, RunStatus, RunTemplate};
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 
-/// Normalize an ID for matching by removing prefix and hyphens, converting to lowercase
 fn normalize_for_match(id: &str) -> String {
     id.trim_start_matches("run_")
         .trim_start_matches("tpl_")
         .trim_start_matches("pl_")
+        .trim_start_matches("result_")
         .replace('-', "")
         .to_lowercase()
 }
@@ -39,12 +40,12 @@ impl Storage {
         Self::with_base_dir(base_dir)
     }
 
-    /// Create a new Storage with custom base directory
     pub fn with_base_dir(base_dir: PathBuf) -> Result<Self> {
-        // Create directories if they don't exist
         fs::create_dir_all(base_dir.join("runs"))?;
         fs::create_dir_all(base_dir.join("templates"))?;
         fs::create_dir_all(base_dir.join("playlists"))?;
+        fs::create_dir_all(base_dir.join("results"))?;
+        fs::create_dir_all(base_dir.join("blobs"))?;
         fs::create_dir_all(base_dir.join("logs"))?;
 
         Ok(Self { base_dir })
@@ -313,7 +314,6 @@ impl Storage {
         Ok(playlists)
     }
 
-    /// Delete a playlist by ID
     pub fn delete_playlist(&self, playlist_id: &str) -> Result<()> {
         let path = self
             .base_dir
@@ -321,6 +321,129 @@ impl Storage {
             .join(format!("{}.json", playlist_id));
         fs::remove_file(&path).with_context(|| format!("Playlist not found: {}", playlist_id))?;
         Ok(())
+    }
+
+    // === Result operations ===
+
+    pub fn save_result(&self, result: &RunResult) -> Result<PathBuf> {
+        let path = self
+            .base_dir
+            .join("results")
+            .join(format!("{}.json", result.result_id));
+        let temp_path = self
+            .base_dir
+            .join("results")
+            .join(format!("{}.json.tmp", result.result_id));
+
+        let json = serde_json::to_string_pretty(result)?;
+
+        let mut file = File::create(&temp_path)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+
+        fs::rename(&temp_path, &path)?;
+
+        Ok(path)
+    }
+
+    pub fn load_result(&self, result_id: &str) -> Result<RunResult> {
+        let path = self
+            .base_dir
+            .join("results")
+            .join(format!("{}.json", result_id));
+        let json = fs::read_to_string(&path)
+            .with_context(|| format!("Result not found: {}", result_id))?;
+        let result: RunResult = serde_json::from_str(&json)?;
+        Ok(result)
+    }
+
+    pub fn list_results(&self, limit: usize) -> Result<Vec<RunResult>> {
+        let results_dir = self.base_dir.join("results");
+        let mut entries: Vec<_> = fs::read_dir(&results_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "json")
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        entries.sort_by(|a, b| {
+            let a_time = a.metadata().and_then(|m| m.modified()).ok();
+            let b_time = b.metadata().and_then(|m| m.modified()).ok();
+            b_time.cmp(&a_time)
+        });
+
+        let results: Vec<RunResult> = entries
+            .into_iter()
+            .take(limit)
+            .filter_map(|e| fs::read_to_string(e.path()).ok())
+            .filter_map(|json| serde_json::from_str(&json).ok())
+            .collect();
+
+        Ok(results)
+    }
+
+    pub fn list_results_for_run(&self, run_id: &str) -> Result<Vec<RunResult>> {
+        let all_results = self.list_results(usize::MAX)?;
+        Ok(all_results
+            .into_iter()
+            .filter(|r| r.run_id == run_id)
+            .collect())
+    }
+
+    pub fn delete_result(&self, result_id: &str) -> Result<()> {
+        let path = self
+            .base_dir
+            .join("results")
+            .join(format!("{}.json", result_id));
+        fs::remove_file(&path).with_context(|| format!("Result not found: {}", result_id))?;
+        Ok(())
+    }
+
+    // === Blob operations ===
+
+    pub fn save_blob(&self, content: &[u8]) -> Result<String> {
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        let hash = format!("{:x}", hasher.finalize());
+        let blob_ref = format!("blobs/{}", hash);
+
+        let blob_path = self.base_dir.join("blobs").join(&hash);
+
+        if !blob_path.exists() {
+            let temp_path = self.base_dir.join("blobs").join(format!("{}.tmp", hash));
+            let mut file = File::create(&temp_path)?;
+            file.write_all(content)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp_path, &blob_path)?;
+        }
+
+        Ok(blob_ref)
+    }
+
+    pub fn load_blob(&self, blob_ref: &str) -> Result<Vec<u8>> {
+        let hash = blob_ref.trim_start_matches("blobs/");
+        let blob_path = self.base_dir.join("blobs").join(hash);
+        let content = fs::read(&blob_path)
+            .with_context(|| format!("Blob not found: {}", blob_ref))?;
+        Ok(content)
+    }
+
+    pub fn blob_exists(&self, blob_ref: &str) -> bool {
+        let hash = blob_ref.trim_start_matches("blobs/");
+        self.base_dir.join("blobs").join(hash).exists()
+    }
+
+    pub fn blobs_dir(&self) -> PathBuf {
+        self.base_dir.join("blobs")
+    }
+
+    pub fn results_dir(&self) -> PathBuf {
+        self.base_dir.join("results")
     }
 
     // === ID Resolution ===
@@ -337,10 +460,14 @@ impl Storage {
         resolve_id_from_items(&templates, input, |t| &t.template_id)
     }
 
-    /// Resolve a playlist ID (supports short IDs)
     pub fn resolve_playlist_id(&self, input: &str) -> Result<String> {
         let playlists = self.list_playlists()?;
         resolve_id_from_items(&playlists, input, |p| &p.playlist_id)
+    }
+
+    pub fn resolve_result_id(&self, input: &str) -> Result<String> {
+        let results = self.list_results(usize::MAX)?;
+        resolve_id_from_items(&results, input, |r| &r.result_id)
     }
 }
 
@@ -651,7 +778,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
 
-        // CAS update should error when run doesn't exist
         let result = storage.save_run_if_status_with(
             "run_nonexistent",
             &[crate::RunStatus::Running],
@@ -660,5 +786,110 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_result_storage() {
+        use chrono::Utc;
+
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        let started = Utc::now();
+        let finished = started + chrono::Duration::seconds(5);
+
+        let result = crate::RunResult::new(
+            "run_550e8400-e29b-41d4-a716-446655440000".to_string(),
+            started,
+            finished,
+            0,
+        );
+
+        storage.save_result(&result).unwrap();
+
+        let loaded = storage.load_result(&result.result_id).unwrap();
+        assert_eq!(loaded.result_id, result.result_id);
+        assert_eq!(loaded.run_id, result.run_id);
+        assert_eq!(loaded.execution.exit_code, 0);
+
+        let results = storage.list_results(10).unwrap();
+        assert_eq!(results.len(), 1);
+
+        storage.delete_result(&result.result_id).unwrap();
+        let results = storage.list_results(10).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_list_results_for_run() {
+        use chrono::Utc;
+
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        let run_id_1 = "run_aaaa0000-0000-0000-0000-000000000000".to_string();
+        let run_id_2 = "run_bbbb0000-0000-0000-0000-000000000000".to_string();
+
+        let started = Utc::now();
+        let finished = started + chrono::Duration::seconds(1);
+
+        let result1 = crate::RunResult::new(run_id_1.clone(), started, finished, 0);
+        let result2 = crate::RunResult::new(run_id_1.clone(), started, finished, 1);
+        let result3 = crate::RunResult::new(run_id_2.clone(), started, finished, 0);
+
+        storage.save_result(&result1).unwrap();
+        storage.save_result(&result2).unwrap();
+        storage.save_result(&result3).unwrap();
+
+        let results_for_run1 = storage.list_results_for_run(&run_id_1).unwrap();
+        assert_eq!(results_for_run1.len(), 2);
+
+        let results_for_run2 = storage.list_results_for_run(&run_id_2).unwrap();
+        assert_eq!(results_for_run2.len(), 1);
+    }
+
+    #[test]
+    fn test_blob_storage() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        let content = b"Hello, World! This is stdout content.";
+        let blob_ref = storage.save_blob(content).unwrap();
+
+        assert!(blob_ref.starts_with("blobs/"));
+        assert!(storage.blob_exists(&blob_ref));
+
+        let loaded = storage.load_blob(&blob_ref).unwrap();
+        assert_eq!(loaded, content);
+
+        let blob_ref_2 = storage.save_blob(content).unwrap();
+        assert_eq!(blob_ref, blob_ref_2);
+    }
+
+    #[test]
+    fn test_resolve_result_id() {
+        use chrono::Utc;
+
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        let started = Utc::now();
+        let finished = started + chrono::Duration::seconds(1);
+
+        let mut result = crate::RunResult::new(
+            "run_test".to_string(),
+            started,
+            finished,
+            0,
+        );
+        result.result_id = "result_550e8400-e29b-41d4-a716-446655440000".to_string();
+
+        storage.save_result(&result).unwrap();
+
+        let resolved = storage.resolve_result_id("550e").unwrap();
+        assert_eq!(resolved, result.result_id);
+
+        let resolved = storage.resolve_result_id(&result.result_id).unwrap();
+        assert_eq!(resolved, result.result_id);
     }
 }

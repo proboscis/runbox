@@ -115,13 +115,16 @@ enum Commands {
         command: TemplateCommands,
     },
 
-    /// Manage playlists
     Playlist {
         #[command(subcommand)]
         command: PlaylistCommands,
     },
 
-    /// Show run history
+    Result {
+        #[command(subcommand)]
+        command: ResultCommands,
+    },
+
     History {
         /// Limit number of results
         #[arg(short, long, default_value = "10")]
@@ -203,25 +206,32 @@ enum TemplateCommands {
 
 #[derive(Subcommand)]
 enum PlaylistCommands {
-    /// List all playlists
     List,
-    /// Show playlist details
     Show { playlist_id: String },
-    /// Create a new playlist from JSON file
     Create { path: String },
-    /// Add template to playlist
     Add {
         playlist_id: String,
         template_id: String,
-        /// Optional label
         #[arg(short, long)]
         label: Option<String>,
     },
-    /// Remove template from playlist
     Remove {
         playlist_id: String,
         template_id: String,
     },
+}
+
+#[derive(Subcommand)]
+enum ResultCommands {
+    List {
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+    Show { result_id: String },
+    ForRun { run_id: String },
+    Stdout { result_id: String },
+    Stderr { result_id: String },
+    Delete { result_id: String },
 }
 
 fn main() -> Result<()> {
@@ -266,6 +276,14 @@ fn main() -> Result<()> {
                 playlist_id,
                 template_id,
             } => cmd_playlist_remove(&storage, &playlist_id, &template_id),
+        },
+        Commands::Result { command } => match command {
+            ResultCommands::List { limit } => cmd_result_list(&storage, limit),
+            ResultCommands::Show { result_id } => cmd_result_show(&storage, &result_id),
+            ResultCommands::ForRun { run_id } => cmd_result_for_run(&storage, &run_id),
+            ResultCommands::Stdout { result_id } => cmd_result_stdout(&storage, &result_id),
+            ResultCommands::Stderr { result_id } => cmd_result_stderr(&storage, &result_id),
+            ResultCommands::Delete { result_id } => cmd_result_delete(&storage, &result_id),
         },
         Commands::History { limit } => cmd_history(&storage, limit),
         Commands::Show { run_id } => cmd_show(&storage, &run_id),
@@ -1037,6 +1055,141 @@ fn cmd_show(storage: &Storage, run_id: &str) -> Result<()> {
         println!("Log:        {}", log_ref.path.display());
     }
 
+    Ok(())
+}
+
+// === Result Commands ===
+
+fn cmd_result_list(storage: &Storage, limit: usize) -> Result<()> {
+    let results = storage.list_results(limit)?;
+
+    if results.is_empty() {
+        println!("No results found.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<12} {:<12} {:<10} {:<12} {:<8}",
+        "RESULT ID", "RUN ID", "EXIT", "DURATION", "ARTIFACTS"
+    );
+    println!("{}", "-".repeat(60));
+
+    for result in results {
+        let duration = format!("{}ms", result.execution.duration_ms);
+        println!(
+            "{:<12} {:<12} {:<10} {:<12} {:<8}",
+            result.short_id(),
+            short_id(&result.run_id),
+            result.execution.exit_code,
+            duration,
+            result.artifacts.len()
+        );
+    }
+
+    Ok(())
+}
+
+fn cmd_result_show(storage: &Storage, result_id: &str) -> Result<()> {
+    let resolved_id = storage.resolve_result_id(result_id)?;
+    let result = storage.load_result(&resolved_id)?;
+
+    println!("Result ID:    {}", result.result_id);
+    println!("Short ID:     {}", result.short_id());
+    println!("Run ID:       {}", result.run_id);
+    println!();
+    println!("Started:      {}", result.execution.started_at);
+    println!("Finished:     {}", result.execution.finished_at);
+    println!("Duration:     {}ms", result.execution.duration_ms);
+    println!("Exit Code:    {}", result.execution.exit_code);
+
+    if let Some(ref output) = result.output {
+        println!();
+        if let Some(ref stdout_ref) = output.stdout_ref {
+            println!("Stdout:       {}", stdout_ref);
+        }
+        if let Some(ref stderr_ref) = output.stderr_ref {
+            println!("Stderr:       {}", stderr_ref);
+        }
+    }
+
+    if !result.artifacts.is_empty() {
+        println!();
+        println!("Artifacts:");
+        for artifact in &result.artifacts {
+            println!("  - {}: {} ({})", artifact.name, artifact.path, artifact.ref_);
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_result_for_run(storage: &Storage, run_id: &str) -> Result<()> {
+    let resolved_run_id = storage.resolve_run_id(run_id)?;
+    let results = storage.list_results_for_run(&resolved_run_id)?;
+
+    if results.is_empty() {
+        println!("No results found for run: {}", short_id(&resolved_run_id));
+        return Ok(());
+    }
+
+    println!("Results for run: {}", short_id(&resolved_run_id));
+    println!();
+    println!(
+        "{:<12} {:<10} {:<12} {:<20}",
+        "RESULT ID", "EXIT", "DURATION", "FINISHED"
+    );
+    println!("{}", "-".repeat(60));
+
+    for result in results {
+        let duration = format!("{}ms", result.execution.duration_ms);
+        println!(
+            "{:<12} {:<10} {:<12} {:<20}",
+            result.short_id(),
+            result.execution.exit_code,
+            duration,
+            result.execution.finished_at.format("%Y-%m-%d %H:%M:%S")
+        );
+    }
+
+    Ok(())
+}
+
+fn cmd_result_stdout(storage: &Storage, result_id: &str) -> Result<()> {
+    let resolved_id = storage.resolve_result_id(result_id)?;
+    let result = storage.load_result(&resolved_id)?;
+
+    let stdout_ref = result
+        .output
+        .as_ref()
+        .and_then(|o| o.stdout_ref.as_ref())
+        .context("No stdout available for this result")?;
+
+    let content = storage.load_blob(stdout_ref)?;
+    print!("{}", String::from_utf8_lossy(&content));
+
+    Ok(())
+}
+
+fn cmd_result_stderr(storage: &Storage, result_id: &str) -> Result<()> {
+    let resolved_id = storage.resolve_result_id(result_id)?;
+    let result = storage.load_result(&resolved_id)?;
+
+    let stderr_ref = result
+        .output
+        .as_ref()
+        .and_then(|o| o.stderr_ref.as_ref())
+        .context("No stderr available for this result")?;
+
+    let content = storage.load_blob(stderr_ref)?;
+    print!("{}", String::from_utf8_lossy(&content));
+
+    Ok(())
+}
+
+fn cmd_result_delete(storage: &Storage, result_id: &str) -> Result<()> {
+    let resolved_id = storage.resolve_result_id(result_id)?;
+    storage.delete_result(&resolved_id)?;
+    println!("Result deleted: {}", short_id(&resolved_id));
     Ok(())
 }
 
