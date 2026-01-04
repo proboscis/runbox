@@ -127,7 +127,7 @@ enum Commands {
 
     History {
         /// Limit number of results
-        #[arg(short, long, default_value = "10")]
+        #[arg(short, long, short_alias = 'n', default_value = "10")]
         limit: usize,
     },
 
@@ -217,7 +217,7 @@ enum PlaylistCommands {
     },
     Remove {
         playlist_id: String,
-        template_id: String,
+        template_or_index: String,
     },
 }
 
@@ -274,8 +274,8 @@ fn main() -> Result<()> {
             } => cmd_playlist_add(&storage, &playlist_id, &template_id, label),
             PlaylistCommands::Remove {
                 playlist_id,
-                template_id,
-            } => cmd_playlist_remove(&storage, &playlist_id, &template_id),
+                template_or_index,
+            } => cmd_playlist_remove(&storage, &playlist_id, &template_or_index),
         },
         Commands::Result { command } => match command {
             ResultCommands::List { limit } => cmd_result_list(&storage, limit),
@@ -973,15 +973,33 @@ fn cmd_playlist_add(
     Ok(())
 }
 
-fn cmd_playlist_remove(storage: &Storage, playlist_id: &str, template_id: &str) -> Result<()> {
+fn cmd_playlist_remove(storage: &Storage, playlist_id: &str, selector: &str) -> Result<()> {
     let resolved_playlist_id = storage.resolve_playlist_id(playlist_id)?;
-    let resolved_template_id = storage.resolve_template_id(template_id)?;
     let mut playlist = storage.load_playlist(&resolved_playlist_id)?;
+
+    if selector.chars().all(|c| c.is_ascii_digit()) {
+        let index: usize = selector
+            .parse()
+            .with_context(|| format!("Invalid index: {}", selector))?;
+        if index >= playlist.items.len() {
+            bail!(
+                "Index {} out of bounds (playlist has {} items)",
+                index,
+                playlist.items.len()
+            );
+        }
+        let removed = playlist.items.remove(index);
+        storage.save_playlist(&playlist)?;
+        println!("Removed {} from {}", short_id(&removed.template_id), short_id(&resolved_playlist_id));
+        return Ok(());
+    }
+
+    let resolved_template_id = storage.resolve_template_id(selector)?;
     let initial_len = playlist.items.len();
     playlist.items.retain(|item| item.template_id != resolved_template_id);
 
     if playlist.items.len() == initial_len {
-        anyhow::bail!("Template {} not found in playlist", short_id(&resolved_template_id));
+        bail!("Template {} not found in playlist", short_id(&resolved_template_id));
     }
 
     storage.save_playlist(&playlist)?;

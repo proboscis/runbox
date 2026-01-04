@@ -151,18 +151,17 @@ fn test_template_create_duplicate_id() {
         .assert()
         .success();
 
-    // Attempt to create duplicate - should fail or overwrite
-    // The current implementation overwrites, so we verify the file still exists
+    // Attempt to create duplicate - should fail
     let duplicate_file = temp.path().join("template2.json");
     std::fs::write(&duplicate_file, valid_template_json("tpl_duplicate")).unwrap();
 
-    // Try creating again with same ID (current implementation overwrites)
     runbox_cmd(&temp)
         .args(["template", "create", duplicate_file.to_str().unwrap()])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("Template already exists"));
 
-    // Verify the template still exists (either overwritten or rejected)
+    // Verify the original template still exists
     let template_path = temp.path().join("templates").join("tpl_duplicate.json");
     assert!(
         template_path.exists(),

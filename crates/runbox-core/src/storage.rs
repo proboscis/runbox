@@ -228,6 +228,9 @@ impl Storage {
             .base_dir
             .join("templates")
             .join(format!("{}.json", template.template_id));
+        if path.exists() {
+            bail!("Template already exists: {}", template.template_id);
+        }
         let json = serde_json::to_string_pretty(template)?;
         fs::write(&path, json)?;
         Ok(path)

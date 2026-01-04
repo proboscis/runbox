@@ -375,11 +375,16 @@ impl GitContext {
             &format!("checking existing worktrees for commit {}...", &base_commit[..8.min(base_commit.len())]),
         );
 
+        let canonical_base_dir = std::fs::canonicalize(worktree_base_dir)
+            .unwrap_or_else(|_| worktree_base_dir.to_path_buf());
+
         let worktrees = self.list_worktrees(logger)?;
 
         for wt in worktrees {
+            let canonical_worktree_path =
+                std::fs::canonicalize(&wt.path).unwrap_or_else(|_| wt.path.clone());
             // Only consider worktrees under our base directory
-            if !wt.path.starts_with(worktree_base_dir) {
+            if !canonical_worktree_path.starts_with(&canonical_base_dir) {
                 continue;
             }
 
