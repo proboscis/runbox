@@ -1,4 +1,4 @@
-use assert_cmd::Command;
+use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
@@ -45,8 +45,7 @@ fn test_show_run_details() {
         vec!["echo", "hello", "world"],
     );
 
-    Command::cargo_bin("runbox")
-        .unwrap()
+    cargo_bin_cmd!("runbox")
         .env("RUNBOX_HOME", temp.path())
         .args(["show", "run_test1234-5678-90ab-cdef-111111111111"])
         .assert()
@@ -68,8 +67,7 @@ fn test_show_with_short_id() {
     );
 
     // Use only the first few characters of the run ID (after run_)
-    Command::cargo_bin("runbox")
-        .unwrap()
+    cargo_bin_cmd!("runbox")
         .env("RUNBOX_HOME", temp.path())
         .args(["show", "abcd12"])
         .assert()
@@ -111,6 +109,7 @@ fn test_show_all_fields() {
             "ended_at": "2024-01-15T10:05:00Z"
         },
         "exit_code": 0,
+        "reconcile_reason": "manual",
         "log_ref": {
             "path": "/tmp/test.log"
         }
@@ -119,8 +118,7 @@ fn test_show_all_fields() {
     let run_path = runs_dir.join("run_fields-test-1234-5678-333333333333.json");
     fs::write(&run_path, serde_json::to_string_pretty(&run_json).unwrap()).unwrap();
 
-    Command::cargo_bin("runbox")
-        .unwrap()
+    cargo_bin_cmd!("runbox")
         .env("RUNBOX_HOME", temp.path())
         .args(["show", "fields"])
         .assert()
@@ -138,12 +136,15 @@ fn test_show_all_fields() {
         .stdout(predicate::str::contains("Command:"))
         .stdout(predicate::str::contains("make"))
         .stdout(predicate::str::contains("Cwd:"))
+        .stdout(predicate::str::contains("Env:"))
+        .stdout(predicate::str::contains("DEBUG"))
         // Verify code_state fields
         .stdout(predicate::str::contains("Repo:"))
         .stdout(predicate::str::contains("git@github.com:example/project.git"))
         .stdout(predicate::str::contains("Commit:"))
         .stdout(predicate::str::contains("deadbeef"))
         .stdout(predicate::str::contains("Patch:"))
+        .stdout(predicate::str::contains("yes"))
         // Verify timeline
         .stdout(predicate::str::contains("Created:"))
         .stdout(predicate::str::contains("Started:"))
@@ -151,6 +152,9 @@ fn test_show_all_fields() {
         // Verify exit code
         .stdout(predicate::str::contains("Exit Code:"))
         .stdout(predicate::str::contains("0"))
+        // Verify reconcile reason
+        .stdout(predicate::str::contains("Reconcile:"))
+        .stdout(predicate::str::contains("manual"))
         // Verify log reference
         .stdout(predicate::str::contains("Log:"));
 }
@@ -165,8 +169,7 @@ fn test_show_not_found() {
     fs::create_dir_all(temp.path().join("playlists")).unwrap();
     fs::create_dir_all(temp.path().join("logs")).unwrap();
 
-    Command::cargo_bin("runbox")
-        .unwrap()
+    cargo_bin_cmd!("runbox")
         .env("RUNBOX_HOME", temp.path())
         .args(["show", "nonexistent"])
         .assert()
@@ -193,8 +196,7 @@ fn test_show_ambiguous_id() {
     );
 
     // Using a short prefix that matches both runs should fail
-    Command::cargo_bin("runbox")
-        .unwrap()
+    cargo_bin_cmd!("runbox")
         .env("RUNBOX_HOME", temp.path())
         .args(["show", "5aaa"])
         .assert()
@@ -227,8 +229,7 @@ fn test_show_minimal_run() {
     fs::write(&run_path, serde_json::to_string_pretty(&run_json).unwrap()).unwrap();
 
     // Should still work and display available fields
-    Command::cargo_bin("runbox")
-        .unwrap()
+    cargo_bin_cmd!("runbox")
         .env("RUNBOX_HOME", temp.path())
         .args(["show", "minimal"])
         .assert()
