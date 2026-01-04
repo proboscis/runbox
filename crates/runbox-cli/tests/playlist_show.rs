@@ -46,17 +46,24 @@ fn test_playlist_show() {
         ],
     );
 
-    Command::cargo_bin("runbox")
+    let assert = Command::cargo_bin("runbox")
         .unwrap()
         .env("RUNBOX_HOME", temp.path())
         .args(["playlist", "show", "pl_test-1234-5678-90ab-cdef12345678"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("pl_test-1234-5678-90ab-cdef12345678"))
-        .stdout(predicate::str::contains("Test Playlist"))
-        .stdout(predicate::str::contains("tpl_runner-1111-2222-3333-444455556666"))
-        .stdout(predicate::str::contains("Runner Task"))
-        .stdout(predicate::str::contains("tpl_eval-aaaa-bbbb-cccc-ddddeeeeffff"));
+        .success();
+
+    let output = assert.get_output();
+    let playlist: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(playlist["playlist_id"], "pl_test-1234-5678-90ab-cdef12345678");
+    assert_eq!(playlist["name"], "Test Playlist");
+    let items = playlist["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["template_id"], "tpl_runner-1111-2222-3333-444455556666");
+    assert_eq!(items[0]["label"], "Runner Task");
+    assert_eq!(items[1]["template_id"], "tpl_eval-aaaa-bbbb-cccc-ddddeeeeffff");
+    assert!(items[1]["label"].is_null());
 }
 
 #[test]
@@ -72,14 +79,18 @@ fn test_playlist_show_with_short_id() {
     );
 
     // Use only the first few characters of the playlist ID (without pl_ prefix)
-    Command::cargo_bin("runbox")
+    let assert = Command::cargo_bin("runbox")
         .unwrap()
         .env("RUNBOX_HOME", temp.path())
         .args(["playlist", "show", "abcd12"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("pl_abcd1234-5678-90ab-cdef12345678"))
-        .stdout(predicate::str::contains("Short ID Playlist"));
+        .success();
+
+    let output = assert.get_output();
+    let playlist: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(playlist["playlist_id"], "pl_abcd1234-5678-90ab-cdef12345678");
+    assert_eq!(playlist["name"], "Short ID Playlist");
 }
 
 #[test]
@@ -94,15 +105,20 @@ fn test_playlist_show_empty_playlist() {
         vec![],
     );
 
-    Command::cargo_bin("runbox")
+    let assert = Command::cargo_bin("runbox")
         .unwrap()
         .env("RUNBOX_HOME", temp.path())
         .args(["playlist", "show", "pl_empty-1234-5678-90ab-cdef12345678"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("pl_empty-1234-5678-90ab-cdef12345678"))
-        .stdout(predicate::str::contains("Empty Playlist"))
-        .stdout(predicate::str::contains("\"items\": []"));
+        .success();
+
+    let output = assert.get_output();
+    let playlist: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(playlist["playlist_id"], "pl_empty-1234-5678-90ab-cdef12345678");
+    assert_eq!(playlist["name"], "Empty Playlist");
+    let items = playlist["items"].as_array().unwrap();
+    assert!(items.is_empty());
 }
 
 #[test]
