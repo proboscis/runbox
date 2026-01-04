@@ -59,6 +59,66 @@ fn test_template_list_with_templates() {
 }
 
 #[test]
+fn test_template_list_multiple_templates() {
+    let temp = TempDir::new().unwrap();
+
+    let templates_dir = temp.path().join("templates");
+    fs::create_dir_all(&templates_dir).unwrap();
+
+    let first_template = r#"{
+        "template_version": 0,
+        "template_id": "tpl_11111111-1234-5678-abcd-ef1234567890",
+        "name": "First Template",
+        "exec": {
+            "argv": ["echo", "first"],
+            "cwd": ".",
+            "env": {},
+            "timeout_sec": 0
+        },
+        "code_state": {
+            "repo_url": "git@github.com:org/repo.git"
+        }
+    }"#;
+
+    let second_template = r#"{
+        "template_version": 0,
+        "template_id": "tpl_22222222-1234-5678-abcd-ef1234567890",
+        "name": "Second Template",
+        "exec": {
+            "argv": ["echo", "second"],
+            "cwd": ".",
+            "env": {},
+            "timeout_sec": 0
+        },
+        "code_state": {
+            "repo_url": "git@github.com:org/repo.git"
+        }
+    }"#;
+
+    fs::write(
+        templates_dir.join("tpl_11111111-1234-5678-abcd-ef1234567890.json"),
+        first_template,
+    )
+    .unwrap();
+    fs::write(
+        templates_dir.join("tpl_22222222-1234-5678-abcd-ef1234567890.json"),
+        second_template,
+    )
+    .unwrap();
+
+    Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .args(["template", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("11111111"))
+        .stdout(predicate::str::contains("First Template"))
+        .stdout(predicate::str::contains("22222222"))
+        .stdout(predicate::str::contains("Second Template"));
+}
+
+#[test]
 fn test_template_list_output_format() {
     let temp = TempDir::new().unwrap();
 
