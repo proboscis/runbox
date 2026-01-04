@@ -110,6 +110,31 @@ fn test_playlist_remove_by_template_id() {
 }
 
 #[test]
+fn test_playlist_remove_by_index() {
+    let temp = TempDir::new().unwrap();
+
+    create_test_playlist(
+        &temp,
+        "pl_index-1234",
+        "Index Playlist",
+        &[
+            ("tpl_first-1234-5678-90ab-cdef12345678", None),
+            ("tpl_second-1234-5678-90ab-cdef12345678", None),
+        ],
+    );
+
+    runbox_cmd(&temp)
+        .args(["playlist", "remove", "pl_index-1234", "0"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Removed"));
+
+    let items = load_playlist_items(&temp, "pl_index-1234");
+    assert_eq!(items.len(), 1, "Playlist should have 1 item after removal");
+    assert_eq!(items[0], "tpl_second-1234-5678-90ab-cdef12345678");
+}
+
+#[test]
 fn test_playlist_remove_with_short_ids() {
     let temp = TempDir::new().unwrap();
 
@@ -132,6 +157,27 @@ fn test_playlist_remove_with_short_ids() {
     // Verify the item was removed
     let items = load_playlist_items(&temp, "pl_shortpl-1234-5678");
     assert!(items.is_empty(), "Playlist should be empty after removal");
+}
+
+#[test]
+fn test_playlist_remove_index_out_of_bounds() {
+    let temp = TempDir::new().unwrap();
+
+    create_test_playlist(
+        &temp,
+        "pl_index-oob-1234",
+        "Index Playlist",
+        &[("tpl_only-1234-5678-90ab-cdef12345678", None)],
+    );
+
+    runbox_cmd(&temp)
+        .args(["playlist", "remove", "pl_index-oob-1234", "999"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("out of bounds"));
+
+    let items = load_playlist_items(&temp, "pl_index-oob-1234");
+    assert_eq!(items.len(), 1, "Playlist should still have 1 item");
 }
 
 #[test]
