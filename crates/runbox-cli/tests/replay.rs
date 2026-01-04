@@ -258,6 +258,76 @@ fn test_replay_with_fresh_creates_new_worktree() {
     assert!(worktree_path.exists(), "Worktree should be created with --fresh");
 }
 
+#[test]
+fn test_replay_with_reuse_reuses_existing_worktree() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path().join("repo");
+
+    // Set up git repo
+    let commit_hash = setup_git_repo(&temp);
+    setup_storage_dirs(&temp);
+
+    // Create run records that point to the same commit
+    let run_id_first = "run_aaaaaaaa-1111-1111-1111-111111111111";
+    let run_id_second = "run_bbbbbbbb-2222-2222-2222-222222222222";
+    create_run_record(&temp, run_id_first, &commit_hash, ".");
+    create_run_record(&temp, run_id_second, &commit_hash, ".");
+
+    // Create worktree directory
+    let worktree_dir = temp.path().join("worktrees");
+    fs::create_dir_all(&worktree_dir).unwrap();
+
+    let first_worktree_path = worktree_dir.join(run_id_first);
+
+    // Run replay for the first run to create the worktree
+    Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .current_dir(&repo_path)
+        .args([
+            "replay",
+            "aaaaaaaa",
+            "--worktree-dir",
+            worktree_dir.to_str().unwrap(),
+            "--keep",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Created worktree:"))
+        .stdout(predicate::str::contains(first_worktree_path.to_str().unwrap()));
+
+    assert!(
+        first_worktree_path.exists(),
+        "Worktree should exist at {:?}",
+        first_worktree_path
+    );
+
+    // Run replay for the second run with --reuse
+    Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .current_dir(&repo_path)
+        .args([
+            "replay",
+            "bbbbbbbb",
+            "--worktree-dir",
+            worktree_dir.to_str().unwrap(),
+            "--reuse",
+            "--keep",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Reusing existing worktree:"))
+        .stdout(predicate::str::contains(first_worktree_path.to_str().unwrap()));
+
+    let second_worktree_path = worktree_dir.join(run_id_second);
+    assert!(
+        !second_worktree_path.exists(),
+        "Reuse should not create a new worktree at {:?}",
+        second_worktree_path
+    );
+}
+
 // === Error Path Tests ===
 
 #[test]
