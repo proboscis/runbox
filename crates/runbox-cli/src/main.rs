@@ -124,7 +124,7 @@ enum Commands {
     /// Show run history
     History {
         /// Limit number of results
-        #[arg(short, long, default_value = "10")]
+        #[arg(short, long, short_alias = 'n', default_value = "10")]
         limit: usize,
     },
 

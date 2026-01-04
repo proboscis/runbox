@@ -154,7 +154,7 @@ fn test_history_limit() {
     let output = Command::cargo_bin("runbox")
         .unwrap()
         .env("RUNBOX_HOME", temp.path())
-        .args(["history", "-l", "5"])
+        .args(["history", "-n", "5"])
         .assert()
         .success();
 
