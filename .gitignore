@@ -11,3 +11,4 @@ build/
 # orch runtime files (keep config.yaml)
 .orch/*.log
 .orch/*.pid
+ORCH_PROMPT.md
