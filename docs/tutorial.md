@@ -6,14 +6,15 @@ Runbox is a reproducible command execution system. It captures command execution
 
 1. [Installation](#installation)
 2. [Quick Start](#quick-start)
-3. [Core Concepts](#core-concepts)
-4. [Templates](#templates)
-5. [Running Commands](#running-commands)
-6. [Monitoring and Logs](#monitoring-and-logs)
-7. [Playlists](#playlists)
-8. [Replay](#replay)
-9. [Configuration](#configuration)
-10. [Troubleshooting](#troubleshooting)
+3. [Direct Execution](#direct-execution)
+4. [Core Concepts](#core-concepts)
+5. [Templates](#templates)
+6. [Running Commands](#running-commands)
+7. [Monitoring and Logs](#monitoring-and-logs)
+8. [Playlists](#playlists)
+9. [Replay](#replay)
+10. [Configuration](#configuration)
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -92,6 +93,84 @@ runbox ps
 ```bash
 runbox logs <run_id>
 ```
+
+---
+
+## Direct Execution
+
+For quick, one-off commands without creating templates, use direct execution mode.
+
+### Basic Usage
+
+```bash
+# Execute any command directly
+runbox run -- echo "Hello, World!"
+
+# Run a Python script
+runbox run -- python train.py --epochs 10
+
+# Run make targets
+runbox run -- make test
+```
+
+The `--` separator distinguishes direct commands from template-based runs.
+
+### Using the `log` Command
+
+The `log` command is an alias for direct execution:
+
+```bash
+runbox log -- echo "Hello, World!"
+runbox log -- npm run build
+```
+
+### Direct Execution Options
+
+```bash
+# Choose runtime (bg or tmux)
+runbox run --runtime tmux -- python train.py
+
+# Set a timeout (in seconds)
+runbox run --timeout 3600 -- ./long_running_script.sh
+
+# Add environment variables
+runbox run --env CUDA_VISIBLE_DEVICES=0 --env DEBUG=1 -- python train.py
+
+# Specify working directory
+runbox run --cwd /path/to/project -- npm test
+
+# Skip git context capture (for non-git directories)
+runbox run --no-git -- echo "no git tracking"
+
+# Dry run to preview what would execute
+runbox run --dry-run -- python train.py --epochs 10
+```
+
+### Git Context Capture
+
+By default, direct execution captures the full git context:
+- Current commit (HEAD)
+- Uncommitted changes as a patch
+
+This allows you to replay the exact code state later:
+
+```bash
+# Run a command
+runbox run -- python experiment.py --seed 42
+
+# Later, replay with the same code state
+runbox replay <run_id>
+```
+
+### When to Use Direct vs Templates
+
+| Use Case | Approach |
+|----------|----------|
+| Quick one-off commands | Direct execution |
+| Exploratory work | Direct execution |
+| Repeated tasks with variables | Templates |
+| Complex workflows | Templates + Playlists |
+| Sharing with team | Templates |
 
 ---
 
@@ -223,7 +302,32 @@ runbox template delete tpl_hello
 
 ## Running Commands
 
-### Basic Execution
+Runbox supports two execution modes: **direct execution** for quick commands and **template-based execution** for reproducible workflows.
+
+### Direct Execution
+
+Run any command directly without a template:
+
+```bash
+# Simple commands
+runbox run -- echo "Hello, World!"
+runbox run -- make test
+runbox run -- npm run build
+
+# With options
+runbox run --runtime tmux -- python train.py
+runbox run --timeout 3600 -- ./long_job.sh
+runbox run --env KEY=value -- ./script.sh
+runbox run --cwd /path/to/dir -- npm test
+runbox run --no-git -- echo "skip git capture"
+
+# Using the 'log' alias
+runbox log -- python experiment.py
+```
+
+### Template-Based Execution
+
+Run from a pre-defined template:
 
 ```bash
 # Run with defaults
@@ -241,11 +345,15 @@ runbox run --template tpl_train_model \
 
 ### Runtime Options
 
+Both direct and template execution support runtime selection:
+
 ```bash
 # Background execution (default)
+runbox run -- echo "background"
 runbox run --template tpl_hello --runtime bg
 
 # Tmux session (interactive)
+runbox run --runtime tmux -- python debug.py
 runbox run --template tpl_hello --runtime tmux
 ```
 
@@ -254,6 +362,10 @@ runbox run --template tpl_hello --runtime tmux
 Preview what would be executed without actually running:
 
 ```bash
+# Direct execution dry run
+runbox run --dry-run -- python train.py --epochs 10
+
+# Template dry run
 runbox run --template tpl_train_model --binding epochs=10 --dry-run
 ```
 
@@ -527,6 +639,29 @@ git worktree prune
 
 ## Examples
 
+### Quick Ad-hoc Execution
+
+```bash
+# Run a quick test
+runbox run -- pytest tests/ -v
+
+# Execute a script and track it
+runbox log -- python analyze.py --input data.csv
+
+# Run with specific GPU
+runbox run --env CUDA_VISIBLE_DEVICES=1 -- python train.py
+
+# Interactive debugging in tmux
+runbox run --runtime tmux -- python -m pdb script.py
+
+# Check the result
+runbox ps
+runbox logs <run_id>
+
+# Later, reproduce the exact run
+runbox replay <run_id>
+```
+
 ### Scientific Computing Workflow
 
 ```bash
@@ -583,7 +718,9 @@ runbox show $run_id
 
 | Command | Purpose |
 |---------|---------|
-| `runbox run` | Execute a template |
+| `runbox run -- <cmd>` | Execute a command directly |
+| `runbox log -- <cmd>` | Execute a command directly (alias) |
+| `runbox run --template` | Execute from a template |
 | `runbox ps` | List runs |
 | `runbox stop` | Stop a run |
 | `runbox logs` | View run logs |
