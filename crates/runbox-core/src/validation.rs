@@ -3,24 +3,24 @@ use jsonschema::JSONSchema;
 use serde_json::Value;
 use std::path::Path;
 
-/// JSON Schema validator
 pub struct Validator {
     run_schema: JSONSchema,
     template_schema: JSONSchema,
     playlist_schema: JSONSchema,
+    result_schema: JSONSchema,
 }
 
-// Embedded schemas
 const RUN_SCHEMA: &str = include_str!("../../../specs/run.schema.json");
 const TEMPLATE_SCHEMA: &str = include_str!("../../../specs/run_template.schema.json");
 const PLAYLIST_SCHEMA: &str = include_str!("../../../specs/playlist.schema.json");
+const RESULT_SCHEMA: &str = include_str!("../../../specs/run_result.schema.json");
 
 impl Validator {
-    /// Create a new Validator with embedded schemas
     pub fn new() -> Result<Self> {
         let run_schema_value: Value = serde_json::from_str(RUN_SCHEMA)?;
         let template_schema_value: Value = serde_json::from_str(TEMPLATE_SCHEMA)?;
         let playlist_schema_value: Value = serde_json::from_str(PLAYLIST_SCHEMA)?;
+        let result_schema_value: Value = serde_json::from_str(RESULT_SCHEMA)?;
 
         let run_schema = JSONSchema::compile(&run_schema_value)
             .map_err(|e| anyhow::anyhow!("Invalid run schema: {}", e))?;
@@ -28,11 +28,14 @@ impl Validator {
             .map_err(|e| anyhow::anyhow!("Invalid template schema: {}", e))?;
         let playlist_schema = JSONSchema::compile(&playlist_schema_value)
             .map_err(|e| anyhow::anyhow!("Invalid playlist schema: {}", e))?;
+        let result_schema = JSONSchema::compile(&result_schema_value)
+            .map_err(|e| anyhow::anyhow!("Invalid result schema: {}", e))?;
 
         Ok(Self {
             run_schema,
             template_schema,
             playlist_schema,
+            result_schema,
         })
     }
 
@@ -56,7 +59,6 @@ impl Validator {
         Ok(())
     }
 
-    /// Validate a Playlist JSON
     pub fn validate_playlist(&self, value: &Value) -> Result<()> {
         let result = self.playlist_schema.validate(value);
         if let Err(errors) = result {
@@ -66,7 +68,15 @@ impl Validator {
         Ok(())
     }
 
-    /// Auto-detect and validate a JSON file
+    pub fn validate_result(&self, value: &Value) -> Result<()> {
+        let result = self.result_schema.validate(value);
+        if let Err(errors) = result {
+            let error_msgs: Vec<String> = errors.map(|e| format!("  - {}", e)).collect();
+            anyhow::bail!("Result validation failed:\n{}", error_msgs.join("\n"));
+        }
+        Ok(())
+    }
+
     pub fn validate_file(&self, path: &Path) -> Result<ValidationType> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read file: {}", path.display()))?;
@@ -76,9 +86,11 @@ impl Validator {
         self.validate_auto(&value)
     }
 
-    /// Auto-detect and validate a JSON value
     pub fn validate_auto(&self, value: &Value) -> Result<ValidationType> {
-        // Try to detect type from fields
+        if value.get("result_id").is_some() {
+            self.validate_result(value)?;
+            return Ok(ValidationType::Result);
+        }
         if value.get("run_id").is_some() {
             self.validate_run(value)?;
             return Ok(ValidationType::Run);
@@ -92,7 +104,7 @@ impl Validator {
             return Ok(ValidationType::Playlist);
         }
 
-        anyhow::bail!("Could not determine JSON type (expected run_id, template_id, or playlist_id)")
+        anyhow::bail!("Could not determine JSON type (expected result_id, run_id, template_id, or playlist_id)")
     }
 }
 
@@ -102,12 +114,12 @@ impl Default for Validator {
     }
 }
 
-/// Type of validated JSON
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationType {
     Run,
     Template,
     Playlist,
+    Result,
 }
 
 impl std::fmt::Display for ValidationType {
@@ -116,6 +128,7 @@ impl std::fmt::Display for ValidationType {
             ValidationType::Run => write!(f, "Run"),
             ValidationType::Template => write!(f, "RunTemplate"),
             ValidationType::Playlist => write!(f, "Playlist"),
+            ValidationType::Result => write!(f, "RunResult"),
         }
     }
 }
@@ -178,8 +191,64 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_result() {
+        let validator = Validator::new().unwrap();
+        let result_json = serde_json::json!({
+            "result_id": "result_550e8400-e29b-41d4-a716-446655440000",
+            "run_id": "run_550e8400-e29b-41d4-a716-446655440000",
+            "execution": {
+                "started_at": "2025-01-01T00:00:00Z",
+                "finished_at": "2025-01-01T00:00:05Z",
+                "exit_code": 0,
+                "duration_ms": 5000
+            }
+        });
+
+        assert!(validator.validate_result(&result_json).is_ok());
+    }
+
+    #[test]
+    fn test_validate_result_with_output_and_artifacts() {
+        let validator = Validator::new().unwrap();
+        let result_json = serde_json::json!({
+            "result_id": "result_550e8400-e29b-41d4-a716-446655440000",
+            "run_id": "run_550e8400-e29b-41d4-a716-446655440000",
+            "execution": {
+                "started_at": "2025-01-01T00:00:00Z",
+                "finished_at": "2025-01-01T00:00:05Z",
+                "exit_code": 0,
+                "duration_ms": 5000
+            },
+            "output": {
+                "stdout_ref": "blobs/abc123",
+                "stderr_ref": "blobs/def456"
+            },
+            "artifacts": [
+                {"name": "build-output", "path": "/tmp/out.tar.gz", "ref": "blobs/xyz789"}
+            ]
+        });
+
+        assert!(validator.validate_result(&result_json).is_ok());
+    }
+
+    #[test]
     fn test_auto_detect() {
         let validator = Validator::new().unwrap();
+
+        let result_json = serde_json::json!({
+            "result_id": "result_550e8400-e29b-41d4-a716-446655440000",
+            "run_id": "run_test",
+            "execution": {
+                "started_at": "2025-01-01T00:00:00Z",
+                "finished_at": "2025-01-01T00:00:05Z",
+                "exit_code": 0,
+                "duration_ms": 5000
+            }
+        });
+        assert_eq!(
+            validator.validate_auto(&result_json).unwrap(),
+            ValidationType::Result
+        );
 
         let run_json = serde_json::json!({"run_id": "run_550e8400-e29b-41d4-a716-446655440000", "exec": {"argv": ["x"], "cwd": "."}, "code_state": {"repo_url": "x", "base_commit": "a1b2c3d4e5f6789012345678901234567890abcd"}});
         assert_eq!(
