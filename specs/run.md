@@ -62,7 +62,33 @@ See [run.cue](./run.cue) for CUE definitions.
 
 ## Examples
 
-### Run
+### Run (from direct execution)
+
+Created by: `runbox run -- echo hello`
+
+```json
+{
+  "run_version": 0,
+  "run_id": "run_617c2725-692e-4cdf-9336-85a526ad8415",
+
+  "exec": {
+    "argv": ["echo", "hello"],
+    "cwd": ".",
+    "env": {},
+    "timeout_sec": 0
+  },
+
+  "code_state": {
+    "repo_url": "git@github.com:org/repo.git",
+    "base_commit": "a1b2c3d4e5f6789012345678901234567890abcd"
+  }
+}
+```
+
+### Run (from template)
+
+Created by: `runbox run --template tpl_plc_runner --binding i=7`
+
 ```json
 {
   "run_version": 0,
@@ -217,8 +243,24 @@ env {exec.env} {exec.argv}
 
 ## Execution Flow
 
+### Direct Execution Flow
+
 ```
-1. User clicks playlist item
+1. User runs: runbox run -- <command>
+2. Parse command after --
+3. Capture context:
+   - base_commit = git rev-parse HEAD
+   - patch = git diff (if dirty)
+   - push patch to refs/patches/{run_id}
+4. Generate Run (with UUID)
+5. Save Run to ~/.local/share/runbox/runs/
+6. Execute
+```
+
+### Template Execution Flow
+
+```
+1. User clicks playlist item or runs: runbox run --template <id>
 2. Resolve template_id → RunTemplate
 3. Resolve bindings:
    - Apply defaults

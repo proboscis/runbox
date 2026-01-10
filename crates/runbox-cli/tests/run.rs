@@ -56,7 +56,11 @@ fn init_git_repo(path: &std::path::Path) -> std::io::Result<()> {
 fn create_template(temp: &TempDir, template_id: &str, template_json: &str) {
     let templates_dir = temp.path().join("templates");
     fs::create_dir_all(&templates_dir).unwrap();
-    fs::write(templates_dir.join(format!("{}.json", template_id)), template_json).unwrap();
+    fs::write(
+        templates_dir.join(format!("{}.json", template_id)),
+        template_json,
+    )
+    .unwrap();
 }
 
 /// Template JSON without bindings (uses literal args)
@@ -239,11 +243,22 @@ fn test_run_with_background_runtime_alias_dry_run() {
     let temp = TempDir::new().unwrap();
     init_git_repo(temp.path()).unwrap();
 
-    create_template(&temp, "tpl_background", &simple_template_json("tpl_background"));
+    create_template(
+        &temp,
+        "tpl_background",
+        &simple_template_json("tpl_background"),
+    );
 
     runbox_cmd(&temp)
         .current_dir(temp.path())
-        .args(["run", "-t", "tpl_background", "--runtime", "background", "--dry-run"])
+        .args([
+            "run",
+            "-t",
+            "tpl_background",
+            "--runtime",
+            "background",
+            "--dry-run",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("Dry run"));
@@ -301,7 +316,10 @@ fn test_run_missing_required_binding() {
         .args(["run", "-t", "tpl_required", "--dry-run"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Missing binding").or(predicate::str::contains("required_var")));
+        .stderr(
+            predicate::str::contains("Missing binding")
+                .or(predicate::str::contains("required_var")),
+        );
 }
 
 #[test]
@@ -309,15 +327,27 @@ fn test_run_invalid_runtime() {
     let temp = TempDir::new().unwrap();
     init_git_repo(temp.path()).unwrap();
 
-    create_template(&temp, "tpl_invalid_rt", &simple_template_json("tpl_invalid_rt"));
+    create_template(
+        &temp,
+        "tpl_invalid_rt",
+        &simple_template_json("tpl_invalid_rt"),
+    );
 
     // Clap should reject invalid runtime values
     runbox_cmd(&temp)
         .current_dir(temp.path())
-        .args(["run", "-t", "tpl_invalid_rt", "--runtime", "invalid_runtime"])
+        .args([
+            "run",
+            "-t",
+            "tpl_invalid_rt",
+            "--runtime",
+            "invalid_runtime",
+        ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("invalid").or(predicate::str::contains("possible values")));
+        .stderr(
+            predicate::str::contains("invalid").or(predicate::str::contains("possible values")),
+        );
 }
 
 #[test]
@@ -458,4 +488,256 @@ fn test_run_env_vars_in_template_dry_run() {
         .success()
         .stdout(predicate::str::contains("MY_VAR"))
         .stdout(predicate::str::contains("my_value"));
+}
+
+// =============================================================================
+// Direct Execution Tests
+// =============================================================================
+
+#[test]
+fn test_run_direct_command_dry_run() {
+    let temp = TempDir::new().unwrap();
+    init_git_repo(temp.path()).unwrap();
+
+    runbox_cmd(&temp)
+        .current_dir(temp.path())
+        .args(["run", "--dry-run", "--", "echo", "hello", "world"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dry run"))
+        .stdout(predicate::str::contains("echo"))
+        .stdout(predicate::str::contains("hello"))
+        .stdout(predicate::str::contains("world"));
+}
+
+#[test]
+fn test_run_direct_with_no_git_flag_dry_run() {
+    let temp = TempDir::new().unwrap();
+    // NOT initializing git repo - should work with --no-git
+
+    runbox_cmd(&temp)
+        .current_dir(temp.path())
+        .args(["run", "--no-git", "--dry-run", "--", "echo", "hello"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dry run"))
+        .stdout(predicate::str::contains("echo"))
+        .stdout(predicate::str::contains("hello"))
+        .stdout(predicate::str::contains(
+            "0000000000000000000000000000000000000000",
+        ));
+}
+
+#[test]
+fn test_run_direct_with_env_vars_dry_run() {
+    let temp = TempDir::new().unwrap();
+    init_git_repo(temp.path()).unwrap();
+
+    runbox_cmd(&temp)
+        .current_dir(temp.path())
+        .args([
+            "run",
+            "--env",
+            "MY_VAR=my_value",
+            "--env",
+            "ANOTHER=test",
+            "--dry-run",
+            "--",
+            "echo",
+            "hello",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dry run"))
+        .stdout(predicate::str::contains("MY_VAR"))
+        .stdout(predicate::str::contains("my_value"))
+        .stdout(predicate::str::contains("ANOTHER"))
+        .stdout(predicate::str::contains("test"));
+}
+
+#[test]
+fn test_run_direct_with_timeout_dry_run() {
+    let temp = TempDir::new().unwrap();
+    init_git_repo(temp.path()).unwrap();
+
+    runbox_cmd(&temp)
+        .current_dir(temp.path())
+        .args([
+            "run",
+            "--timeout",
+            "3600",
+            "--dry-run",
+            "--",
+            "echo",
+            "hello",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dry run"))
+        .stdout(predicate::str::contains("timeout_sec"))
+        .stdout(predicate::str::contains("3600"));
+}
+
+#[test]
+fn test_run_direct_with_cwd_dry_run() {
+    let temp = TempDir::new().unwrap();
+    init_git_repo(temp.path()).unwrap();
+
+    runbox_cmd(&temp)
+        .current_dir(temp.path())
+        .args([
+            "run",
+            "--cwd",
+            "/custom/path",
+            "--dry-run",
+            "--",
+            "echo",
+            "hello",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dry run"))
+        .stdout(predicate::str::contains("/custom/path"));
+}
+
+#[test]
+fn test_run_direct_with_tmux_runtime_dry_run() {
+    let temp = TempDir::new().unwrap();
+    init_git_repo(temp.path()).unwrap();
+
+    runbox_cmd(&temp)
+        .current_dir(temp.path())
+        .args([
+            "run",
+            "--runtime",
+            "tmux",
+            "--dry-run",
+            "--",
+            "echo",
+            "hello",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dry run"));
+}
+
+#[test]
+fn test_run_direct_captures_git_context_dry_run() {
+    let temp = TempDir::new().unwrap();
+    init_git_repo(temp.path()).unwrap();
+
+    runbox_cmd(&temp)
+        .current_dir(temp.path())
+        .args(["run", "--dry-run", "--", "echo", "hello"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dry run"))
+        .stdout(predicate::str::contains("repo_url"))
+        .stdout(predicate::str::contains("git@github.com:test/repo.git"))
+        .stdout(predicate::str::contains("base_commit"));
+}
+
+#[test]
+fn test_run_missing_template_and_command() {
+    let temp = TempDir::new().unwrap();
+    init_git_repo(temp.path()).unwrap();
+
+    runbox_cmd(&temp)
+        .current_dir(temp.path())
+        .args(["run"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("--template")
+                .or(predicate::str::contains("command"))
+                .or(predicate::str::contains("required")),
+        );
+}
+
+#[test]
+fn test_run_direct_without_git_repo_fails() {
+    let temp = TempDir::new().unwrap();
+    // NOT initializing git repo
+
+    runbox_cmd(&temp)
+        .current_dir(temp.path())
+        .args(["run", "--dry-run", "--", "echo", "hello"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("git").or(predicate::str::contains("repository")));
+}
+
+// =============================================================================
+// Log Command Tests (alias for direct execution)
+// =============================================================================
+
+#[test]
+fn test_log_command_dry_run() {
+    let temp = TempDir::new().unwrap();
+    init_git_repo(temp.path()).unwrap();
+
+    runbox_cmd(&temp)
+        .current_dir(temp.path())
+        .args(["log", "--dry-run", "--", "echo", "hello"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dry run"))
+        .stdout(predicate::str::contains("echo"))
+        .stdout(predicate::str::contains("hello"));
+}
+
+#[test]
+fn test_log_command_with_no_git_dry_run() {
+    let temp = TempDir::new().unwrap();
+    // NOT initializing git repo - should work with --no-git
+
+    runbox_cmd(&temp)
+        .current_dir(temp.path())
+        .args(["log", "--no-git", "--dry-run", "--", "echo", "hello"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dry run"))
+        .stdout(predicate::str::contains(
+            "0000000000000000000000000000000000000000",
+        ));
+}
+
+#[test]
+fn test_log_command_with_options_dry_run() {
+    let temp = TempDir::new().unwrap();
+    init_git_repo(temp.path()).unwrap();
+
+    runbox_cmd(&temp)
+        .current_dir(temp.path())
+        .args([
+            "log",
+            "--runtime",
+            "tmux",
+            "--timeout",
+            "1800",
+            "--env",
+            "DEBUG=1",
+            "--dry-run",
+            "--",
+            "make",
+            "test",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dry run"))
+        .stdout(predicate::str::contains("make"))
+        .stdout(predicate::str::contains("test"))
+        .stdout(predicate::str::contains("1800"))
+        .stdout(predicate::str::contains("DEBUG"));
+}
+
+#[test]
+fn test_log_command_requires_command() {
+    let temp = TempDir::new().unwrap();
+
+    runbox_cmd(&temp)
+        .current_dir(temp.path())
+        .args(["log", "--"])
+        .assert()
+        .failure();
 }

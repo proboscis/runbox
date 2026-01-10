@@ -3,9 +3,9 @@ use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use dialoguer::{theme::ColorfulTheme, Input};
 use runbox_core::{
-    default_pid_path, default_socket_path, short_id, BindingResolver, ConfigResolver,
-    DaemonClient, GitContext, LogRef, Playlist, PlaylistItem, RunStatus, RunTemplate,
-    RuntimeRegistry, Storage, Timeline, Validator, VerboseLogger,
+    default_pid_path, default_socket_path, short_id, BindingResolver, ConfigResolver, DaemonClient,
+    GitContext, LogRef, Playlist, PlaylistItem, RunStatus, RunTemplate, RuntimeRegistry, Storage,
+    Timeline, Validator, VerboseLogger,
 };
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -14,9 +14,45 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+/// Tutorial content embedded at compile time
+const TUTORIAL: &str = include_str!("../../../docs/tutorial.md");
+
 #[derive(Parser)]
 #[command(name = "runbox")]
 #[command(about = "Reproducible command execution system")]
+#[command(
+    long_about = "Runbox captures command executions with full git context, stores them for \
+later reference, and allows you to replay them in isolated git worktrees \
+with the exact same code state."
+)]
+#[command(after_help = "\
+QUICK START:
+  # Execute a command directly (captures git context)
+  runbox run -- echo 'Hello, World!'
+  runbox run -- python train.py --epochs 10
+
+  # Check running processes
+  runbox ps
+
+  # View logs
+  runbox logs <run_id>
+
+  # Replay a previous run with exact code state
+  runbox replay <run_id>
+
+TEMPLATE-BASED EXECUTION:
+  # Run from a pre-defined template
+  runbox run --template tpl_train_model --binding epochs=100
+
+  # List available templates
+  runbox template list
+
+LEARN MORE:
+  runbox tutorial       Show the full interactive tutorial
+  runbox <command> -h   Show help for a specific command
+  
+DOCUMENTATION:
+  https://github.com/your-org/runbox")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -45,13 +81,38 @@ impl std::fmt::Display for RuntimeType {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run from a template
-    Run {
-        /// Template ID
-        #[arg(short, long)]
-        template: String,
+    /// Run from a template or execute a command directly
+    #[command(after_help = "\
+EXAMPLES:
+  # Direct execution (everything after -- is the command)
+  runbox run -- echo 'Hello, World!'
+  runbox run -- python train.py --epochs 10
+  runbox run -- make test
 
-        /// Variable bindings (key=value)
+  # With options for direct execution
+  runbox run --runtime tmux -- python debug.py
+  runbox run --timeout 3600 -- ./long_job.sh
+  runbox run --env CUDA_VISIBLE_DEVICES=0 -- python train.py
+  runbox run --cwd /path/to/project -- npm test
+  runbox run --no-git -- echo 'skip git capture'
+  runbox run --dry-run -- python train.py
+
+  # Template-based execution
+  runbox run --template tpl_train_model
+  runbox run --template tpl_train_model --binding epochs=100
+  runbox run --template tpl_hello --binding name=World --runtime tmux
+
+RELATED COMMANDS:
+  runbox log       Alias for direct execution (runbox log -- <cmd>)
+  runbox ps        List runs to check status
+  runbox logs      View stdout/stderr from a run
+  runbox template  Manage templates")]
+    Run {
+        /// Template ID (for template-based execution)
+        #[arg(short, long)]
+        template: Option<String>,
+
+        /// Variable bindings (key=value) - only for template mode
         #[arg(short, long)]
         binding: Vec<String>,
 
@@ -62,9 +123,107 @@ enum Commands {
         /// Skip execution (dry run)
         #[arg(long)]
         dry_run: bool,
+
+        /// Command timeout in seconds (0 = no timeout) - only for direct mode
+        #[arg(long, default_value = "0")]
+        timeout: u64,
+
+        /// Additional environment variables (KEY=VALUE) - only for direct mode
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env_vars: Vec<String>,
+
+        /// Working directory - only for direct mode (default: current directory)
+        #[arg(long)]
+        cwd: Option<String>,
+
+        /// Skip git context capture - only for direct mode
+        #[arg(long)]
+        no_git: bool,
+
+        /// Command to execute directly (everything after --)
+        #[arg(last = true, value_name = "COMMAND")]
+        command: Vec<String>,
+    },
+
+    /// Log and execute a command directly (alias for 'run --')
+    #[command(after_help = "\
+EXAMPLES:
+  # Execute and log a command
+  runbox log -- echo 'Hello, World!'
+  runbox log -- python train.py --epochs 10
+  runbox log -- make test
+  runbox log -- npm run build
+
+  # With options
+  runbox log --runtime tmux -- python debug.py
+  runbox log --timeout 3600 -- ./long_job.sh
+  runbox log --env KEY=value -- ./script.sh
+  runbox log --cwd /path/to/project -- npm test
+  runbox log --no-git -- echo 'skip git capture'
+  runbox log --dry-run -- python train.py
+
+RELATED COMMANDS:
+  runbox run       Full run command with template support
+  runbox ps        List runs to check status
+  runbox logs      View stdout/stderr from a run")]
+    Log {
+        /// Runtime environment (bg, background, tmux)
+        #[arg(long, default_value = "bg")]
+        runtime: RuntimeType,
+
+        /// Skip execution (dry run)
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Command timeout in seconds (0 = no timeout)
+        #[arg(long, default_value = "0")]
+        timeout: u64,
+
+        /// Additional environment variables (KEY=VALUE)
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env_vars: Vec<String>,
+
+        /// Working directory (default: current directory)
+        #[arg(long)]
+        cwd: Option<String>,
+
+        /// Skip git context capture
+        #[arg(long)]
+        no_git: bool,
+
+        /// Command to execute (everything after --)
+        #[arg(last = true, required = true, value_name = "COMMAND")]
+        command: Vec<String>,
     },
 
     /// List running and recent runs
+    #[command(after_help = "\
+EXAMPLES:
+  # List recent runs (default: last 20)
+  runbox ps
+
+  # Filter by status
+  runbox ps --status running
+  runbox ps --status exited
+  runbox ps --status failed
+
+  # Limit number of results
+  runbox ps --limit 5
+  runbox ps -l 10
+
+  # Show all runs
+  runbox ps --all
+
+OUTPUT:
+  SHORT ID     STATUS     RUNTIME    COMMAND
+  ----------------------------------------------------------------
+  550e8400     running    tmux       python train.py --epochs 10
+  6ba7b810     exited     background echo Hello, World!
+
+RELATED COMMANDS:
+  runbox logs <id>   View logs for a specific run
+  runbox show <id>   Show detailed run information
+  runbox stop <id>   Stop a running process")]
     Ps {
         /// Filter by status
         #[arg(long)]
@@ -80,8 +239,28 @@ enum Commands {
     },
 
     /// Stop a running process
+    #[command(after_help = "\
+EXAMPLES:
+  # Graceful stop (sends SIGTERM)
+  runbox stop 550e8400
+
+  # Force kill (sends SIGKILL)
+  runbox stop 550e8400 --force
+  runbox stop 550e8400 -f
+
+  # Using full run ID
+  runbox stop run_550e8400-e29b-41d4-a716-446655440000
+
+NOTES:
+  - Short IDs (first 8 characters) can be used instead of full run IDs
+  - Graceful stop (SIGTERM) allows the process to clean up
+  - Force stop (SIGKILL) immediately terminates the process
+
+RELATED COMMANDS:
+  runbox ps          List runs to find run IDs
+  runbox logs <id>   Check output before stopping")]
     Stop {
-        /// Run ID (or short ID)
+        /// Run ID (or short ID prefix, e.g., '550e8400')
         run_id: String,
 
         /// Force kill (SIGKILL instead of SIGTERM)
@@ -89,60 +268,282 @@ enum Commands {
         force: bool,
     },
 
-    /// Show logs for a run
+    /// Show stdout/stderr logs for a run
+    #[command(after_help = "\
+EXAMPLES:
+  # View all logs for a run
+  runbox logs 550e8400
+
+  # Follow logs in real-time (like tail -f)
+  runbox logs 550e8400 --follow
+  runbox logs 550e8400 -f
+
+  # Show last N lines only
+  runbox logs 550e8400 --lines 50
+  runbox logs 550e8400 -l 100
+
+OUTPUT:
+  [stdout/stderr content from the run]
+  Training started...
+  Epoch 1/10: loss=0.5
+  Epoch 2/10: loss=0.3
+  ...
+
+NOTES:
+  - Logs are captured from stdout and stderr combined
+  - Use --follow for running processes to see live output
+  - Press Ctrl+C to stop following
+
+RELATED COMMANDS:
+  runbox ps        List runs to find run IDs
+  runbox show      Show run metadata including log file path
+  runbox attach    Attach to tmux session (for tmux runtime)")]
     Logs {
-        /// Run ID (or short ID)
+        /// Run ID (or short ID prefix, e.g., '550e8400')
         run_id: String,
 
-        /// Follow log output (like tail -f)
+        /// Follow log output in real-time (like tail -f)
         #[arg(short, long)]
         follow: bool,
 
-        /// Number of lines to show (default: all)
+        /// Show last N lines only (default: all)
         #[arg(short, long)]
         lines: Option<usize>,
     },
 
-    /// Attach to a running process (tmux only)
+    /// Attach to a running tmux session for interactive access
+    #[command(after_help = "\
+EXAMPLES:
+  # Attach to a tmux-based run
+  runbox attach 550e8400
+
+  # Using full run ID
+  runbox attach run_550e8400-e29b-41d4-a716-446655440000
+
+NOTES:
+  - Only works for runs started with --runtime tmux
+  - Use Ctrl+B, D to detach from the tmux session
+  - The process continues running after detaching
+
+RELATED COMMANDS:
+  runbox ps               List runs to find run IDs
+  runbox logs <id>        View logs (for background runs)
+  runbox run --runtime tmux  Start a new run in tmux")]
     Attach {
-        /// Run ID (or short ID)
+        /// Run ID (or short ID prefix, e.g., '550e8400')
         run_id: String,
     },
 
-    /// Manage templates
+    /// Manage run templates (create, list, show, delete)
+    #[command(after_help = "\
+EXAMPLES:
+  # List all templates
+  runbox template list
+
+  # Show template details
+  runbox template show tpl_hello
+  runbox template show hello    # short ID works too
+
+  # Create a new template from JSON file
+  runbox template create my_template.json
+
+  # Delete a template
+  runbox template delete tpl_hello
+
+TEMPLATE JSON FORMAT:
+  {
+    \"template_id\": \"tpl_hello\",
+    \"name\": \"Hello World\",
+    \"exec\": {
+      \"argv\": [\"echo\", \"Hello, {name}!\"],
+      \"cwd\": \".\",
+      \"env\": {},
+      \"timeout_sec\": 60
+    },
+    \"bindings\": {
+      \"defaults\": { \"name\": \"World\" },
+      \"interactive\": []
+    }
+  }
+
+RELATED COMMANDS:
+  runbox run --template <id>   Execute a template
+  runbox validate              Validate a template JSON file")]
     Template {
         #[command(subcommand)]
         command: TemplateCommands,
     },
 
+    /// Manage playlists (collections of templates)
+    #[command(after_help = "\
+EXAMPLES:
+  # List all playlists
+  runbox playlist list
+
+  # Show playlist contents
+  runbox playlist show pl_daily
+
+  # Create a playlist from JSON file
+  runbox playlist create my_playlist.json
+
+  # Add a template to a playlist
+  runbox playlist add pl_daily tpl_backup --label 'Backup Data'
+
+  # Remove a template from a playlist (by template ID or index)
+  runbox playlist remove pl_daily tpl_backup
+  runbox playlist remove pl_daily 0    # remove first item
+
+PLAYLIST JSON FORMAT:
+  {
+    \"playlist_id\": \"pl_daily\",
+    \"name\": \"Daily Tasks\",
+    \"items\": [
+      { \"template_id\": \"tpl_sync\", \"label\": \"Sync Data\" },
+      { \"template_id\": \"tpl_train\", \"label\": \"Train Model\" }
+    ]
+  }
+
+RELATED COMMANDS:
+  runbox template list   List available templates to add")]
     Playlist {
         #[command(subcommand)]
         command: PlaylistCommands,
     },
 
+    /// Manage run results (captured execution outputs)
+    #[command(after_help = "\
+EXAMPLES:
+  # List recent results
+  runbox result list
+
+  # Show result details
+  runbox result show <result_id>
+
+  # Get result for a specific run
+  runbox result for-run <run_id>
+
+  # View stdout/stderr
+  runbox result stdout <result_id>
+  runbox result stderr <result_id>
+
+RELATED COMMANDS:
+  runbox show <run_id>   Show run details
+  runbox logs <run_id>   View run logs")]
     Result {
         #[command(subcommand)]
         command: ResultCommands,
     },
 
+    /// Show run history (past executions)
+    #[command(after_help = "\
+EXAMPLES:
+  # Show recent run history (default: last 10)
+  runbox history
+
+  # Limit number of results
+  runbox history --limit 20
+  runbox history -l 5
+  runbox history -n 50
+
+OUTPUT:
+  ID         COMMAND
+  ----------------------------------------------------------------
+  550e8400   python train.py --epochs 10
+  6ba7b810   echo Hello, World!
+  7c9e6679   make test
+
+RELATED COMMANDS:
+  runbox show <id>    Show detailed run information
+  runbox replay <id>  Replay a previous run
+  runbox ps           Show running and recent runs with status")]
     History {
-        /// Limit number of results
+        /// Maximum number of runs to show
         #[arg(short, long, short_alias = 'n', default_value = "10")]
         limit: usize,
     },
 
-    /// Show details of a run
+    /// Show detailed information about a run
+    #[command(after_help = "\
+EXAMPLES:
+  # Show run details
+  runbox show 550e8400
+
+  # Using full run ID
+  runbox show run_550e8400-e29b-41d4-a716-446655440000
+
+OUTPUT:
+  Run ID:     run_550e8400-e29b-41d4-a716-446655440000
+  Short ID:   550e8400
+  Status:     exited
+  Runtime:    background
+
+  Command:    [\"python\", \"train.py\", \"--epochs\", \"10\"]
+  Cwd:        .
+
+  Repo:       git@github.com:org/repo.git
+  Commit:     abc123def456...
+  Patch:      yes
+
+  Created:    2025-01-10T10:30:00Z
+  Started:    2025-01-10T10:30:01Z
+  Ended:      2025-01-10T11:45:30Z
+  Exit Code:  0
+  Log:        /home/user/.local/share/runbox/logs/run_550e8400...
+
+RELATED COMMANDS:
+  runbox ps           List runs to find run IDs
+  runbox logs <id>    View stdout/stderr logs
+  runbox replay <id>  Replay the run with same code state")]
     Show {
-        /// Run ID (or short ID)
+        /// Run ID (or short ID prefix, e.g., '550e8400')
         run_id: String,
     },
 
-    /// Replay a previous run in an isolated worktree
+    /// Replay a previous run in an isolated git worktree with exact code state
+    #[command(after_help = "\
+EXAMPLES:
+  # Basic replay
+  runbox replay 550e8400
+
+  # Specify worktree directory
+  runbox replay 550e8400 --worktree-dir /tmp/replay
+
+  # Clean up worktree after execution
+  runbox replay 550e8400 --cleanup
+
+  # Keep worktree after execution (default)
+  runbox replay 550e8400 --keep
+
+  # Always create fresh worktree (don't reuse existing)
+  runbox replay 550e8400 --fresh
+
+  # Reuse existing worktree if commit matches (default)
+  runbox replay 550e8400 --reuse
+
+  # Verbose output levels
+  runbox replay 550e8400 -v      # Level 1: basic info
+  runbox replay 550e8400 -vv     # Level 2: detailed info
+  runbox replay 550e8400 -vvv    # Level 3: debug info
+
+HOW IT WORKS:
+  1. Creates a git worktree at the original commit
+  2. Applies any uncommitted changes (patch) if present
+  3. Executes the same command in that environment
+
+CONFIGURATION:
+  Set defaults in .git/config or ~/.gitconfig:
+    git config runbox.worktree-dir /path/to/worktrees
+    git config runbox.cleanup false
+    git config runbox.reuse true
+
+RELATED COMMANDS:
+  runbox show <id>     View run details including code state
+  runbox history       List past runs to replay")]
     Replay {
-        /// Run ID
+        /// Run ID (or short ID prefix, e.g., '550e8400')
         run_id: String,
 
-        /// Override worktree directory
+        /// Directory to create worktree in
         #[arg(long)]
         worktree_dir: Option<PathBuf>,
 
@@ -158,65 +559,254 @@ enum Commands {
         #[arg(long, conflicts_with = "fresh")]
         reuse: bool,
 
-        /// Always create fresh worktree
+        /// Always create fresh worktree (ignore existing)
         #[arg(long, conflicts_with = "reuse")]
         fresh: bool,
 
-        /// Verbose output (can be repeated: -v, -vv, -vvv)
+        /// Increase verbosity (-v, -vv, -vvv)
         #[arg(short, long, action = clap::ArgAction::Count)]
         verbose: u8,
     },
 
-    /// Validate a JSON file
+    /// Validate a template, run, or playlist JSON file
+    #[command(after_help = "\
+EXAMPLES:
+  # Validate a template file
+  runbox validate my_template.json
+
+  # Validate a playlist file
+  runbox validate my_playlist.json
+
+  # Validate a run file
+  runbox validate run_record.json
+
+AUTO-DETECTION:
+  The file type is auto-detected based on the ID field prefix:
+    - 'tpl_' prefix  -> Template
+    - 'run_' prefix  -> Run
+    - 'pl_' prefix   -> Playlist
+
+OUTPUT:
+  Valid template file: my_template.json
+  
+  # On error:
+  Error: Invalid template: missing required field 'exec'
+
+RELATED COMMANDS:
+  runbox template create   Create a new template from validated JSON")]
     Validate {
-        /// Path to JSON file
+        /// Path to JSON file (template, run, or playlist)
         path: String,
     },
 
-    /// Manage the background daemon (for debugging)
+    /// Manage the background daemon process
+    #[command(after_help = "\
+EXAMPLES:
+  # Check daemon status
+  runbox daemon status
+
+  # Start daemon in foreground (for debugging)
+  runbox daemon start
+
+  # Stop the running daemon
+  runbox daemon stop
+
+  # Ping the daemon to verify it's responding
+  runbox daemon ping
+
+ABOUT THE DAEMON:
+  The daemon tracks background processes and captures their exit status.
+  It starts automatically when running commands with 'background' runtime.
+
+TROUBLESHOOTING:
+  If runs show 'unknown' status, the daemon may not be running:
+    runbox daemon status
+    runbox daemon ping
+
+RELATED COMMANDS:
+  runbox ps     List runs (daemon tracks their status)
+  runbox stop   Stop a running process")]
     Daemon {
         #[command(subcommand)]
         command: DaemonCommands,
     },
+
+    /// Display the full tutorial in the terminal
+    #[command(after_help = "\
+EXAMPLES:
+  # Show the complete tutorial
+  runbox tutorial
+
+  # Pipe to a pager for easier reading
+  runbox tutorial | less
+
+CONTENTS:
+  - Installation
+  - Quick Start
+  - Direct Execution
+  - Core Concepts (Run, Template, Playlist)
+  - Templates
+  - Running Commands
+  - Monitoring and Logs
+  - Playlists
+  - Replay
+  - Configuration
+  - Troubleshooting
+  - Examples")]
+    Tutorial,
 }
 
 #[derive(Subcommand)]
 enum DaemonCommands {
-    /// Start the daemon in foreground mode
+    /// Start the daemon in foreground mode (for debugging)
+    #[command(after_help = "\
+EXAMPLES:
+  runbox daemon start
+
+NOTE: Press Ctrl+C to stop the daemon when running in foreground.
+For normal operation, the daemon starts automatically.")]
     Start,
-    /// Stop the running daemon
+
+    /// Stop the running daemon gracefully
+    #[command(after_help = "\
+EXAMPLES:
+  runbox daemon stop")]
     Stop,
-    /// Check daemon status
+
+    /// Check if the daemon is running and show connection info
+    #[command(after_help = "\
+EXAMPLES:
+  runbox daemon status
+
+OUTPUT:
+  Socket path: /tmp/runbox-daemon.sock
+  PID file:    /tmp/runbox-daemon.pid
+  PID:         12345
+  Status:      running")]
     Status,
-    /// Ping the daemon
+
+    /// Ping the daemon to verify it's responding
+    #[command(after_help = "\
+EXAMPLES:
+  runbox daemon ping
+
+OUTPUT:
+  Pinging daemon...
+  Daemon is alive (pong received)")]
     Ping,
 }
 
 #[derive(Subcommand)]
 enum TemplateCommands {
-    /// List all templates
+    /// List all registered templates
+    #[command(after_help = "\
+EXAMPLES:
+  runbox template list
+
+OUTPUT:
+  ID         NAME
+  ----------------------------------------------------------------
+  tpl_hello  Hello World
+  tpl_train  Train ML Model")]
     List,
-    /// Show template details
-    Show { template_id: String },
-    /// Create a new template from JSON file
-    Create { path: String },
-    /// Delete a template
-    Delete { template_id: String },
+
+    /// Show template details as JSON
+    #[command(after_help = "\
+EXAMPLES:
+  runbox template show tpl_hello
+  runbox template show hello    # short ID prefix works")]
+    Show {
+        /// Template ID (or short ID prefix)
+        template_id: String,
+    },
+
+    /// Register a new template from a JSON file
+    #[command(after_help = "\
+EXAMPLES:
+  runbox template create my_template.json
+
+NOTE: Use 'runbox validate' to check the JSON before creating.")]
+    Create {
+        /// Path to template JSON file
+        path: String,
+    },
+
+    /// Delete a registered template
+    #[command(after_help = "\
+EXAMPLES:
+  runbox template delete tpl_hello
+  runbox template delete hello    # short ID prefix works")]
+    Delete {
+        /// Template ID (or short ID prefix)
+        template_id: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum PlaylistCommands {
+    /// List all registered playlists
+    #[command(after_help = "\
+EXAMPLES:
+  runbox playlist list
+
+OUTPUT:
+  ID         NAME                           ITEMS
+  ----------------------------------------------------------------
+  pl_daily   Daily Tasks                    3")]
     List,
-    Show { playlist_id: String },
-    Create { path: String },
-    Add {
+
+    /// Show playlist details as JSON
+    #[command(after_help = "\
+EXAMPLES:
+  runbox playlist show pl_daily
+  runbox playlist show daily    # short ID prefix works")]
+    Show {
+        /// Playlist ID (or short ID prefix)
         playlist_id: String,
+    },
+
+    /// Register a new playlist from a JSON file
+    #[command(after_help = "\
+EXAMPLES:
+  runbox playlist create my_playlist.json
+
+NOTE: Use 'runbox validate' to check the JSON before creating.")]
+    Create {
+        /// Path to playlist JSON file
+        path: String,
+    },
+
+    /// Add a template to a playlist
+    #[command(after_help = "\
+EXAMPLES:
+  # Add with auto-generated label
+  runbox playlist add pl_daily tpl_backup
+
+  # Add with custom label
+  runbox playlist add pl_daily tpl_backup --label 'Backup Data'")]
+    Add {
+        /// Playlist ID (or short ID prefix)
+        playlist_id: String,
+        /// Template ID to add (or short ID prefix)
         template_id: String,
+        /// Display label for this item in the playlist
         #[arg(short, long)]
         label: Option<String>,
     },
+
+    /// Remove a template from a playlist by ID or index
+    #[command(after_help = "\
+EXAMPLES:
+  # Remove by template ID
+  runbox playlist remove pl_daily tpl_backup
+
+  # Remove by index (0-based)
+  runbox playlist remove pl_daily 0    # remove first item
+  runbox playlist remove pl_daily 2    # remove third item")]
     Remove {
+        /// Playlist ID (or short ID prefix)
         playlist_id: String,
+        /// Template ID or index (0-based) to remove
         template_or_index: String,
     },
 }
@@ -227,11 +817,21 @@ enum ResultCommands {
         #[arg(short, long, default_value = "20")]
         limit: usize,
     },
-    Show { result_id: String },
-    ForRun { run_id: String },
-    Stdout { result_id: String },
-    Stderr { result_id: String },
-    Delete { result_id: String },
+    Show {
+        result_id: String,
+    },
+    ForRun {
+        run_id: String,
+    },
+    Stdout {
+        result_id: String,
+    },
+    Stderr {
+        result_id: String,
+    },
+    Delete {
+        result_id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -248,7 +848,33 @@ fn main() -> Result<()> {
             binding,
             runtime,
             dry_run,
-        } => cmd_run(&storage, &template, binding, runtime, dry_run),
+            timeout,
+            env_vars,
+            cwd,
+            no_git,
+            command,
+        } => {
+            if let Some(tpl_id) = template {
+                cmd_run_template(&storage, &tpl_id, binding, runtime, dry_run)
+            } else if !command.is_empty() {
+                cmd_run_direct(
+                    &storage, command, runtime, dry_run, timeout, env_vars, cwd, no_git,
+                )
+            } else {
+                anyhow::bail!("Either --template or a command (after --) is required.\n\nUsage:\n  runbox run --template <id> [--binding key=value]\n  runbox run [OPTIONS] -- <command...>")
+            }
+        }
+        Commands::Log {
+            runtime,
+            dry_run,
+            timeout,
+            env_vars,
+            cwd,
+            no_git,
+            command,
+        } => cmd_run_direct(
+            &storage, command, runtime, dry_run, timeout, env_vars, cwd, no_git,
+        ),
         Commands::Ps { status, all, limit } => cmd_ps(&storage, status, all, limit),
         Commands::Stop { run_id, force } => cmd_stop(&storage, &run_id, force),
         Commands::Logs {
@@ -312,7 +938,13 @@ fn main() -> Result<()> {
             DaemonCommands::Status => cmd_daemon_status(),
             DaemonCommands::Ping => cmd_daemon_ping(),
         },
+        Commands::Tutorial => cmd_tutorial(),
     }
+}
+
+fn cmd_tutorial() -> Result<()> {
+    println!("{}", TUTORIAL);
+    Ok(())
 }
 
 // === Daemon Commands ===
@@ -439,9 +1071,9 @@ fn which_daemon() -> Result<PathBuf> {
     Ok(PathBuf::from("runbox-daemon"))
 }
 
-// === Run Command ===
+// === Run Commands ===
 
-fn cmd_run(
+fn cmd_run_template(
     storage: &Storage,
     template_id: &str,
     bindings: Vec<String>,
@@ -528,15 +1160,11 @@ fn cmd_run(
 
     // CAS-style update with lock: only update if still Pending
     // This prevents overwriting terminal state if process exited very fast
-    let saved = storage.save_run_if_status_with(
-        &run.run_id,
-        &[RunStatus::Pending],
-        |current| {
-            current.handle = Some(handle.clone());
-            current.status = RunStatus::Running;
-            current.timeline.started_at = Some(Utc::now());
-        }
-    )?;
+    let saved = storage.save_run_if_status_with(&run.run_id, &[RunStatus::Pending], |current| {
+        current.handle = Some(handle.clone());
+        current.status = RunStatus::Running;
+        current.timeline.started_at = Some(Utc::now());
+    })?;
 
     if !saved {
         // Process already exited - daemon captured the status
@@ -548,12 +1176,127 @@ fn cmd_run(
                 if current.handle.is_none() {
                     current.handle = Some(handle.clone());
                 }
+            },
+        );
+        log::debug!("Run {} already exited - daemon captured status", run.run_id);
+    }
+
+    println!("Run started: {}", run.run_id);
+    println!("Short ID: {}", run.short_id());
+    println!("Logs: {}", log_path.display());
+
+    if matches!(runtime, RuntimeType::Tmux) {
+        println!("Attach with: runbox attach {}", run.short_id());
+    }
+
+    Ok(())
+}
+
+fn cmd_run_direct(
+    storage: &Storage,
+    command: Vec<String>,
+    runtime: RuntimeType,
+    dry_run: bool,
+    timeout: u64,
+    env_vars: Vec<String>,
+    cwd: Option<String>,
+    no_git: bool,
+) -> Result<()> {
+    use runbox_core::{CodeState, Exec, Run};
+
+    if command.is_empty() {
+        bail!("No command specified. Usage: runbox run -- <command...>");
+    }
+
+    let run_id = format!("run_{}", uuid::Uuid::new_v4());
+
+    let code_state = if no_git {
+        CodeState {
+            repo_url: String::new(),
+            base_commit: "0".repeat(40),
+            patch: None,
+        }
+    } else {
+        let git = GitContext::from_current_dir()?;
+        git.build_code_state(&run_id)?
+    };
+
+    let env: std::collections::HashMap<String, String> = env_vars
+        .iter()
+        .filter_map(|s| {
+            let parts: Vec<&str> = s.splitn(2, '=').collect();
+            if parts.len() == 2 {
+                Some((parts[0].to_string(), parts[1].to_string()))
+            } else {
+                None
             }
+        })
+        .collect();
+
+    let working_dir = cwd.unwrap_or_else(|| ".".to_string());
+
+    let exec = Exec {
+        argv: command,
+        cwd: working_dir,
+        env,
+        timeout_sec: timeout,
+    };
+
+    let mut run = Run::new(exec, code_state);
+    run.run_id = run_id;
+
+    run.validate()?;
+
+    if dry_run {
+        println!("Dry run - would execute:");
+        println!("{}", serde_json::to_string_pretty(&run)?);
+        return Ok(());
+    }
+
+    let registry = RuntimeRegistry::new();
+    let runtime_name = runtime.to_string();
+    let adapter = registry
+        .get(&runtime_name)
+        .context(format!("Unknown runtime: {}", runtime_name))?;
+
+    let log_path = storage.log_path(&run.run_id);
+
+    run.runtime = runtime_name.clone();
+    run.log_ref = Some(LogRef {
+        path: log_path.clone(),
+    });
+    run.timeline = Timeline {
+        created_at: Some(Utc::now()),
+        started_at: None,
+        ended_at: None,
+    };
+    run.status = RunStatus::Pending;
+
+    storage.save_run(&run)?;
+
+    println!("Starting run: {}", run.run_id);
+    println!("Runtime: {}", runtime_name);
+    println!("Command: {:?}", run.exec.argv);
+
+    let handle = adapter.spawn(&run.exec, &run.run_id, &log_path)?;
+
+    let saved = storage.save_run_if_status_with(&run.run_id, &[RunStatus::Pending], |current| {
+        current.handle = Some(handle.clone());
+        current.status = RunStatus::Running;
+        current.timeline.started_at = Some(Utc::now());
+    })?;
+
+    if !saved {
+        let _ = storage.save_run_if_status_with(
+            &run.run_id,
+            &[RunStatus::Exited, RunStatus::Failed, RunStatus::Unknown],
+            |current| {
+                if current.handle.is_none() {
+                    current.handle = Some(handle.clone());
+                }
+            },
         );
-        log::debug!(
-            "Run {} already exited - daemon captured status",
-            run.run_id
-        );
+        log::debug!("Run {} already exited - daemon captured status", run.run_id);
     }
 
     println!("Run started: {}", run.run_id);
@@ -569,7 +1312,12 @@ fn cmd_run(
 
 // === Ps Command ===
 
-fn cmd_ps(storage: &Storage, status_filter: Option<String>, _all: bool, limit: usize) -> Result<()> {
+fn cmd_ps(
+    storage: &Storage,
+    status_filter: Option<String>,
+    _all: bool,
+    limit: usize,
+) -> Result<()> {
     // First, reconcile running processes
     reconcile_runs(storage)?;
 
@@ -649,7 +1397,7 @@ fn cmd_stop(storage: &Storage, run_id: &str, force: bool) -> Result<()> {
                 if current.timeline.ended_at.is_none() {
                     current.timeline.ended_at = Some(Utc::now());
                 }
-            }
+            },
         );
         // Note: if CAS failed, daemon already set terminal state, which is fine
 
@@ -843,10 +1591,8 @@ fn reconcile_runs(storage: &Storage) -> Result<()> {
 
         if let Some(reason) = reason {
             // Use CAS-style save with lock
-            let _ = storage.save_run_if_status_with(
-                &run.run_id,
-                &[RunStatus::Running],
-                |current| {
+            let _ =
+                storage.save_run_if_status_with(&run.run_id, &[RunStatus::Running], |current| {
                     current.status = RunStatus::Unknown;
                     current.reconcile_reason = Some(reason.clone());
                     let now = Utc::now();
@@ -856,8 +1602,7 @@ fn reconcile_runs(storage: &Storage) -> Result<()> {
                     if current.timeline.ended_at.is_none() {
                         current.timeline.ended_at = Some(now);
                     }
-                }
-            );
+                });
         }
     }
 
@@ -891,8 +1636,8 @@ fn cmd_template_show(storage: &Storage, template_id: &str) -> Result<()> {
 }
 
 fn cmd_template_create(storage: &Storage, path: &str) -> Result<()> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read file: {}", path))?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("Failed to read file: {}", path))?;
 
     // Validate first
     let validator = Validator::new()?;
@@ -926,7 +1671,12 @@ fn cmd_playlist_list(storage: &Storage) -> Result<()> {
     println!("{:<10} {:<30} {:<10}", "ID", "NAME", "ITEMS");
     println!("{}", "-".repeat(50));
     for p in playlists {
-        println!("{:<10} {:<30} {:<10}", short_id(&p.playlist_id), p.name, p.items.len());
+        println!(
+            "{:<10} {:<30} {:<10}",
+            short_id(&p.playlist_id),
+            p.name,
+            p.items.len()
+        );
     }
 
     Ok(())
@@ -940,8 +1690,8 @@ fn cmd_playlist_show(storage: &Storage, playlist_id: &str) -> Result<()> {
 }
 
 fn cmd_playlist_create(storage: &Storage, path: &str) -> Result<()> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read file: {}", path))?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("Failed to read file: {}", path))?;
 
     // Validate first
     let validator = Validator::new()?;
@@ -969,7 +1719,11 @@ fn cmd_playlist_add(
         label,
     });
     storage.save_playlist(&playlist)?;
-    println!("Added {} to {}", short_id(&resolved_template_id), short_id(&resolved_playlist_id));
+    println!(
+        "Added {} to {}",
+        short_id(&resolved_template_id),
+        short_id(&resolved_playlist_id)
+    );
     Ok(())
 }
 
@@ -990,20 +1744,33 @@ fn cmd_playlist_remove(storage: &Storage, playlist_id: &str, selector: &str) -> 
         }
         let removed = playlist.items.remove(index);
         storage.save_playlist(&playlist)?;
-        println!("Removed {} from {}", short_id(&removed.template_id), short_id(&resolved_playlist_id));
+        println!(
+            "Removed {} from {}",
+            short_id(&removed.template_id),
+            short_id(&resolved_playlist_id)
+        );
         return Ok(());
     }
 
     let resolved_template_id = storage.resolve_template_id(selector)?;
     let initial_len = playlist.items.len();
-    playlist.items.retain(|item| item.template_id != resolved_template_id);
+    playlist
+        .items
+        .retain(|item| item.template_id != resolved_template_id);
 
     if playlist.items.len() == initial_len {
-        bail!("Template {} not found in playlist", short_id(&resolved_template_id));
+        bail!(
+            "Template {} not found in playlist",
+            short_id(&resolved_template_id)
+        );
     }
 
     storage.save_playlist(&playlist)?;
-    println!("Removed {} from {}", short_id(&resolved_template_id), short_id(&resolved_playlist_id));
+    println!(
+        "Removed {} from {}",
+        short_id(&resolved_template_id),
+        short_id(&resolved_playlist_id)
+    );
     Ok(())
 }
 
@@ -1040,7 +1807,14 @@ fn cmd_show(storage: &Storage, run_id: &str) -> Result<()> {
     println!("Run ID:     {}", run.run_id);
     println!("Short ID:   {}", run.short_id());
     println!("Status:     {}", run.status);
-    println!("Runtime:    {}", if run.runtime.is_empty() { "-" } else { &run.runtime });
+    println!(
+        "Runtime:    {}",
+        if run.runtime.is_empty() {
+            "-"
+        } else {
+            &run.runtime
+        }
+    );
     println!();
     println!("Command:    {:?}", run.exec.argv);
     println!("Cwd:        {}", run.exec.cwd);
@@ -1134,7 +1908,10 @@ fn cmd_result_show(storage: &Storage, result_id: &str) -> Result<()> {
         println!();
         println!("Artifacts:");
         for artifact in &result.artifacts {
-            println!("  - {}: {} ({})", artifact.name, artifact.path, artifact.ref_);
+            println!(
+                "  - {}: {} ({})",
+                artifact.name, artifact.path, artifact.ref_
+            );
         }
     }
 
