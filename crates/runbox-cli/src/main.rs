@@ -3,7 +3,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use dialoguer::{theme::ColorfulTheme, Input};
 use runbox_core::{
-    default_pid_path, default_socket_path, short_id, BindingResolver, ConfigResolver, DaemonClient,
+    default_pid_path, default_socket_path, short_id, ResolveTargetError, BindingResolver, ConfigResolver, DaemonClient,
     GitContext, LogRef, Playlist, PlaylistItem, RunStatus, RunTemplate, RuntimeRegistry, Storage,
     Timeline, Validator, VerboseLogger,
 };
@@ -73,9 +73,13 @@ impl std::fmt::Display for RuntimeType {
 }
 #[derive(Subcommand)]
 enum Commands {
-    /// Run from a template or execute a command directly
+    /// Run from a template, playlist item, or execute a command directly
     #[command(after_help = "\
 EXAMPLES:
+  # Smart resolution (template or playlist item by short ID)
+  runbox run echo                 # Template by name/id prefix
+  runbox run a1b2c3d4             # Template or playlist item by short ID
+  runbox run --dry-run f5e6d7c8   # Show what would run
   # Direct execution (everything after -- is the command)
   runbox run -- echo 'Hello, World!'
   runbox run -- python train.py --epochs 10
@@ -87,20 +91,28 @@ EXAMPLES:
   runbox run --cwd /path/to/project -- npm test
   runbox run --no-git -- echo 'skip git capture'
   runbox run --dry-run -- python train.py
-  # Template-based execution
+  # Explicit template-based execution
   runbox run --template tpl_train_model
   runbox run --template tpl_train_model --binding epochs=100
   runbox run --template tpl_hello --binding name=World --runtime tmux
+RESOLUTION ORDER:
+  1. Templates (exact match on template_id)
+  2. Templates (prefix match on normalized ID)
+  3. Playlist items (prefix match on hex short ID)
 RELATED COMMANDS:
   runbox log       Alias for direct execution (runbox log -- <cmd>)
   runbox ps        List runs to check status
   runbox logs      View stdout/stderr from a run
-  runbox template  Manage templates")]
+  runbox template  Manage templates
+  runbox playlist  Manage playlists")]
     Run {
-        /// Template ID (for template-based execution)
+        /// Short ID to resolve (template or playlist item)
+        #[arg(value_name = "TARGET")]
+        target: Option<String>,
+        /// Template ID (explicit, skips smart resolution)
         #[arg(short, long)]
         template: Option<String>,
-        /// Variable bindings (key=value) - only for template mode
+        /// Variable bindings (key=value) - for template mode
         #[arg(short, long)]
         binding: Vec<String>,
         /// Runtime environment (bg, background, tmux)
@@ -777,6 +789,7 @@ fn main() -> Result<()> {
     };
     match cli.command {
         Commands::Run {
+            target,
             template,
             binding,
             runtime,
@@ -788,13 +801,18 @@ fn main() -> Result<()> {
             command,
         } => {
             if let Some(tpl_id) = template {
+                // Explicit template override (--template flag)
                 cmd_run_template(&storage, &tpl_id, binding, runtime, dry_run)
+            } else if let Some(target_id) = target {
+                // Smart resolution (positional TARGET argument)
+                cmd_run_smart(&storage, &target_id, binding, runtime, dry_run)
             } else if !command.is_empty() {
+                // Direct command execution (-- <command...>)
                 cmd_run_direct(
                     &storage, command, runtime, dry_run, timeout, env_vars, cwd, no_git,
                 )
             } else {
-                anyhow::bail!("Either --template or a command (after --) is required.\n\nUsage:\n  runbox run --template <id> [--binding key=value]\n  runbox run [OPTIONS] -- <command...>")
+                anyhow::bail!("Specify a target (template/playlist item ID), --template, or a command after --.\n\nUsage:\n  runbox run <target>                     # Smart resolution\n  runbox run --template <id>              # Explicit template\n  runbox run [OPTIONS] -- <command...>    # Direct execution")
             }
         }
         Commands::Log {
@@ -1088,6 +1106,54 @@ fn cmd_run_template(
     }
     Ok(())
 }
+
+/// Smart resolution: resolve target to template or playlist item and execute
+fn cmd_run_smart(
+    storage: &Storage,
+    target: &str,
+    bindings: Vec<String>,
+    runtime: RuntimeType,
+    dry_run: bool,
+) -> Result<()> {
+    // Resolve the target
+    let resolved = match storage.resolve_target(target) {
+        Ok(r) => r,
+        Err(ResolveTargetError::NotFound(t)) => {
+            bail!("No template or playlist item found matching \"{}\"", t)
+        }
+        Err(ResolveTargetError::Ambiguous { input, count, candidates }) => {
+            bail!(
+                "Ambiguous short ID \"{}\" matches {} items:\n{}\n\nUse more characters or specify explicitly:\n  runbox run --template <id>\n  runbox playlist run <playlist> <item>",
+                input, count, candidates
+            )
+        }
+        Err(ResolveTargetError::Storage(e)) => {
+            bail!("Storage error: {}", e)
+        }
+    };
+
+    // Display resolution info
+    println!("Resolved: {}", resolved.description());
+
+    // Get the template ID to execute
+    let template_id = resolved.template_id();
+    
+    // Load and display the template info
+    let template = storage.load_template(template_id)?;
+    println!("  Template: {} ({})", template.name, template.template_id);
+    println!("  Command:  {:?}", template.exec.argv);
+
+    if dry_run {
+        println!("\n(dry run - would execute with the above configuration)");
+        return Ok(());
+    }
+
+    println!();
+    
+    // Delegate to cmd_run_template for actual execution
+    cmd_run_template(storage, template_id, bindings, runtime, false)
+}
+
 fn cmd_run_direct(
     storage: &Storage,
     command: Vec<String>,

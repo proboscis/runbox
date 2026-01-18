@@ -18,6 +18,6 @@ pub use playlist::{Playlist, PlaylistItem};
 pub use result::{Artifact, Execution, Output, RunResult};
 pub use run::{CodeState, Exec, LogRef, Patch, Run, RunStatus, RuntimeHandle, Timeline};
 pub use runtime::{BackgroundAdapter, RuntimeAdapter, RuntimeRegistry, TmuxAdapter};
-pub use storage::{short_id, Storage};
+pub use storage::{short_id, ResolvedTarget, ResolveTargetError, Storage};
 pub use template::{Bindings, RunTemplate, TemplateCodeState, TemplateExec};
 pub use validation::{ValidationType, Validator};

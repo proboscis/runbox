@@ -516,6 +516,188 @@ where
     }
 }
 
+/// Represents a resolved target for smart run resolution
+#[derive(Debug, Clone)]
+pub enum ResolvedTarget {
+    /// A template was resolved
+    Template {
+        template_id: String,
+        template_name: String,
+    },
+    /// A playlist item was resolved
+    PlaylistItem {
+        playlist_id: String,
+        playlist_name: String,
+        index: usize,
+        template_id: String,
+        label: Option<String>,
+        short_id: String,
+    },
+}
+
+impl ResolvedTarget {
+    /// Get the template ID from the resolved target
+    pub fn template_id(&self) -> &str {
+        match self {
+            ResolvedTarget::Template { template_id, .. } => template_id,
+            ResolvedTarget::PlaylistItem { template_id, .. } => template_id,
+        }
+    }
+
+    /// Get the display short ID for this target
+    pub fn display_short_id(&self) -> String {
+        match self {
+            ResolvedTarget::Template { template_id, .. } => short_id(template_id),
+            ResolvedTarget::PlaylistItem { short_id, .. } => short_id.clone(),
+        }
+    }
+
+    /// Get a human-readable description of what was resolved
+    pub fn description(&self) -> String {
+        match self {
+            ResolvedTarget::Template { template_id, template_name } => {
+                format!("template \"{}\" ({})", template_name, template_id)
+            }
+            ResolvedTarget::PlaylistItem {
+                playlist_id,
+                playlist_name,
+                index,
+                label,
+                template_id,
+                ..
+            } => {
+                let item_label = label.as_deref().unwrap_or(template_id);
+                let playlist_short = short_id(playlist_id);
+                format!(
+                    "playlist \"{}\" ({}) item {} \"{}\" ({})",
+                    playlist_name, playlist_short, index, item_label, template_id
+                )
+            }
+        }
+    }
+
+    /// Get a formatted candidate line for ambiguity display
+    pub fn candidate_line(&self) -> String {
+        match self {
+            ResolvedTarget::Template { template_id, template_name } => {
+                format!(
+                    "  [template]       {}  \"{}\" ({})",
+                    short_id(template_id),
+                    template_name,
+                    template_id
+                )
+            }
+            ResolvedTarget::PlaylistItem {
+                playlist_id,
+                index: _,
+                template_id,
+                label,
+                short_id,
+                ..
+            } => {
+                let playlist_short = crate::storage::short_id(playlist_id);
+                let item_label = label.as_deref().unwrap_or("(no label)");
+                format!(
+                    "  [playlist:{}] {}  \"{}\" ({})",
+                    playlist_short, short_id, item_label, template_id
+                )
+            }
+        }
+    }
+}
+
+/// Error type for resolution failures
+#[derive(Debug, thiserror::Error)]
+pub enum ResolveTargetError {
+    #[error("No template or playlist item found matching \"{0}\"")]
+    NotFound(String),
+    #[error("Ambiguous short ID \"{input}\" matches {count} items:\n{candidates}\n\nUse more characters or specify explicitly:\n  runbox run --template <id>\n  runbox playlist run <playlist> <item>")]
+    Ambiguous {
+        input: String,
+        count: usize,
+        candidates: String,
+    },
+    #[error(transparent)]
+    Storage(#[from] anyhow::Error),
+}
+
+impl Storage {
+    /// Resolve a target string to either a template or playlist item.
+    /// 
+    /// Resolution order:
+    /// 1. Check templates for exact match on template_id
+    /// 2. Check templates for prefix match on normalized ID
+    /// 3. Check playlist items for prefix match on generated hex short ID
+    /// 
+    /// Returns an error if no match is found or if the match is ambiguous.
+    pub fn resolve_target(&self, target: &str) -> Result<ResolvedTarget, ResolveTargetError> {
+        let mut matches: Vec<ResolvedTarget> = vec![];
+
+        // 1. Check templates
+        let templates = self.list_templates().map_err(ResolveTargetError::Storage)?;
+        
+        // Exact match on template_id first
+        for template in &templates {
+            if template.template_id == target {
+                return Ok(ResolvedTarget::Template {
+                    template_id: template.template_id.clone(),
+                    template_name: template.name.clone(),
+                });
+            }
+        }
+
+        // Prefix match on normalized ID
+        let target_normalized = normalize_for_match(target);
+        for template in &templates {
+            let id_normalized = normalize_for_match(&template.template_id);
+            if id_normalized.starts_with(&target_normalized) {
+                matches.push(ResolvedTarget::Template {
+                    template_id: template.template_id.clone(),
+                    template_name: template.name.clone(),
+                });
+            }
+        }
+
+        // 2. Check playlist items
+        let playlists = self.list_playlists().map_err(ResolveTargetError::Storage)?;
+        let target_lower = target.to_lowercase();
+        
+        for playlist in &playlists {
+            for (idx, item) in playlist.items.iter().enumerate() {
+                let item_short = item.short_id(&playlist.playlist_id, idx);
+                if item_short.starts_with(&target_lower) {
+                    matches.push(ResolvedTarget::PlaylistItem {
+                        playlist_id: playlist.playlist_id.clone(),
+                        playlist_name: playlist.name.clone(),
+                        index: idx,
+                        template_id: item.template_id.clone(),
+                        label: item.label.clone(),
+                        short_id: item_short,
+                    });
+                }
+            }
+        }
+
+        // Return based on match count
+        match matches.len() {
+            0 => Err(ResolveTargetError::NotFound(target.to_string())),
+            1 => Ok(matches.remove(0)),
+            n => {
+                let candidates = matches
+                    .iter()
+                    .map(|m| m.candidate_line())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Err(ResolveTargetError::Ambiguous {
+                    input: target.to_string(),
+                    count: n,
+                    candidates,
+                })
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,4 +1077,139 @@ mod tests {
         let resolved = storage.resolve_result_id(&result.result_id).unwrap();
         assert_eq!(resolved, result.result_id);
     }
+
+    #[test]
+    fn test_resolve_target_template() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create a template
+        let template = crate::RunTemplate {
+            template_version: 0,
+            template_id: "tpl_hello_world".to_string(),
+            name: "Hello World".to_string(),
+            exec: crate::TemplateExec {
+                argv: vec!["echo".to_string(), "hello".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+                timeout_sec: 0,
+            },
+            bindings: None,
+            code_state: crate::TemplateCodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+            },
+        };
+        storage.save_template(&template).unwrap();
+
+        // Exact match
+        let resolved = storage.resolve_target("tpl_hello_world").unwrap();
+        assert!(matches!(resolved, ResolvedTarget::Template { .. }));
+        assert_eq!(resolved.template_id(), "tpl_hello_world");
+
+        // Prefix match
+        let resolved = storage.resolve_target("hello").unwrap();
+        assert!(matches!(resolved, ResolvedTarget::Template { .. }));
+        assert_eq!(resolved.template_id(), "tpl_hello_world");
+    }
+
+    #[test]
+    fn test_resolve_target_playlist_item() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create a template first
+        let template = crate::RunTemplate {
+            template_version: 0,
+            template_id: "tpl_echo".to_string(),
+            name: "Echo".to_string(),
+            exec: crate::TemplateExec {
+                argv: vec!["echo".to_string(), "test".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+                timeout_sec: 0,
+            },
+            bindings: None,
+            code_state: crate::TemplateCodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+            },
+        };
+        storage.save_template(&template).unwrap();
+
+        // Create a playlist with an item
+        let mut playlist = crate::Playlist::new("pl_daily", "Daily Tasks");
+        playlist.add("tpl_echo", Some("Echo Task"));
+        storage.save_playlist(&playlist).unwrap();
+
+        // Get the short ID of the playlist item
+        let item_short_id = playlist.items[0].short_id(&playlist.playlist_id, 0);
+
+        // Resolve by short ID
+        let resolved = storage.resolve_target(&item_short_id).unwrap();
+        assert!(matches!(resolved, ResolvedTarget::PlaylistItem { .. }));
+        assert_eq!(resolved.template_id(), "tpl_echo");
+
+        // Resolve by prefix
+        let prefix = &item_short_id[..4];
+        let resolved = storage.resolve_target(prefix).unwrap();
+        assert!(matches!(resolved, ResolvedTarget::PlaylistItem { .. }));
+    }
+
+    #[test]
+    fn test_resolve_target_not_found() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        let result = storage.resolve_target("nonexistent");
+        assert!(matches!(result, Err(ResolveTargetError::NotFound(_))));
+    }
+
+    #[test]
+    fn test_resolve_target_ambiguous() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create two templates with similar prefixes
+        let template1 = crate::RunTemplate {
+            template_version: 0,
+            template_id: "tpl_abc_one".to_string(),
+            name: "ABC One".to_string(),
+            exec: crate::TemplateExec {
+                argv: vec!["echo".to_string(), "one".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+                timeout_sec: 0,
+            },
+            bindings: None,
+            code_state: crate::TemplateCodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+            },
+        };
+        storage.save_template(&template1).unwrap();
+
+        let template2 = crate::RunTemplate {
+            template_version: 0,
+            template_id: "tpl_abc_two".to_string(),
+            name: "ABC Two".to_string(),
+            exec: crate::TemplateExec {
+                argv: vec!["echo".to_string(), "two".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+                timeout_sec: 0,
+            },
+            bindings: None,
+            code_state: crate::TemplateCodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+            },
+        };
+        storage.save_template(&template2).unwrap();
+
+        // Short prefix should be ambiguous
+        let result = storage.resolve_target("abc");
+        assert!(matches!(result, Err(ResolveTargetError::Ambiguous { .. })));
+
+        // More specific prefix should work
+        let resolved = storage.resolve_target("abc_one").unwrap();
+        assert_eq!(resolved.template_id(), "tpl_abc_one");
+    }
+
 }
