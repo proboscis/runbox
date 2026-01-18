@@ -12,7 +12,7 @@ use std::process::Command;
 
 /// Adapter for running processes in zellij sessions (one session per run)
 pub struct ZellijAdapter {
-    /// Prefix for session names (e.g., "runbox" -> "runbox-550e8400")
+    /// Prefix for session names (e.g., "runbox" -> "runbox-550e8400-e29b-...")
     session_prefix: String,
 }
 
@@ -21,22 +21,47 @@ impl ZellijAdapter {
         Self { session_prefix }
     }
 
-    /// Generate session name for a run
+    /// Generate session name for a run (uses full UUID to avoid collisions)
     fn session_name(&self, run_id: &str) -> String {
-        format!("{}-{}", self.session_prefix, Self::short_id(run_id))
+        // run_id format: "run_{uuid}" - use full UUID portion for uniqueness
+        let uuid_part = run_id.get(4..).unwrap_or(run_id);
+        format!("{}-{}", self.session_prefix, uuid_part)
     }
 
-    /// Get short ID from run_id (first 8 chars of UUID)
+    /// Get short ID from run_id for display purposes only
     fn short_id(run_id: &str) -> &str {
-        // run_id format: "run_{uuid}"
-        if run_id.len() >= 12 {
-            &run_id[4..12]
-        } else {
-            run_id
+        // run_id format: "run_{uuid}" - first 8 chars of UUID for display
+        run_id.get(4..12).unwrap_or(run_id)
+    }
+
+    /// Check if a session exists and is running (not EXITED)
+    fn session_is_running(session_name: &str) -> bool {
+        let output = Command::new("zellij")
+            .args(["list-sessions", "--no-formatting"])
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                let sessions = String::from_utf8_lossy(&out.stdout);
+                sessions.lines().any(|line| {
+                    let trimmed = line.trim();
+                    // Session lines: "name" (running) or "name (EXITED)" (dead)
+                    // Only consider running if exact match without EXITED
+                    if trimmed == session_name {
+                        return true;
+                    }
+                    // Check for "name " prefix but NOT "(EXITED)"
+                    if trimmed.starts_with(&format!("{} ", session_name)) {
+                        return !trimmed.contains("(EXITED)");
+                    }
+                    false
+                })
+            }
+            _ => false,
         }
     }
 
-    /// Check if a session exists
+    /// Check if a session exists (running or exited)
     fn session_exists(session_name: &str) -> bool {
         let output = Command::new("zellij")
             .args(["list-sessions", "--no-formatting"])
@@ -47,7 +72,6 @@ impl ZellijAdapter {
                 let sessions = String::from_utf8_lossy(&out.stdout);
                 sessions.lines().any(|line| {
                     let trimmed = line.trim();
-                    // Session lines: "name" or "name (EXITED)"
                     trimmed == session_name || trimmed.starts_with(&format!("{} ", session_name))
                 })
             }
@@ -74,7 +98,13 @@ impl RuntimeAdapter for ZellijAdapter {
     fn spawn(&self, exec: &Exec, run_id: &str, log_path: &Path) -> Result<RuntimeHandle> {
         let session_name = self.session_name(run_id);
 
+        // Check if session already exists (collision or leftover)
+        if Self::session_exists(&session_name) {
+            bail!("Zellij session '{}' already exists. This may indicate a collision or leftover session.", session_name);
+        }
+
         // Build environment using `env` command
+        // Note: env keys should be valid identifiers, values are escaped
         let env_args: Vec<String> = exec
             .env
             .iter()
@@ -100,8 +130,6 @@ impl RuntimeAdapter for ZellijAdapter {
         );
 
         // Create a new zellij session running the command
-        // Using `zellij --session <name> options --default-cwd <cwd>` then `zellij run`
-        // Or simpler: use `zellij -s <session> run` which creates session if needed
         let output = Command::new("zellij")
             .args([
                 "--session",
@@ -122,34 +150,37 @@ impl RuntimeAdapter for ZellijAdapter {
             bail!("Failed to create zellij session: {}", stderr);
         }
 
-        // Verify session was created
-        if !Self::session_exists(&session_name) {
-            // Give it a moment and retry check
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            if !Self::session_exists(&session_name) {
-                bail!("Zellij session '{}' was not created", session_name);
+        // Verify session was created with bounded retry
+        for _ in 0..5 {
+            if Self::session_exists(&session_name) {
+                return Ok(RuntimeHandle::Zellij {
+                    session: session_name,
+                    tab: Self::short_id(run_id).to_string(),
+                });
             }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
-        Ok(RuntimeHandle::Zellij {
-            session: session_name,
-            tab: Self::short_id(run_id).to_string(), // Keep for compatibility
-        })
+        bail!("Zellij session '{}' was not created", session_name);
     }
 
     fn stop(&self, handle: &RuntimeHandle, _force: bool) -> Result<()> {
         if let RuntimeHandle::Zellij { session, .. } = handle {
-            // Kill the entire session - this is reliable
             let output = Command::new("zellij")
                 .args(["kill-session", session])
                 .output()
                 .context("Failed to kill zellij session")?;
 
+            // Accept success or "session not found" errors
             if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                // Session might already be gone
-                if !stderr.contains("not found") && !stderr.contains("No session") && !stderr.is_empty() {
-                    bail!("Failed to kill zellij session: {}", stderr);
+                let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+                // Ignore various "not found" error messages
+                if !stderr.contains("not found") 
+                    && !stderr.contains("no session") 
+                    && !stderr.contains("doesn't exist")
+                    && !stderr.is_empty() 
+                {
+                    bail!("Failed to kill zellij session: {}", String::from_utf8_lossy(&output.stderr));
                 }
             }
 
@@ -162,16 +193,12 @@ impl RuntimeAdapter for ZellijAdapter {
     fn attach(&self, handle: &RuntimeHandle) -> Result<()> {
         if let RuntimeHandle::Zellij { session, .. } = handle {
             if Self::is_inside_zellij() {
-                // Can't attach to another session from inside zellij easily
-                // User needs to detach first or use zellij's session switcher
                 bail!("Cannot attach from inside zellij. Detach first (Ctrl+O, D) then run: zellij attach {}", session);
             }
 
-            // Attach to the session
             let err = Command::new("zellij")
                 .args(["attach", session])
                 .exec();
-            // exec() replaces current process, only get here on error
             bail!("Failed to attach to zellij session: {}", err);
         } else {
             bail!("Invalid handle type for ZellijAdapter")
@@ -180,7 +207,8 @@ impl RuntimeAdapter for ZellijAdapter {
 
     fn is_alive(&self, handle: &RuntimeHandle) -> bool {
         if let RuntimeHandle::Zellij { session, .. } = handle {
-            Self::session_exists(session)
+            // Only consider running sessions as alive, not EXITED ones
+            Self::session_is_running(session)
         } else {
             false
         }
@@ -198,15 +226,15 @@ mod tests {
             "550e8400"
         );
         assert_eq!(ZellijAdapter::short_id("short"), "short");
+        assert_eq!(ZellijAdapter::short_id("run"), "run"); // Edge case
     }
 
     #[test]
-    fn test_session_name() {
+    fn test_session_name_uses_full_uuid() {
         let adapter = ZellijAdapter::new("runbox".to_string());
-        assert_eq!(
-            adapter.session_name("run_550e8400-e29b-41d4-a716-446655440000"),
-            "runbox-550e8400"
-        );
+        let session = adapter.session_name("run_550e8400-e29b-41d4-a716-446655440000");
+        // Should use full UUID, not just 8 chars
+        assert_eq!(session, "runbox-550e8400-e29b-41d4-a716-446655440000");
     }
 
     #[test]
