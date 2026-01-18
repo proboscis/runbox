@@ -585,8 +585,94 @@ impl Storage {
             }
         }
     }
-}
 
+    // === List All Runnables ===
+
+    /// List all runnables (templates, replays, playlist items) with optional filtering.
+    ///
+    /// # Arguments
+    /// * `replay_limit` - Maximum number of recent runs to include for replays
+    ///
+    /// # Returns
+    /// A vector of all Runnables: templates first, then replays, then playlist items
+    pub fn list_all_runnables(&self, replay_limit: usize) -> Result<Vec<crate::Runnable>> {
+        use crate::Runnable;
+        
+        let mut runnables = Vec::new();
+
+        // Collect templates
+        for tpl in self.list_templates()? {
+            runnables.push(Runnable::Template(tpl.template_id));
+        }
+
+        // Collect replays (recent runs)
+        for run in self.list_runs(replay_limit)? {
+            runnables.push(Runnable::Replay(run.run_id));
+        }
+
+        // Collect playlist items
+        for playlist in self.list_playlists()? {
+            for (idx, item) in playlist.items.iter().enumerate() {
+                runnables.push(Runnable::PlaylistItem {
+                    playlist_id: playlist.playlist_id.clone(),
+                    index: idx,
+                    template_id: item.template_id.clone(),
+                    label: item.label.clone(),
+                });
+            }
+        }
+
+        Ok(runnables)
+    }
+
+    /// Get the repo URL for a runnable.
+    /// 
+    /// - For Template: returns the template's code_state.repo_url
+    /// - For Replay: returns the run's code_state.repo_url
+    /// - For PlaylistItem: returns the referenced template's code_state.repo_url
+    pub fn get_runnable_repo_url(&self, runnable: &crate::Runnable) -> Option<String> {
+        match runnable {
+            crate::Runnable::Template(id) => {
+                self.load_template(id).ok().map(|t| t.code_state.repo_url)
+            }
+            crate::Runnable::Replay(id) => {
+                self.load_run(id).ok().map(|r| r.code_state.repo_url)
+            }
+            crate::Runnable::PlaylistItem { template_id, .. } => {
+                self.load_template(template_id).ok().map(|t| t.code_state.repo_url)
+            }
+        }
+    }
+
+    /// Get a display-friendly name for a runnable.
+    /// 
+    /// - For Template: returns the template's name
+    /// - For Replay: returns the command (first part of argv)
+    /// - For PlaylistItem: returns the label or template name
+    pub fn get_runnable_display_name(&self, runnable: &crate::Runnable) -> String {
+        match runnable {
+            crate::Runnable::Template(id) => {
+                self.load_template(id)
+                    .map(|t| t.name)
+                    .unwrap_or_else(|_| id.clone())
+            }
+            crate::Runnable::Replay(id) => {
+                self.load_run(id)
+                    .map(|r| r.exec.argv.join(" "))
+                    .unwrap_or_else(|_| id.clone())
+            }
+            crate::Runnable::PlaylistItem { label, template_id, .. } => {
+                if let Some(lbl) = label {
+                    lbl.clone()
+                } else {
+                    self.load_template(template_id)
+                        .map(|t| t.name)
+                        .unwrap_or_else(|_| template_id.clone())
+                }
+            }
+        }
+    }
+}
 
 /// Generic ID resolution from a list of items
 fn resolve_id_from_items<T, F>(items: &[T], input: &str, get_id: F) -> Result<String>
