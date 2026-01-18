@@ -67,7 +67,7 @@ fn test_playlist_show_json() {
 }
 
 #[test]
-fn test_playlist_show_table_default() {
+fn test_playlist_show_table_specific_playlist() {
     let temp = TempDir::new().unwrap();
 
     // Setup: create a playlist with items
@@ -94,6 +94,40 @@ fn test_playlist_show_table_default() {
         .stdout(predicate::str::contains("LABEL"))
         .stdout(predicate::str::contains("Runner Task"))
         .stdout(predicate::str::contains("runbox playlist run"));
+}
+
+#[test]
+fn test_playlist_show_flattened_all_playlists() {
+    let temp = TempDir::new().unwrap();
+
+    // Setup: create multiple playlists
+    create_test_playlist(
+        &temp,
+        "pl_daily",
+        "Daily Tasks",
+        vec![("tpl_echo", Some("Echo Hello"))],
+    );
+    create_test_playlist(
+        &temp,
+        "pl_weekly",
+        "Weekly Tasks",
+        vec![("tpl_backup", Some("Backup Data"))],
+    );
+
+    Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .args(["playlist", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PLAYLIST"))
+        .stdout(predicate::str::contains("IDX"))
+        .stdout(predicate::str::contains("SHORT"))
+        .stdout(predicate::str::contains("TEMPLATE"))
+        .stdout(predicate::str::contains("LABEL"))
+        .stdout(predicate::str::contains("Echo Hello"))
+        .stdout(predicate::str::contains("Backup Data"))
+        .stdout(predicate::str::contains("runbox playlist run <SHORT>"));
 }
 
 #[test]
@@ -160,6 +194,25 @@ fn test_playlist_show_empty_playlist() {
     assert_eq!(playlist["name"], "Empty Playlist");
     let items = playlist["items"].as_array().unwrap();
     assert!(items.is_empty());
+}
+
+#[test]
+fn test_playlist_show_no_playlists() {
+    let temp = TempDir::new().unwrap();
+
+    // Ensure the storage directories exist but are empty
+    fs::create_dir_all(temp.path().join("templates")).unwrap();
+    fs::create_dir_all(temp.path().join("runs")).unwrap();
+    fs::create_dir_all(temp.path().join("playlists")).unwrap();
+    fs::create_dir_all(temp.path().join("logs")).unwrap();
+
+    Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .args(["playlist", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No playlists found"));
 }
 
 #[test]

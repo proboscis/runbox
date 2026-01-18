@@ -616,45 +616,66 @@ enum PlaylistCommands {
     #[command(after_help = "\
 EXAMPLES:
   runbox playlist list
+
 OUTPUT:
   ID         NAME                           ITEMS
   ----------------------------------------------------------------
   pl_daily   Daily Tasks                    3")]
     List,
-    /// Show playlist details (table view by default, or JSON with --json)
+
+    /// Show playlist items (all playlists if none specified)
     #[command(after_help = "\
 EXAMPLES:
-  # Table view with short IDs (default)
+  # Show ALL items from ALL playlists (flattened view)
+  runbox playlist show
+
+  # Show items from a specific playlist
   runbox playlist show pl_daily
-  # JSON output
+
+  # JSON output for specific playlist
   runbox playlist show pl_daily --json
-OUTPUT (table):
+
+OUTPUT (flattened - no playlist specified):
+  PLAYLIST  IDX  SHORT     TEMPLATE        LABEL
+  daily     0    a1b2c3d4  tpl_echo        Echo Hello
+  daily     1    f5e6d7c8  tpl_train       Train Model
+  weekly    0    90ab12cd  tpl_backup      Backup Data
+
+  Run with: runbox playlist run <SHORT>
+
+OUTPUT (specific playlist):
   Playlist: pl_daily (Daily Tasks)
+
   IDX  SHORT     TEMPLATE        LABEL
   0    a1b2c3d4  tpl_echo        Echo Hello
   1    f5e6d7c8  tpl_train       Train Model
-  Run with: runbox playlist run pl_daily <IDX|SHORT>")]
+
+  Run with: runbox playlist run <SHORT> or runbox playlist run daily <IDX|SHORT>")]
     Show {
-        /// Playlist ID (or short ID prefix)
-        playlist_id: String,
+        /// Playlist ID (optional - if omitted, shows all playlists)
+        playlist_id: Option<String>,
         /// Output raw JSON instead of table view
         #[arg(long)]
         json: bool,
     },
+
     /// Register a new playlist from a JSON file
     #[command(after_help = "\
 EXAMPLES:
   runbox playlist create my_playlist.json
+
 NOTE: Use 'runbox validate' to check the JSON before creating.")]
     Create {
         /// Path to playlist JSON file
         path: String,
     },
+
     /// Add a template to a playlist
     #[command(after_help = "\
 EXAMPLES:
   # Add with auto-generated label
   runbox playlist add pl_daily tpl_backup
+
   # Add with custom label
   runbox playlist add pl_daily tpl_backup --label 'Backup Data'")]
     Add {
@@ -666,11 +687,13 @@ EXAMPLES:
         #[arg(short, long)]
         label: Option<String>,
     },
+
     /// Remove a template from a playlist by ID or index
     #[command(after_help = "\
 EXAMPLES:
   # Remove by template ID
   runbox playlist remove pl_daily tpl_backup
+
   # Remove by index (0-based)
   runbox playlist remove pl_daily 0    # remove first item
   runbox playlist remove pl_daily 2    # remove third item")]
@@ -680,25 +703,34 @@ EXAMPLES:
         /// Template ID or index (0-based) to remove
         template_or_index: String,
     },
-    /// Run a template from a playlist by index or short ID
+
+    /// Run a template from a playlist by global short ID or playlist + index/short ID
     #[command(after_help = "\
 EXAMPLES:
-  # Run by index
+  # Run by GLOBAL short ID (from 'playlist show' without args)
+  runbox playlist run a1b2c3d4
+
+  # Run by playlist + index
   runbox playlist run pl_daily 0
-  # Run by short ID
+
+  # Run by playlist + short ID
   runbox playlist run pl_daily a1b2
+
   # With bindings and runtime options
-  runbox playlist run pl_daily a1b2 --binding epochs=10 --runtime tmux
+  runbox playlist run a1b2 --binding epochs=10 --runtime tmux
+
   # Dry run to see what would be executed
-  runbox playlist run pl_daily 0 --dry-run
+  runbox playlist run a1b2 --dry-run
+
 NOTES:
-  - Use 'runbox playlist show <id>' to see available items with short IDs
+  - Use 'runbox playlist show' to see all items with globally unique short IDs
+  - Use 'runbox playlist show <playlist>' to see items in a specific playlist
   - Short ID prefix matching is supported (e.g., 'a1' matches 'a1b2c3d4')")]
     Run {
-        /// Playlist ID (or short ID prefix)
-        playlist_id: String,
-        /// Item index (0, 1, ...) or short ID (a1b2, c3d4, ...)
-        item: String,
+        /// Global short ID, OR playlist ID when used with <item>
+        selector: String,
+        /// Item index or short ID within playlist (optional - if omitted, selector is treated as global short ID)
+        item: Option<String>,
         /// Variable bindings (key=value) for template
         #[arg(short, long)]
         binding: Vec<String>,
@@ -710,6 +742,7 @@ NOTES:
         dry_run: bool,
     },
 }
+
 #[derive(Subcommand)]
 enum ResultCommands {
     List {
@@ -789,7 +822,7 @@ fn main() -> Result<()> {
         Commands::Playlist { command } => match command {
             PlaylistCommands::List => cmd_playlist_list(&storage),
             PlaylistCommands::Show { playlist_id, json } => {
-                cmd_playlist_show(&storage, &playlist_id, json)
+                cmd_playlist_show(&storage, playlist_id.as_deref(), json)
             }
             PlaylistCommands::Create { path } => cmd_playlist_create(&storage, &path),
             PlaylistCommands::Add {
@@ -802,12 +835,12 @@ fn main() -> Result<()> {
                 template_or_index,
             } => cmd_playlist_remove(&storage, &playlist_id, &template_or_index),
             PlaylistCommands::Run {
-                playlist_id,
+                selector,
                 item,
                 binding,
                 runtime,
                 dry_run,
-            } => cmd_playlist_run(&storage, &playlist_id, &item, binding, runtime, dry_run),
+            } => cmd_playlist_run(&storage, &selector, item.as_deref(), binding, runtime, dry_run),
         },
         Commands::Result { command } => match command {
             ResultCommands::List { limit } => cmd_result_list(&storage, limit),
@@ -1459,39 +1492,87 @@ fn cmd_playlist_list(storage: &Storage) -> Result<()> {
     }
     Ok(())
 }
-fn cmd_playlist_show(storage: &Storage, playlist_id: &str, json_output: bool) -> Result<()> {
-    let resolved_id = storage.resolve_playlist_id(playlist_id)?;
-    let playlist = storage.load_playlist(&resolved_id)?;
+fn cmd_playlist_show(storage: &Storage, playlist_id: Option<&str>, json_output: bool) -> Result<()> {
+    match playlist_id {
+        Some(id) => {
+            // Show specific playlist
+            let resolved_id = storage.resolve_playlist_id(id)?;
+            let playlist = storage.load_playlist(&resolved_id)?;
 
-    if json_output {
-        // JSON output (original behavior)
-        println!("{}", serde_json::to_string_pretty(&playlist)?);
-    } else {
-        // Table view with short IDs (new default)
-        println!("Playlist: {} ({})", playlist.playlist_id, playlist.name);
-        println!();
-        println!(
-            "{:<5} {:<10} {:<15} {}",
-            "IDX", "SHORT", "TEMPLATE", "LABEL"
-        );
-        println!("{}", "-".repeat(60));
+            if json_output {
+                // JSON output (original behavior)
+                println!("{}", serde_json::to_string_pretty(&playlist)?);
+            } else {
+                // Table view with short IDs
+                println!("Playlist: {} ({})", playlist.playlist_id, playlist.name);
+                println!();
+                println!(
+                    "{:<5} {:<10} {:<15} {}",
+                    "IDX", "SHORT", "TEMPLATE", "LABEL"
+                );
+                println!("{}", "-".repeat(60));
 
-        for (idx, item) in playlist.items.iter().enumerate() {
-            let short = item.short_id(&playlist.playlist_id, idx);
-            let label = item.label.as_deref().unwrap_or("-");
-            let template_short = short_id(&item.template_id);
-            println!(
-                "{:<5} {:<10} {:<15} {}",
-                idx, short, template_short, label
-            );
+                for (idx, item) in playlist.items.iter().enumerate() {
+                    let item_short = item.short_id(&playlist.playlist_id, idx);
+                    let label = item.label.as_deref().unwrap_or("-");
+                    let template_short = short_id(&item.template_id);
+                    println!(
+                        "{:<5} {:<10} {:<15} {}",
+                        idx, item_short, template_short, label
+                    );
+                }
+
+                if !playlist.items.is_empty() {
+                    println!();
+                    println!(
+                        "Run with: runbox playlist run <SHORT> or runbox playlist run {} <IDX|SHORT>",
+                        short_id(&playlist.playlist_id)
+                    );
+                }
+            }
         }
+        None => {
+            // Show flattened view of all playlists
+            let playlists = storage.list_playlists()?;
 
-        if !playlist.items.is_empty() {
-            println!();
-            println!(
-                "Run with: runbox playlist run {} <IDX|SHORT>",
-                short_id(&playlist.playlist_id)
-            );
+            if playlists.is_empty() {
+                println!("No playlists found.");
+                return Ok(());
+            }
+
+            if json_output {
+                // JSON output - array of all playlists
+                println!("{}", serde_json::to_string_pretty(&playlists)?);
+            } else {
+                // Flattened table view
+                println!(
+                    "{:<10} {:<5} {:<10} {:<15} {}",
+                    "PLAYLIST", "IDX", "SHORT", "TEMPLATE", "LABEL"
+                );
+                println!("{}", "-".repeat(70));
+
+                let mut has_items = false;
+                for playlist in &playlists {
+                    let playlist_short = short_id(&playlist.playlist_id);
+                    for (idx, item) in playlist.items.iter().enumerate() {
+                        has_items = true;
+                        let item_short = item.short_id(&playlist.playlist_id, idx);
+                        let label = item.label.as_deref().unwrap_or("-");
+                        let template_short = short_id(&item.template_id);
+                        println!(
+                            "{:<10} {:<5} {:<10} {:<15} {}",
+                            playlist_short, idx, item_short, template_short, label
+                        );
+                    }
+                }
+
+                if has_items {
+                    println!();
+                    println!("Run with: runbox playlist run <SHORT>");
+                } else {
+                    println!("(no items in any playlist)");
+                }
+            }
         }
     }
 
@@ -1576,25 +1657,75 @@ fn cmd_playlist_remove(storage: &Storage, playlist_id: &str, selector: &str) -> 
 
 fn cmd_playlist_run(
     storage: &Storage,
-    playlist_id: &str,
-    item_selector: &str,
+    selector: &str,
+    item_selector: Option<&str>,
     bindings: Vec<String>,
     runtime: RuntimeType,
     dry_run: bool,
 ) -> Result<()> {
-    let resolved_playlist_id = storage.resolve_playlist_id(playlist_id)?;
-    let playlist = storage.load_playlist(&resolved_playlist_id)?;
+    // Determine if we're using global short ID or playlist + item
+    let (playlist, item_idx, item) = match item_selector {
+        Some(item_sel) => {
+            // Two arguments: selector is playlist_id, item_sel is index/short ID
+            let resolved_playlist_id = storage.resolve_playlist_id(selector)?;
+            let playlist = storage.load_playlist(&resolved_playlist_id)?;
 
-    // Resolve item by index or short ID
-    let (item_idx, item) = playlist
-        .resolve_item(item_selector)
-        .with_context(|| {
-            format!(
-                "Item '{}' not found in playlist '{}'. Use index (0, 1, ...) or short ID.",
-                item_selector,
-                short_id(&resolved_playlist_id)
-            )
-        })?;
+            let (idx, found_item) = playlist
+                .resolve_item(item_sel)
+                .with_context(|| {
+                    format!(
+                        "Item '{}' not found in playlist '{}'. Use index (0, 1, ...) or short ID.",
+                        item_sel,
+                        short_id(&resolved_playlist_id)
+                    )
+                })?;
+
+            let item = found_item.clone();
+            (playlist, idx, item)
+        }
+        None => {
+            // One argument: selector is a global short ID
+            // Search across all playlists
+            let playlists = storage.list_playlists()?;
+            let selector_lower = selector.to_lowercase();
+
+            let mut matches: Vec<(Playlist, usize, PlaylistItem)> = Vec::new();
+
+            for playlist in playlists {
+                for (idx, item) in playlist.items.iter().enumerate() {
+                    let item_short = item.short_id(&playlist.playlist_id, idx);
+                    if item_short.starts_with(&selector_lower) {
+                        matches.push((playlist.clone(), idx, item.clone()));
+                        break; // Found a match in this playlist, move to next
+                    }
+                }
+            }
+
+            match matches.len() {
+                0 => bail!(
+                    "No item found matching '{}'. Use 'runbox playlist show' to see available items.",
+                    selector
+                ),
+                1 => {
+                    let (playlist, idx, item) = matches.into_iter().next().unwrap();
+                    (playlist, idx, item)
+                }
+                _ => {
+                    eprintln!("Ambiguous short ID '{}' matches multiple items:", selector);
+                    for (playlist, idx, item) in &matches {
+                        let item_short = item.short_id(&playlist.playlist_id, *idx);
+                        eprintln!(
+                            "  {} in playlist {} (index {})",
+                            item_short,
+                            short_id(&playlist.playlist_id),
+                            idx
+                        );
+                    }
+                    bail!("Use more characters to disambiguate, or specify playlist: runbox playlist run <playlist> <item>");
+                }
+            }
+        }
+    };
 
     let item_short = item.short_id(&playlist.playlist_id, item_idx);
 
@@ -1603,8 +1734,17 @@ fn cmd_playlist_run(
 
     if dry_run {
         println!("Would run template: {}", item.template_id);
-        println!("  Playlist item: {} (index {}, short ID {})", 
-            item.label.as_deref().unwrap_or("-"), item_idx, item_short);
+        println!(
+            "  Playlist: {} ({})",
+            short_id(&playlist.playlist_id),
+            playlist.name
+        );
+        println!(
+            "  Item: {} (index {}, short ID {})",
+            item.label.as_deref().unwrap_or("-"),
+            item_idx,
+            item_short
+        );
         println!("  argv: {:?}", template.exec.argv);
         println!("  cwd: {}", template.exec.cwd);
         println!("  runtime: {}", runtime);
