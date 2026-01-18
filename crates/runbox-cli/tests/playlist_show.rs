@@ -32,7 +32,7 @@ fn create_test_playlist(temp_dir: &TempDir, playlist_id: &str, name: &str, items
 }
 
 #[test]
-fn test_playlist_show() {
+fn test_playlist_show_json() {
     let temp = TempDir::new().unwrap();
 
     // Setup: create a playlist with items
@@ -49,7 +49,7 @@ fn test_playlist_show() {
     let assert = Command::cargo_bin("runbox")
         .unwrap()
         .env("RUNBOX_HOME", temp.path())
-        .args(["playlist", "show", "pl_test-1234-5678-90ab-cdef12345678"])
+        .args(["playlist", "show", "pl_test-1234-5678-90ab-cdef12345678", "--json"])
         .assert()
         .success();
 
@@ -64,6 +64,70 @@ fn test_playlist_show() {
     assert_eq!(items[0]["label"], "Runner Task");
     assert_eq!(items[1]["template_id"], "tpl_eval-aaaa-bbbb-cccc-ddddeeeeffff");
     assert!(items[1]["label"].is_null());
+}
+
+#[test]
+fn test_playlist_show_table_specific_playlist() {
+    let temp = TempDir::new().unwrap();
+
+    // Setup: create a playlist with items
+    create_test_playlist(
+        &temp,
+        "pl_test-1234-5678-90ab-cdef12345678",
+        "Test Playlist",
+        vec![
+            ("tpl_runner-1111-2222-3333-444455556666", Some("Runner Task")),
+            ("tpl_eval-aaaa-bbbb-cccc-ddddeeeeffff", None),
+        ],
+    );
+
+    Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .args(["playlist", "show", "pl_test-1234-5678-90ab-cdef12345678"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Playlist: pl_test-1234-5678-90ab-cdef12345678 (Test Playlist)"))
+        .stdout(predicate::str::contains("IDX"))
+        .stdout(predicate::str::contains("SHORT"))
+        .stdout(predicate::str::contains("TEMPLATE"))
+        .stdout(predicate::str::contains("LABEL"))
+        .stdout(predicate::str::contains("Runner Task"))
+        .stdout(predicate::str::contains("runbox playlist run"));
+}
+
+#[test]
+fn test_playlist_show_flattened_all_playlists() {
+    let temp = TempDir::new().unwrap();
+
+    // Setup: create multiple playlists
+    create_test_playlist(
+        &temp,
+        "pl_daily",
+        "Daily Tasks",
+        vec![("tpl_echo", Some("Echo Hello"))],
+    );
+    create_test_playlist(
+        &temp,
+        "pl_weekly",
+        "Weekly Tasks",
+        vec![("tpl_backup", Some("Backup Data"))],
+    );
+
+    Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .args(["playlist", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PLAYLIST"))
+        .stdout(predicate::str::contains("IDX"))
+        .stdout(predicate::str::contains("SHORT"))
+        .stdout(predicate::str::contains("TEMPLATE"))
+        .stdout(predicate::str::contains("LABEL"))
+        .stdout(predicate::str::contains("Echo Hello"))
+        .stdout(predicate::str::contains("Backup Data"))
+        .stdout(predicate::str::contains("runbox playlist run <SHORT>"));
 }
 
 #[test]
@@ -82,7 +146,7 @@ fn test_playlist_show_with_short_id() {
     let assert = Command::cargo_bin("runbox")
         .unwrap()
         .env("RUNBOX_HOME", temp.path())
-        .args(["playlist", "show", "abcd12"])
+        .args(["playlist", "show", "abcd12", "--json"])
         .assert()
         .success();
 
@@ -105,10 +169,21 @@ fn test_playlist_show_empty_playlist() {
         vec![],
     );
 
-    let assert = Command::cargo_bin("runbox")
+    // Table view for empty playlist
+    Command::cargo_bin("runbox")
         .unwrap()
         .env("RUNBOX_HOME", temp.path())
         .args(["playlist", "show", "pl_empty-1234-5678-90ab-cdef12345678"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Playlist: pl_empty-1234-5678-90ab-cdef12345678 (Empty Playlist)"))
+        .stdout(predicate::str::contains("IDX"));
+
+    // JSON view for empty playlist
+    let assert = Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .args(["playlist", "show", "pl_empty-1234-5678-90ab-cdef12345678", "--json"])
         .assert()
         .success();
 
@@ -119,6 +194,25 @@ fn test_playlist_show_empty_playlist() {
     assert_eq!(playlist["name"], "Empty Playlist");
     let items = playlist["items"].as_array().unwrap();
     assert!(items.is_empty());
+}
+
+#[test]
+fn test_playlist_show_no_playlists() {
+    let temp = TempDir::new().unwrap();
+
+    // Ensure the storage directories exist but are empty
+    fs::create_dir_all(temp.path().join("templates")).unwrap();
+    fs::create_dir_all(temp.path().join("runs")).unwrap();
+    fs::create_dir_all(temp.path().join("playlists")).unwrap();
+    fs::create_dir_all(temp.path().join("logs")).unwrap();
+
+    Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .args(["playlist", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No playlists found"));
 }
 
 #[test]
