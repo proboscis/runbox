@@ -68,6 +68,8 @@ enum RuntimeType {
     Background,
     /// Tmux window
     Tmux,
+    /// Zellij tab
+    Zellij,
 }
 
 impl std::fmt::Display for RuntimeType {
@@ -75,6 +77,7 @@ impl std::fmt::Display for RuntimeType {
         match self {
             RuntimeType::Bg | RuntimeType::Background => write!(f, "background"),
             RuntimeType::Tmux => write!(f, "tmux"),
+            RuntimeType::Zellij => write!(f, "zellij"),
         }
     }
 }
@@ -321,7 +324,7 @@ EXAMPLES:
   runbox attach run_550e8400-e29b-41d4-a716-446655440000
 
 NOTES:
-  - Only works for runs started with --runtime tmux
+  - Only works for runs started with --runtime tmux or --runtime zellij
   - Use Ctrl+B, D to detach from the tmux session
   - The process continues running after detaching
 
@@ -1185,7 +1188,7 @@ fn cmd_run_template(
     println!("Short ID: {}", run.short_id());
     println!("Logs: {}", log_path.display());
 
-    if matches!(runtime, RuntimeType::Tmux) {
+    if matches!(runtime, RuntimeType::Tmux | RuntimeType::Zellij) {
         println!("Attach with: runbox attach {}", run.short_id());
     }
 
@@ -1303,7 +1306,7 @@ fn cmd_run_direct(
     println!("Short ID: {}", run.short_id());
     println!("Logs: {}", log_path.display());
 
-    if matches!(runtime, RuntimeType::Tmux) {
+    if matches!(runtime, RuntimeType::Tmux | RuntimeType::Zellij) {
         println!("Attach with: runbox attach {}", run.short_id());
     }
 
@@ -1493,9 +1496,9 @@ fn cmd_attach(storage: &Storage, run_id: &str) -> Result<()> {
     let full_run_id = resolve_run_id(storage, run_id)?;
     let run = storage.load_run(&full_run_id)?;
 
-    if run.runtime != "tmux" {
+    if run.runtime != "tmux" && run.runtime != "zellij" {
         bail!(
-            "Attach is only supported for tmux runtime (current: {})",
+            "Attach is only supported for tmux/zellij runtime (current: {})",
             if run.runtime.is_empty() {
                 "none"
             } else {

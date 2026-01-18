@@ -5,9 +5,11 @@
 
 mod background;
 mod tmux;
+mod zellij;
 
 pub use background::BackgroundAdapter;
 pub use tmux::TmuxAdapter;
+pub use zellij::ZellijAdapter;
 
 use crate::run::{Exec, RuntimeHandle};
 use anyhow::Result;
@@ -50,6 +52,7 @@ impl RuntimeRegistry {
         adapters.insert("background".to_string(), Box::new(BackgroundAdapter::new()));
         adapters.insert("bg".to_string(), Box::new(BackgroundAdapter::new()));
         adapters.insert("tmux".to_string(), Box::new(TmuxAdapter::new("runbox".to_string())));
+        adapters.insert("zellij".to_string(), Box::new(ZellijAdapter::new("runbox".to_string())));
         Self { adapters }
     }
 
@@ -80,6 +83,7 @@ mod tests {
         assert!(registry.get("background").is_some());
         assert!(registry.get("bg").is_some());
         assert!(registry.get("tmux").is_some());
+        assert!(registry.get("zellij").is_some());
         assert!(registry.get("nonexistent").is_none());
     }
 }
