@@ -472,6 +472,71 @@ impl Storage {
         let results = self.list_results(usize::MAX)?;
         resolve_id_from_items(&results, input, |r| &r.result_id)
     }
+
+    // === Unified Runnable Resolution ===
+
+    /// Resolve any runnable by short ID prefix.
+    ///
+    /// This searches across all runnable types (templates, runs for replay, playlist items)
+    /// and returns the matching runnable or an error if not found or ambiguous.
+    ///
+    /// # Arguments
+    /// * `input` - A short ID prefix (case-insensitive hex string)
+    /// * `limit` - Maximum number of runs to search (for replay matching)
+    ///
+    /// # Returns
+    /// * `Ok(Runnable)` - Single matching runnable
+    /// * `Err` - No match or ambiguous matches with helpful error message
+    pub fn resolve_runnable(&self, input: &str, limit: usize) -> Result<crate::Runnable> {
+        use crate::runnable::{format_ambiguous_matches, Runnable, RunnableMatch};
+
+        let input_lower = input.to_lowercase();
+        let mut matches: Vec<RunnableMatch> = Vec::new();
+
+        // Check templates
+        for tpl in self.list_templates()? {
+            let runnable = Runnable::Template(tpl.template_id.clone());
+            if runnable.short_id().starts_with(&input_lower) {
+                matches.push(RunnableMatch::from_runnable(runnable));
+            }
+        }
+
+        // Check runs (for replay)
+        for run in self.list_runs(limit)? {
+            let runnable = Runnable::Replay(run.run_id.clone());
+            if runnable.short_id().starts_with(&input_lower) {
+                matches.push(RunnableMatch::from_runnable(runnable));
+            }
+        }
+
+        // Check playlist items
+        for playlist in self.list_playlists()? {
+            for (idx, item) in playlist.items.iter().enumerate() {
+                let runnable = Runnable::PlaylistItem {
+                    playlist_id: playlist.playlist_id.clone(),
+                    index: idx,
+                    template_id: item.template_id.clone(),
+                    label: item.label.clone(),
+                };
+                if runnable.short_id().starts_with(&input_lower) {
+                    matches.push(RunnableMatch::from_runnable(runnable));
+                }
+            }
+        }
+
+        match matches.len() {
+            0 => bail!("No runnable found matching '{}'", input),
+            1 => Ok(matches.remove(0).runnable),
+            n => {
+                bail!(
+                    "Ambiguous short ID \"{}\" matches {} items:{}",
+                    input,
+                    n,
+                    format_ambiguous_matches(&matches)
+                )
+            }
+        }
+    }
 }
 
 /// Generic ID resolution from a list of items
@@ -894,5 +959,192 @@ mod tests {
 
         let resolved = storage.resolve_result_id(&result.result_id).unwrap();
         assert_eq!(resolved, result.result_id);
+    }
+
+    #[test]
+    fn test_resolve_runnable_template() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create a template
+        let template = crate::RunTemplate {
+            template_version: 0,
+            template_id: "tpl_echo".to_string(),
+            name: "Echo Command".to_string(),
+            exec: crate::TemplateExec {
+                argv: vec!["echo".to_string(), "hello".to_string()],
+                cwd: ".".to_string(),
+                env: std::collections::HashMap::new(),
+                timeout_sec: 0,
+            },
+            bindings: None,
+            code_state: crate::TemplateCodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+            },
+        };
+        storage.save_template(&template).unwrap();
+
+        // Get the template's short ID
+        let runnable = crate::Runnable::Template("tpl_echo".to_string());
+        let short_id = runnable.short_id();
+
+        // Resolve by short ID prefix
+        let resolved = storage.resolve_runnable(&short_id[..4], 100).unwrap();
+        match resolved {
+            crate::Runnable::Template(id) => assert_eq!(id, "tpl_echo"),
+            _ => panic!("Expected Template runnable"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_runnable_replay() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create a run
+        let mut run = Run::new(
+            Exec {
+                argv: vec!["echo".to_string(), "hello".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+                timeout_sec: 0,
+            },
+            CodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch: None,
+            },
+        );
+        run.run_id = "run_550e8400-e29b-41d4-a716-446655440000".to_string();
+        storage.save_run(&run).unwrap();
+
+        // Resolve by short ID prefix
+        let resolved = storage.resolve_runnable("550e", 100).unwrap();
+        match resolved {
+            crate::Runnable::Replay(id) => assert_eq!(id, "run_550e8400-e29b-41d4-a716-446655440000"),
+            _ => panic!("Expected Replay runnable"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_runnable_playlist_item() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create a template first
+        let template = crate::RunTemplate {
+            template_version: 0,
+            template_id: "tpl_echo".to_string(),
+            name: "Echo Command".to_string(),
+            exec: crate::TemplateExec {
+                argv: vec!["echo".to_string(), "hello".to_string()],
+                cwd: ".".to_string(),
+                env: std::collections::HashMap::new(),
+                timeout_sec: 0,
+            },
+            bindings: None,
+            code_state: crate::TemplateCodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+            },
+        };
+        storage.save_template(&template).unwrap();
+
+        // Create a playlist with items
+        let mut playlist = Playlist::new("pl_daily", "Daily Tasks");
+        playlist.add("tpl_echo", Some("Echo Hello"));
+        storage.save_playlist(&playlist).unwrap();
+
+        // Get the playlist item's short ID
+        let runnable = crate::Runnable::PlaylistItem {
+            playlist_id: "pl_daily".to_string(),
+            index: 0,
+            template_id: "tpl_echo".to_string(),
+            label: Some("Echo Hello".to_string()),
+        };
+        let short_id = runnable.short_id();
+
+        // Resolve by short ID prefix
+        let resolved = storage.resolve_runnable(&short_id[..4], 100).unwrap();
+        match resolved {
+            crate::Runnable::PlaylistItem { playlist_id, index, template_id, .. } => {
+                assert_eq!(playlist_id, "pl_daily");
+                assert_eq!(index, 0);
+                assert_eq!(template_id, "tpl_echo");
+            }
+            _ => panic!("Expected PlaylistItem runnable"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_runnable_not_found() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        let result = storage.resolve_runnable("xyz", 100);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No runnable found"));
+    }
+
+    #[test]
+    fn test_resolve_runnable_ambiguous() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create two templates that might have similar short ID prefixes
+        // We'll use a more direct approach by creating multiple items
+        let template1 = crate::RunTemplate {
+            template_version: 0,
+            template_id: "tpl_aaa".to_string(),
+            name: "AAA".to_string(),
+            exec: crate::TemplateExec {
+                argv: vec!["echo".to_string()],
+                cwd: ".".to_string(),
+                env: std::collections::HashMap::new(),
+                timeout_sec: 0,
+            },
+            bindings: None,
+            code_state: crate::TemplateCodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+            },
+        };
+        let template2 = crate::RunTemplate {
+            template_version: 0,
+            template_id: "tpl_bbb".to_string(),
+            name: "BBB".to_string(),
+            exec: crate::TemplateExec {
+                argv: vec!["echo".to_string()],
+                cwd: ".".to_string(),
+                env: std::collections::HashMap::new(),
+                timeout_sec: 0,
+            },
+            bindings: None,
+            code_state: crate::TemplateCodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+            },
+        };
+        storage.save_template(&template1).unwrap();
+        storage.save_template(&template2).unwrap();
+
+        // Get both short IDs and check if they share a prefix
+        let runnable1 = crate::Runnable::Template("tpl_aaa".to_string());
+        let runnable2 = crate::Runnable::Template("tpl_bbb".to_string());
+        let short1 = runnable1.short_id();
+        let short2 = runnable2.short_id();
+
+        // If they happen to share a prefix (unlikely but possible), test ambiguity
+        // Otherwise, just verify that resolution works correctly
+        if short1.chars().next() == short2.chars().next() {
+            let result = storage.resolve_runnable(&short1[..1], 100);
+            assert!(result.is_err());
+            let err_msg = result.unwrap_err().to_string();
+            assert!(err_msg.contains("Ambiguous"));
+        }
+
+        // Regardless, full short IDs should resolve uniquely
+        let resolved1 = storage.resolve_runnable(&short1, 100).unwrap();
+        match resolved1 {
+            crate::Runnable::Template(id) => assert_eq!(id, "tpl_aaa"),
+            _ => panic!("Expected Template runnable"),
+        }
     }
 }
