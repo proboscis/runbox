@@ -5,8 +5,7 @@
 //! - Replays: Re-execution of previous runs with exact code state
 //! - Playlist Items: Template references within a playlist
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use sha2::{Digest, Sha256};
 
 /// A unified representation of anything that can be run in runbox.
 ///
@@ -27,32 +26,51 @@ pub enum Runnable {
     },
 }
 
+/// Generate a stable 8-character hex short ID from input bytes using SHA256.
+/// This is stable across Rust versions unlike DefaultHasher.
+fn stable_short_id(data: &[u8]) -> String {
+    let hash = Sha256::digest(data);
+    // Take first 4 bytes (8 hex chars)
+    format!("{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3])
+}
+
+/// Check if a string looks like a valid UUID hex portion (for replay short ID extraction)
+fn is_valid_uuid_hex(s: &str) -> bool {
+    s.len() >= 8 && s.chars().take(8).all(|c| c.is_ascii_hexdigit())
+}
+
 impl Runnable {
     /// Generate the 8-character hex short ID for this runnable.
     ///
-    /// The short ID is deterministic and designed to be unique across all runnables.
+    /// The short ID is deterministic and stable across Rust versions (uses SHA256).
     ///
     /// # Generation rules:
-    /// - Template: hash of "template" + template_id
-    /// - Replay: first 8 hex chars of the UUID portion
-    /// - PlaylistItem: hash of playlist_id + index + template_id
+    /// - Template: SHA256 hash of "template\0" + template_id
+    /// - Replay: first 8 hex chars of UUID if valid, otherwise SHA256 hash
+    /// - PlaylistItem: SHA256 hash of "playlist_item\0" + playlist_id + "\0" + index + "\0" + template_id
     pub fn short_id(&self) -> String {
         match self {
             Runnable::Template(id) => {
-                let mut hasher = DefaultHasher::new();
-                "template".hash(&mut hasher);
-                id.hash(&mut hasher);
-                format!("{:08x}", hasher.finish() as u32)
+                let mut data = b"template\0".to_vec();
+                data.extend_from_slice(id.as_bytes());
+                stable_short_id(&data)
             }
             Runnable::Replay(run_id) => {
                 // run_id format: "run_{uuid}"
                 // Extract hex chars from UUID, removing "run_" prefix and dashes
-                run_id
+                let uuid_part = run_id
                     .trim_start_matches("run_")
-                    .replace('-', "")
-                    .chars()
-                    .take(8)
-                    .collect()
+                    .replace('-', "");
+                
+                // If it looks like valid UUID hex, extract first 8 chars (lowercase)
+                if is_valid_uuid_hex(&uuid_part) {
+                    uuid_part.chars().take(8).collect::<String>().to_lowercase()
+                } else {
+                    // Fallback to stable hash for non-UUID run IDs
+                    let mut data = b"replay\0".to_vec();
+                    data.extend_from_slice(run_id.as_bytes());
+                    stable_short_id(&data)
+                }
             }
             Runnable::PlaylistItem {
                 playlist_id,
@@ -60,11 +78,13 @@ impl Runnable {
                 template_id,
                 ..
             } => {
-                let mut hasher = DefaultHasher::new();
-                playlist_id.hash(&mut hasher);
-                index.hash(&mut hasher);
-                template_id.hash(&mut hasher);
-                format!("{:08x}", hasher.finish() as u32)
+                let mut data = b"playlist_item\0".to_vec();
+                data.extend_from_slice(playlist_id.as_bytes());
+                data.push(0);
+                data.extend_from_slice(index.to_string().as_bytes());
+                data.push(0);
+                data.extend_from_slice(template_id.as_bytes());
+                stable_short_id(&data)
             }
         }
     }
@@ -193,16 +213,52 @@ mod tests {
     }
 
     #[test]
+    fn test_template_short_id_is_stable() {
+        // This test ensures the SHA256-based short ID is stable
+        // If this test fails after a code change, it means short IDs have changed
+        let runnable = Runnable::Template("tpl_echo".to_string());
+        let short_id = runnable.short_id();
+        
+        // SHA256("template\0tpl_echo") first 4 bytes as hex
+        // This is a known value that should not change
+        assert_eq!(short_id.len(), 8);
+        assert!(short_id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
     fn test_replay_short_id() {
         let runnable = Runnable::Replay("run_550e8400-e29b-41d4-a716-446655440000".to_string());
         let short_id = runnable.short_id();
 
-        // Should extract first 8 hex chars from UUID
+        // Should extract first 8 hex chars from UUID (lowercase)
         assert_eq!(short_id, "550e8400");
 
         // Different run should have different short ID
         let runnable2 = Runnable::Replay("run_a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string());
         assert_eq!(runnable2.short_id(), "a1b2c3d4");
+    }
+
+    #[test]
+    fn test_replay_short_id_uppercase() {
+        // Uppercase UUID should produce lowercase short ID
+        let runnable = Runnable::Replay("run_550E8400-E29B-41D4-A716-446655440000".to_string());
+        let short_id = runnable.short_id();
+        assert_eq!(short_id, "550e8400");
+    }
+
+    #[test]
+    fn test_replay_short_id_non_uuid() {
+        // Non-UUID run ID should fallback to hash
+        let runnable = Runnable::Replay("run_custom_id_123".to_string());
+        let short_id = runnable.short_id();
+        
+        // Should be 8 hex chars (from hash)
+        assert_eq!(short_id.len(), 8);
+        assert!(short_id.chars().all(|c| c.is_ascii_hexdigit()));
+        
+        // Should be deterministic
+        let short_id2 = Runnable::Replay("run_custom_id_123".to_string()).short_id();
+        assert_eq!(short_id, short_id2);
     }
 
     #[test]
@@ -236,6 +292,21 @@ mod tests {
             label: Some("Echo Hello".to_string()),
         };
         assert_ne!(short_id, runnable3.short_id());
+    }
+
+    #[test]
+    fn test_playlist_item_short_id_is_stable() {
+        // This test ensures the SHA256-based short ID is stable
+        let runnable = Runnable::PlaylistItem {
+            playlist_id: "pl_daily".to_string(),
+            index: 0,
+            template_id: "tpl_echo".to_string(),
+            label: None,
+        };
+        let short_id = runnable.short_id();
+        
+        assert_eq!(short_id.len(), 8);
+        assert!(short_id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

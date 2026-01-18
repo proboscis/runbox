@@ -1260,7 +1260,7 @@ fn display_run_info(runnable: &Runnable, template: Option<&RunTemplate>, run: Op
         println!("│ {:<width$}│", format!("Command: {}", cmd_display), width = width);
         println!("│ {:<width$}│", format!("Cwd:     {}", r.exec.cwd), width = width);
         if !r.code_state.repo_url.is_empty() {
-            println!("│ {:<width$}│", format!("Commit:  {}", &r.code_state.base_commit[..8]), width = width);
+            println!("│ {:<width$}│", format!("Commit:  {}", r.code_state.base_commit.get(..8).unwrap_or(&r.code_state.base_commit)), width = width);
         }
     }
     

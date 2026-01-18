@@ -475,22 +475,70 @@ impl Storage {
 
     // === Unified Runnable Resolution ===
 
-    /// Resolve any runnable by short ID prefix.
+    /// Resolve any runnable by short ID prefix or full ID.
     ///
     /// This searches across all runnable types (templates, runs for replay, playlist items)
     /// and returns the matching runnable or an error if not found or ambiguous.
     ///
     /// # Arguments
-    /// * `input` - A short ID prefix (case-insensitive hex string)
+    /// * `input` - A short ID prefix (hex string) or full ID (tpl_..., run_...)
     /// * `limit` - Maximum number of runs to search (for replay matching)
     ///
     /// # Returns
     /// * `Ok(Runnable)` - Single matching runnable
-    /// * `Err` - No match or ambiguous matches with helpful error message
+    /// * `Err` - No match, ambiguous matches, or invalid input
+    ///
+    /// # Full ID Support
+    /// If input starts with `tpl_`, it's treated as a template ID.
+    /// If input starts with `run_`, it's treated as a run ID for replay.
+    /// Otherwise, it's treated as a short ID prefix to search.
     pub fn resolve_runnable(&self, input: &str, limit: usize) -> Result<crate::Runnable> {
         use crate::runnable::{format_ambiguous_matches, Runnable, RunnableMatch};
 
+        // Reject empty input
+        if input.is_empty() {
+            bail!("Empty input: please provide a short ID or full ID (tpl_..., run_...)");
+        }
+
+        // Handle full template IDs directly
+        if input.starts_with("tpl_") {
+            // Verify template exists
+            let resolved_id = self.resolve_template_id(input)?;
+            return Ok(Runnable::Template(resolved_id));
+        }
+
+        // Handle full run IDs directly
+        if input.starts_with("run_") {
+            // Verify run exists
+            let resolved_id = self.resolve_run_id(input)?;
+            return Ok(Runnable::Replay(resolved_id));
+        }
+
+        // Handle full playlist IDs - resolve to first item if exists
+        if input.starts_with("pl_") {
+            let resolved_id = self.resolve_playlist_id(input)?;
+            let playlist = self.load_playlist(&resolved_id)?;
+            if playlist.items.is_empty() {
+                bail!("Playlist '{}' has no items", resolved_id);
+            }
+            let item = &playlist.items[0];
+            return Ok(Runnable::PlaylistItem {
+                playlist_id: resolved_id,
+                index: 0,
+                template_id: item.template_id.clone(),
+                label: item.label.clone(),
+            });
+        }
+
+        // For short ID prefix matching, validate it looks like hex
         let input_lower = input.to_lowercase();
+        if !input_lower.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!(
+                "Invalid short ID '{}': must be hexadecimal or a full ID (tpl_..., run_...)",
+                input
+            );
+        }
+
         let mut matches: Vec<RunnableMatch> = Vec::new();
 
         // Check templates
@@ -538,6 +586,7 @@ impl Storage {
         }
     }
 }
+
 
 /// Generic ID resolution from a list of items
 fn resolve_id_from_items<T, F>(items: &[T], input: &str, get_id: F) -> Result<String>
@@ -1080,11 +1129,95 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
 
-        let result = storage.resolve_runnable("xyz", 100);
+        // Use a valid hex string that doesn't match anything
+        let result = storage.resolve_runnable("deadbeef", 100);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No runnable found"));
     }
 
+    #[test]
+    fn test_resolve_runnable_empty_input() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        let result = storage.resolve_runnable("", 100);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Empty input"));
+    }
+
+    #[test]
+    fn test_resolve_runnable_invalid_input() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Non-hex, non-full-ID input should be rejected
+        let result = storage.resolve_runnable("xyz", 100);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid short ID"));
+    }
+
+    #[test]
+    fn test_resolve_runnable_full_template_id() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create a template
+        let template = crate::RunTemplate {
+            template_version: 0,
+            template_id: "tpl_echo".to_string(),
+            name: "Echo Command".to_string(),
+            exec: crate::TemplateExec {
+                argv: vec!["echo".to_string(), "hello".to_string()],
+                cwd: ".".to_string(),
+                env: std::collections::HashMap::new(),
+                timeout_sec: 0,
+            },
+            bindings: None,
+            code_state: crate::TemplateCodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+            },
+        };
+        storage.save_template(&template).unwrap();
+
+        // Resolve by full template ID
+        let resolved = storage.resolve_runnable("tpl_echo", 100).unwrap();
+        match resolved {
+            crate::Runnable::Template(id) => assert_eq!(id, "tpl_echo"),
+            _ => panic!("Expected Template runnable"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_runnable_full_run_id() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        // Create a run
+        let mut run = Run::new(
+            Exec {
+                argv: vec!["echo".to_string(), "hello".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+                timeout_sec: 0,
+            },
+            CodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                base_commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch: None,
+            },
+        );
+        run.run_id = "run_550e8400-e29b-41d4-a716-446655440000".to_string();
+        storage.save_run(&run).unwrap();
+
+        // Resolve by full run ID
+        let resolved = storage.resolve_runnable("run_550e8400-e29b-41d4-a716-446655440000", 100).unwrap();
+        match resolved {
+            crate::Runnable::Replay(id) => assert_eq!(id, "run_550e8400-e29b-41d4-a716-446655440000"),
+            _ => panic!("Expected Replay runnable"),
+        }
+    }
+
+    #[test]
     #[test]
     fn test_resolve_runnable_ambiguous() {
         let dir = tempdir().unwrap();
