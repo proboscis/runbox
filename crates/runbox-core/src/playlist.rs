@@ -16,6 +16,22 @@ pub struct PlaylistItem {
     pub label: Option<String>,
 }
 
+impl PlaylistItem {
+    /// Generate a short ID for this playlist item based on hash of playlist_id, index, and template_id.
+    /// The short ID is deterministic and unique within a playlist.
+    pub fn short_id(&self, playlist_id: &str, index: usize) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        playlist_id.hash(&mut hasher);
+        index.hash(&mut hasher);
+        self.template_id.hash(&mut hasher);
+
+        format!("{:08x}", hasher.finish() as u32) // First 8 hex chars
+    }
+}
+
 impl Playlist {
     /// Create a new empty playlist
     pub fn new(id: &str, name: &str) -> Self {
@@ -52,6 +68,30 @@ impl Playlist {
 
         Ok(())
     }
+
+    /// Resolve an item by index (numeric string) or short ID
+    /// Returns the index and a reference to the item
+    pub fn resolve_item(&self, selector: &str) -> Option<(usize, &PlaylistItem)> {
+        // Try to parse as numeric index first
+        // Only use index if it's a valid index (within bounds)
+        if let Ok(index) = selector.parse::<usize>() {
+            if let Some(item) = self.items.get(index) {
+                return Some((index, item));
+            }
+            // Index out of bounds - fall through to try as short ID
+        }
+
+        // Try to match as short ID (prefix match)
+        let selector_lower = selector.to_lowercase();
+        for (idx, item) in self.items.iter().enumerate() {
+            let item_short_id = item.short_id(&self.playlist_id, idx);
+            if item_short_id.starts_with(&selector_lower) {
+                return Some((idx, item));
+            }
+        }
+
+        None
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -78,5 +118,79 @@ mod tests {
         assert_eq!(parsed.items.len(), 2);
         assert_eq!(parsed.items[0].label, Some("Runner".to_string()));
         assert_eq!(parsed.items[1].label, None);
+    }
+
+    #[test]
+    fn test_short_id_generation() {
+        let item = PlaylistItem {
+            template_id: "tpl_echo".to_string(),
+            label: Some("Echo Hello".to_string()),
+        };
+
+        let short_id = item.short_id("pl_daily", 0);
+
+        // Should be 8 hex chars
+        assert_eq!(short_id.len(), 8);
+        assert!(short_id.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Same inputs should produce same output (deterministic)
+        let short_id2 = item.short_id("pl_daily", 0);
+        assert_eq!(short_id, short_id2);
+
+        // Different index should produce different short ID
+        let short_id3 = item.short_id("pl_daily", 1);
+        assert_ne!(short_id, short_id3);
+
+        // Different playlist should produce different short ID
+        let short_id4 = item.short_id("pl_other", 0);
+        assert_ne!(short_id, short_id4);
+    }
+
+    #[test]
+    fn test_resolve_item_by_index() {
+        let mut playlist = Playlist::new("pl_daily", "Daily Tasks");
+        playlist.add("tpl_echo", Some("Echo"));
+        playlist.add("tpl_train", Some("Train"));
+
+        // Resolve by index
+        let result = playlist.resolve_item("0");
+        assert!(result.is_some());
+        let (idx, item) = result.unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(item.template_id, "tpl_echo");
+
+        let result = playlist.resolve_item("1");
+        assert!(result.is_some());
+        let (idx, item) = result.unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(item.template_id, "tpl_train");
+
+        // Out of bounds
+        let result = playlist.resolve_item("2");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_resolve_item_by_short_id() {
+        let mut playlist = Playlist::new("pl_daily", "Daily Tasks");
+        playlist.add("tpl_echo", Some("Echo"));
+        playlist.add("tpl_train", Some("Train"));
+
+        // Get the short ID of first item
+        let short_id = playlist.items[0].short_id(&playlist.playlist_id, 0);
+
+        // Full short ID match
+        let result = playlist.resolve_item(&short_id);
+        assert!(result.is_some());
+        let (idx, item) = result.unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(item.template_id, "tpl_echo");
+
+        // Prefix match (first 4 chars)
+        let prefix = &short_id[..4];
+        let result = playlist.resolve_item(prefix);
+        assert!(result.is_some());
+        let (idx, _) = result.unwrap();
+        assert_eq!(idx, 0);
     }
 }
