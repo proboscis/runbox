@@ -3,9 +3,10 @@ use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use dialoguer::{theme::ColorfulTheme, Input};
 use runbox_core::{
-    default_pid_path, default_socket_path, short_id, BindingResolver, ConfigResolver, DaemonClient,
-    GitContext, LogRef, Playlist, PlaylistItem, RunStatus, RunTemplate, RuntimeRegistry, Storage,
-    Timeline, Validator, VerboseLogger,
+    default_pid_path, default_socket_path, short_id, BindingResolver,
+    CodeState, ConfigResolver, DaemonClient, Exec, GitContext, LogRef, Playlist, PlaylistItem,
+    Run, Runnable, RunStatus, RunTemplate, RuntimeRegistry, Storage, Timeline, Validator,
+    VerboseLogger,
 };
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -73,13 +74,19 @@ impl std::fmt::Display for RuntimeType {
 }
 #[derive(Subcommand)]
 enum Commands {
-    /// Run from a template or execute a command directly
+    /// Run from a template, replay a run, or execute a command directly
     #[command(after_help = "\
 EXAMPLES:
+  # Unified short ID resolution (auto-detects type)
+  runbox run 7f3a              # template (auto-detected)
+  runbox run 550e              # replay (auto-detected)
+  runbox run a1b2              # playlist item (auto-detected)
+
   # Direct execution (everything after -- is the command)
   runbox run -- echo 'Hello, World!'
   runbox run -- python train.py --epochs 10
   runbox run -- make test
+
   # With options for direct execution
   runbox run --runtime tmux -- python debug.py
   runbox run --timeout 3600 -- ./long_job.sh
@@ -87,19 +94,30 @@ EXAMPLES:
   runbox run --cwd /path/to/project -- npm test
   runbox run --no-git -- echo 'skip git capture'
   runbox run --dry-run -- python train.py
-  # Template-based execution
+
+  # Explicit template-based execution
   runbox run --template tpl_train_model
   runbox run --template tpl_train_model --binding epochs=100
   runbox run --template tpl_hello --binding name=World --runtime tmux
+
+  # Explicit replay execution
+  runbox run --replay run_550e8400-e29b-41d4-a716-446655440000
+
 RELATED COMMANDS:
   runbox log       Alias for direct execution (runbox log -- <cmd>)
   runbox ps        List runs to check status
   runbox logs      View stdout/stderr from a run
   runbox template  Manage templates")]
     Run {
-        /// Template ID (for template-based execution)
+        /// Short ID to resolve (template, replay, or playlist item)
+        #[arg(value_name = "SHORT_ID")]
+        target: Option<String>,
+        /// Explicit template ID (for template-based execution)
         #[arg(short, long)]
         template: Option<String>,
+        /// Explicit run ID for replay
+        #[arg(long)]
+        replay: Option<String>,
         /// Variable bindings (key=value) - only for template mode
         #[arg(short, long)]
         binding: Vec<String>,
@@ -777,7 +795,9 @@ fn main() -> Result<()> {
     };
     match cli.command {
         Commands::Run {
+            target,
             template,
+            replay,
             binding,
             runtime,
             dry_run,
@@ -787,14 +807,19 @@ fn main() -> Result<()> {
             no_git,
             command,
         } => {
+            // Priority: explicit flags > target short ID > direct command
             if let Some(tpl_id) = template {
                 cmd_run_template(&storage, &tpl_id, binding, runtime, dry_run)
+            } else if let Some(run_id) = replay {
+                cmd_run_replay(&storage, &run_id, runtime, dry_run)
+            } else if let Some(short_id) = target {
+                cmd_run_unified(&storage, &short_id, binding, runtime, dry_run)
             } else if !command.is_empty() {
                 cmd_run_direct(
                     &storage, command, runtime, dry_run, timeout, env_vars, cwd, no_git,
                 )
             } else {
-                anyhow::bail!("Either --template or a command (after --) is required.\n\nUsage:\n  runbox run --template <id> [--binding key=value]\n  runbox run [OPTIONS] -- <command...>")
+                anyhow::bail!("Either a short ID, --template, --replay, or a command (after --) is required.\n\nUsage:\n  runbox run <short_id>                    # unified resolution\n  runbox run --template <id> [--binding key=value]\n  runbox run --replay <run_id>\n  runbox run [OPTIONS] -- <command...>")
             }
         }
         Commands::Log {
@@ -1098,7 +1123,6 @@ fn cmd_run_direct(
     cwd: Option<String>,
     no_git: bool,
 ) -> Result<()> {
-    use runbox_core::{CodeState, Exec, Run};
     if command.is_empty() {
         bail!("No command specified. Usage: runbox run -- <command...>");
     }
@@ -1186,6 +1210,210 @@ fn cmd_run_direct(
     }
     Ok(())
 }
+
+// === Unified Run Command ===
+
+/// Display a box showing what is being run
+fn display_run_info(runnable: &Runnable, template: Option<&RunTemplate>, run: Option<&runbox_core::Run>) {
+    let width = 55;
+    let border = "─".repeat(width);
+    
+    println!("┌{}┐", border);
+    
+    match runnable {
+        Runnable::Template(id) => {
+            println!("│ {:<width$}│", format!("TEMPLATE: {}", id), width = width);
+            if let Some(tpl) = template {
+                println!("│ {:<width$}│", format!("Name: {}", tpl.name), width = width);
+            }
+        }
+        Runnable::Replay(id) => {
+            println!("│ {:<width$}│", format!("REPLAY: {}", id), width = width);
+            if let Some(r) = run {
+                if let Some(created) = r.timeline.created_at {
+                    println!("│ {:<width$}│", format!("Original: {}", created.format("%Y-%m-%d %H:%M:%S")), width = width);
+                }
+            }
+        }
+        Runnable::PlaylistItem { playlist_id, index, label, .. } => {
+            let label_str = label.as_ref().map(|l| format!(" {:?}", l)).unwrap_or_default();
+            println!("│ {:<width$}│", format!("PLAYLIST ITEM: {}[{}]{}", playlist_id, index, label_str), width = width);
+            if let Some(tpl) = template {
+                println!("│ {:<width$}│", format!("Template: {}", tpl.template_id), width = width);
+            }
+        }
+    }
+    
+    println!("├{}┤", border);
+    
+    if let Some(tpl) = template {
+        let cmd = tpl.exec.argv.join(" ");
+        let cmd_display = if cmd.len() > width - 10 {
+            format!("{}...", &cmd[..width - 13])
+        } else {
+            cmd
+        };
+        println!("│ {:<width$}│", format!("Command: {}", cmd_display), width = width);
+        println!("│ {:<width$}│", format!("Cwd:     {}", tpl.exec.cwd), width = width);
+    } else if let Some(r) = run {
+        let cmd = r.exec.argv.join(" ");
+        let cmd_display = if cmd.len() > width - 10 {
+            format!("{}...", &cmd[..width - 13])
+        } else {
+            cmd
+        };
+        println!("│ {:<width$}│", format!("Command: {}", cmd_display), width = width);
+        println!("│ {:<width$}│", format!("Cwd:     {}", r.exec.cwd), width = width);
+        if !r.code_state.repo_url.is_empty() {
+            println!("│ {:<width$}│", format!("Commit:  {}", r.code_state.base_commit.get(..8).unwrap_or(&r.code_state.base_commit)), width = width);
+        }
+    }
+    
+    println!("└{}┘", border);
+}
+
+/// Unified run command - resolves short ID to any runnable type and executes
+fn cmd_run_unified(
+    storage: &Storage,
+    short_id: &str,
+    bindings: Vec<String>,
+    runtime: RuntimeType,
+    dry_run: bool,
+) -> Result<()> {
+    // Resolve the short ID to a Runnable
+    let runnable = storage.resolve_runnable(short_id, 100)?;
+    
+    match &runnable {
+        Runnable::Template(template_id) => {
+            // Load template for display
+            let template = storage.load_template(template_id)?;
+            display_run_info(&runnable, Some(&template), None);
+            println!();
+            cmd_run_template(storage, template_id, bindings, runtime, dry_run)
+        }
+        Runnable::Replay(run_id) => {
+            // Load run for display
+            let run = storage.load_run(run_id)?;
+            display_run_info(&runnable, None, Some(&run));
+            println!();
+            cmd_run_replay(storage, run_id, runtime, dry_run)
+        }
+        Runnable::PlaylistItem { template_id, playlist_id, index, label } => {
+            // Load template for display
+            let template = storage.load_template(template_id)?;
+            let runnable_with_info = Runnable::PlaylistItem {
+                playlist_id: playlist_id.clone(),
+                index: *index,
+                template_id: template_id.clone(),
+                label: label.clone(),
+            };
+            display_run_info(&runnable_with_info, Some(&template), None);
+            println!();
+            cmd_run_template(storage, template_id, bindings, runtime, dry_run)
+        }
+    }
+}
+
+/// Run a replay of a previous run
+fn cmd_run_replay(
+    storage: &Storage,
+    run_id: &str,
+    runtime: RuntimeType,
+    dry_run: bool,
+) -> Result<()> {
+    
+    // Resolve and load the original run
+    let resolved_id = storage.resolve_run_id(run_id)?;
+    let original_run = storage.load_run(&resolved_id)?;
+    
+    if dry_run {
+        println!("Dry run - would replay:");
+        println!("  Original run: {}", original_run.run_id);
+        println!("  Command: {:?}", original_run.exec.argv);
+        println!("  Cwd: {}", original_run.exec.cwd);
+        println!("  Commit: {}", original_run.code_state.base_commit);
+        if original_run.code_state.patch.is_some() {
+            println!("  Patch: yes");
+        }
+        return Ok(());
+    }
+    
+    // Create a new run with the same exec and code_state
+    let new_run_id = format!("run_{}", uuid::Uuid::new_v4());
+    let exec = Exec {
+        argv: original_run.exec.argv.clone(),
+        cwd: original_run.exec.cwd.clone(),
+        env: original_run.exec.env.clone(),
+        timeout_sec: original_run.exec.timeout_sec,
+    };
+    let code_state = CodeState {
+        repo_url: original_run.code_state.repo_url.clone(),
+        base_commit: original_run.code_state.base_commit.clone(),
+        patch: original_run.code_state.patch.clone(),
+    };
+    
+    let mut run = Run::new(exec, code_state);
+    run.run_id = new_run_id;
+    run.validate()?;
+    
+    // Execute the run
+    let registry = RuntimeRegistry::new();
+    let runtime_name = runtime.to_string();
+    let adapter = registry
+        .get(&runtime_name)
+        .context(format!("Unknown runtime: {}", runtime_name))?;
+    
+    let log_path = storage.log_path(&run.run_id);
+    run.runtime = runtime_name.clone();
+    run.log_ref = Some(LogRef {
+        path: log_path.clone(),
+    });
+    run.timeline = Timeline {
+        created_at: Some(Utc::now()),
+        started_at: None,
+        ended_at: None,
+    };
+    run.status = RunStatus::Pending;
+    
+    storage.save_run(&run)?;
+    
+    println!("Starting replay: {}", run.run_id);
+    println!("Original run: {}", original_run.run_id);
+    println!("Runtime: {}", runtime_name);
+    println!("Command: {:?}", run.exec.argv);
+    
+    let handle = adapter.spawn(&run.exec, &run.run_id, &log_path)?;
+    
+    let saved = storage.save_run_if_status_with(&run.run_id, &[RunStatus::Pending], |current| {
+        current.handle = Some(handle.clone());
+        current.status = RunStatus::Running;
+        current.timeline.started_at = Some(Utc::now());
+    })?;
+    
+    if !saved {
+        let _ = storage.save_run_if_status_with(
+            &run.run_id,
+            &[RunStatus::Exited, RunStatus::Failed, RunStatus::Unknown],
+            |current| {
+                if current.handle.is_none() {
+                    current.handle = Some(handle.clone());
+                }
+            },
+        );
+        log::debug!("Run {} already exited - daemon captured status", run.run_id);
+    }
+    
+    println!("Run started: {}", run.run_id);
+    println!("Short ID: {}", run.short_id());
+    println!("Logs: {}", log_path.display());
+    
+    if matches!(runtime, RuntimeType::Tmux) {
+        println!("Attach with: runbox attach {}", run.short_id());
+    }
+    
+    Ok(())
+}
+
 // === Ps Command ===
 fn cmd_ps(
     storage: &Storage,
