@@ -270,7 +270,7 @@ RELATED COMMANDS:
   runbox history       List past runs only
   runbox playlist show Show playlist items")]
     List {
-        /// Filter by type: template, replay, playlist, or all (default: all)
+        /// Filter by type: template, replay, playlist (default: show all)
         #[arg(short = 't', long, value_name = "TYPE")]
         r#type: Option<String>,
         /// Filter playlist items by playlist ID/prefix
@@ -1581,14 +1581,19 @@ fn normalize_repo_url(url: &str) -> String {
     // https://github.com/proboscis/runbox → proboscis/runbox
     let url = url.trim_end_matches(".git");
     
-    // Try to extract org/repo from the URL
+    // Check for SSH format: git@host:org/repo
+    // SSH format has colon NOT followed by // and no :// in the URL before that colon
     if let Some(idx) = url.rfind(':') {
-        // SSH format: git@github.com:org/repo
-        let path = &url[idx + 1..];
-        return path.to_string();
+        let after_colon = &url[idx + 1..];
+        // SSH format: colon is NOT part of a URL scheme (no :// before)
+        // and is NOT followed by // (would indicate a different URL format)
+        if !after_colon.starts_with("//") && !url.contains("://") {
+            return after_colon.to_string();
+        }
     }
     
     // HTTPS format: https://github.com/org/repo
+    // Split by '/' and take last two components
     let parts: Vec<&str> = url.rsplitn(3, '/').collect();
     if parts.len() >= 2 {
         return format!("{}/{}", parts[1], parts[0]);
@@ -1634,6 +1639,19 @@ struct RunnableInfo {
     tags: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     repo_url: Option<String>,
+}
+
+
+/// Safely truncate a string to max_chars characters, adding "..." if truncated.
+/// This is UTF-8 safe and won't panic on multi-byte characters.
+fn truncate_string(s: &str, max_chars: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars.saturating_sub(3)).collect();
+        format!("{}...", truncated)
+    }
 }
 
 fn cmd_list(
@@ -1776,19 +1794,11 @@ fn cmd_list(
         println!("{}", "─".repeat(if verbose { 90 } else { 70 }));
         
         for info in &infos {
-            let name_truncated = if info.name.len() > 24 {
-                format!("{}...", &info.name[..21])
-            } else {
-                info.name.clone()
-            };
+            let name_truncated = truncate_string(&info.name, 24);
             
             if verbose {
                 let repo_display = info.repo_url.as_deref().unwrap_or("-");
-                let repo_truncated = if repo_display.len() > 20 {
-                    format!("{}...", &repo_display[..17])
-                } else {
-                    repo_display.to_string()
-                };
+                let repo_truncated = truncate_string(repo_display, 20);
                 println!(
                     "{:<10} {:<10} {:<16} {:<24} {:<6} {}",
                     info.short_id,
