@@ -18,7 +18,7 @@ pub use git::{GitContext, WorktreeInfo, WorktreeReplayResult};
 pub use playlist::{Playlist, PlaylistItem};
 pub use result::{Artifact, Execution, Output, RunResult};
 pub use run::{CodeState, Exec, LogRef, Patch, Run, RunStatus, RuntimeHandle, Timeline};
-pub use runnable::{format_ambiguous_matches, ResolveResult, Runnable, RunnableMatch};
+pub use runnable::{format_ambiguous_matches, ResolveResult, Runnable, RunnableMatch, RunnableType};
 pub use runtime::{BackgroundAdapter, RuntimeAdapter, RuntimeRegistry, TmuxAdapter};
 pub use storage::{short_id, Storage};
 pub use template::{Bindings, RunTemplate, TemplateCodeState, TemplateExec};

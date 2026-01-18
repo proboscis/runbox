@@ -5,7 +5,40 @@
 //! - Replays: Re-execution of previous runs with exact code state
 //! - Playlist Items: Template references within a playlist
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+/// Runnable type for filtering
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunnableType {
+    Template,
+    Replay,
+    Playlist,
+}
+
+impl std::fmt::Display for RunnableType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunnableType::Template => write!(f, "template"),
+            RunnableType::Replay => write!(f, "replay"),
+            RunnableType::Playlist => write!(f, "playlist"),
+        }
+    }
+}
+
+impl std::str::FromStr for RunnableType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "template" => Ok(RunnableType::Template),
+            "replay" => Ok(RunnableType::Replay),
+            "playlist" => Ok(RunnableType::Playlist),
+            _ => Err(format!("Invalid runnable type: {}. Valid types: template, replay, playlist", s)),
+        }
+    }
+}
 
 /// A unified representation of anything that can be run in runbox.
 ///
@@ -98,6 +131,15 @@ impl Runnable {
         }
     }
 
+    /// Returns the runnable type enum for filtering.
+    pub fn runnable_type(&self) -> RunnableType {
+        match self {
+            Runnable::Template(_) => RunnableType::Template,
+            Runnable::Replay(_) => RunnableType::Replay,
+            Runnable::PlaylistItem { .. } => RunnableType::Playlist,
+        }
+    }
+
     /// Returns a formatted type label with brackets for display.
     pub fn type_label_bracketed(&self) -> String {
         format!("[{}]", self.type_label())
@@ -123,6 +165,36 @@ impl Runnable {
         }
     }
 
+    /// Returns the source label for display in list view.
+    ///
+    /// - Template: "-" (no source, it's a root definition)
+    /// - Replay: shortened run_id 
+    /// - PlaylistItem: "name[index]" format
+    pub fn source_label(&self) -> String {
+        match self {
+            Runnable::Template(_) => "-".to_string(),
+            Runnable::Replay(run_id) => {
+                // Return first part of run_id
+                run_id.trim_start_matches("run_").chars().take(10).collect()
+            }
+            Runnable::PlaylistItem {
+                playlist_id,
+                index,
+                ..
+            } => {
+                // Format as "name[idx]" - strip the "pl_" prefix for brevity
+                let name = playlist_id.trim_start_matches("pl_");
+                format!("{}[{}]", name, index)
+            }
+        }
+    }
+
+    /// Returns the tags label for display (placeholder for future tags feature).
+    pub fn tags_label(&self) -> String {
+        // Tags are not yet implemented, return "-"
+        "-".to_string()
+    }
+
     /// Returns the underlying ID for resolution.
     ///
     /// - For Template: the template_id
@@ -133,6 +205,14 @@ impl Runnable {
             Runnable::Template(id) => id,
             Runnable::Replay(id) => id,
             Runnable::PlaylistItem { template_id, .. } => template_id,
+        }
+    }
+
+    /// Returns the playlist_id if this is a PlaylistItem, None otherwise.
+    pub fn playlist_id(&self) -> Option<&str> {
+        match self {
+            Runnable::PlaylistItem { playlist_id, .. } => Some(playlist_id),
+            _ => None,
         }
     }
 }
@@ -332,6 +412,28 @@ mod tests {
     }
 
     #[test]
+    fn test_runnable_type() {
+        assert_eq!(
+            Runnable::Template("tpl_echo".to_string()).runnable_type(),
+            RunnableType::Template
+        );
+        assert_eq!(
+            Runnable::Replay("run_550e8400-...".to_string()).runnable_type(),
+            RunnableType::Replay
+        );
+        assert_eq!(
+            Runnable::PlaylistItem {
+                playlist_id: "pl_daily".to_string(),
+                index: 0,
+                template_id: "tpl_echo".to_string(),
+                label: None,
+            }
+            .runnable_type(),
+            RunnableType::Playlist
+        );
+    }
+
+    #[test]
     fn test_type_label_bracketed() {
         assert_eq!(
             Runnable::Template("tpl_echo".to_string()).type_label_bracketed(),
@@ -375,6 +477,30 @@ mod tests {
     }
 
     #[test]
+    fn test_source_label() {
+        assert_eq!(
+            Runnable::Template("tpl_echo".to_string()).source_label(),
+            "-"
+        );
+
+        // Replay shows first part of run_id
+        let replay = Runnable::Replay("run_550e8400-e29b-41d4".to_string());
+        assert_eq!(replay.source_label(), "550e8400-e");
+
+        // Playlist item shows "name[idx]"
+        assert_eq!(
+            Runnable::PlaylistItem {
+                playlist_id: "pl_daily".to_string(),
+                index: 0,
+                template_id: "tpl_echo".to_string(),
+                label: None,
+            }
+            .source_label(),
+            "daily[0]"
+        );
+    }
+
+    #[test]
     fn test_underlying_id() {
         assert_eq!(
             Runnable::Template("tpl_echo".to_string()).underlying_id(),
@@ -395,6 +521,30 @@ mod tests {
             }
             .underlying_id(),
             "tpl_echo"
+        );
+    }
+
+    #[test]
+    fn test_playlist_id() {
+        assert_eq!(
+            Runnable::Template("tpl_echo".to_string()).playlist_id(),
+            None
+        );
+
+        assert_eq!(
+            Runnable::Replay("run_550e8400".to_string()).playlist_id(),
+            None
+        );
+
+        assert_eq!(
+            Runnable::PlaylistItem {
+                playlist_id: "pl_daily".to_string(),
+                index: 0,
+                template_id: "tpl_echo".to_string(),
+                label: None,
+            }
+            .playlist_id(),
+            Some("pl_daily")
         );
     }
 
@@ -424,5 +574,21 @@ mod tests {
         assert!(output.contains("[template]"));
         assert!(output.contains("[replay]"));
         assert!(output.contains("tpl_auth_service"));
+    }
+
+    #[test]
+    fn test_runnable_type_from_str() {
+        assert_eq!("template".parse::<RunnableType>().unwrap(), RunnableType::Template);
+        assert_eq!("replay".parse::<RunnableType>().unwrap(), RunnableType::Replay);
+        assert_eq!("playlist".parse::<RunnableType>().unwrap(), RunnableType::Playlist);
+        assert_eq!("TEMPLATE".parse::<RunnableType>().unwrap(), RunnableType::Template);
+        assert!("invalid".parse::<RunnableType>().is_err());
+    }
+
+    #[test]
+    fn test_runnable_type_display() {
+        assert_eq!(RunnableType::Template.to_string(), "template");
+        assert_eq!(RunnableType::Replay.to_string(), "replay");
+        assert_eq!(RunnableType::Playlist.to_string(), "playlist");
     }
 }

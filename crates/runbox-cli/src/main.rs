@@ -219,6 +219,85 @@ RELATED COMMANDS:
         #[arg(short, long, default_value = "20")]
         limit: usize,
     },
+    /// List all runnables (templates, replays, playlist items) in unified table
+    #[command(after_help = "\
+EXAMPLES:
+  # List all runnables
+  runbox list
+
+  # Filter by type
+  runbox list --type template
+  runbox list --type replay
+  runbox list --type playlist
+
+  # Filter by playlist (implies --type playlist)
+  runbox list --playlist daily
+
+  # Filter by repository
+  runbox list --repo runbox
+  runbox list --repo proboscis/runbox
+  runbox list --repo .          # current repo (auto-detect)
+
+  # Show all repos (disable auto-filter)
+  runbox list --all-repos
+
+  # Limit results
+  runbox list --limit 10
+  runbox list --type replay --limit 5
+
+  # Output formats
+  runbox list                   # table (default)
+  runbox list --json            # JSON array
+  runbox list --short           # IDs only
+
+  # Combined filters
+  runbox list --type template --repo runbox
+  runbox list --repo . --type replay --limit 5
+
+OUTPUT:
+  SHORT     TYPE        SOURCE          NAME                    TAGS
+  ────────────────────────────────────────────────────────────────────
+  7f3a2b1c  template    -               Echo Message            -
+  c4d5e6f7  template    -               Train Model             -
+  a1b2c3d4  playlist    daily[0]        Echo Hello              -
+  550e8400  replay      550e8400-e      python train.py         -
+
+  4 runnables (2 templates, 1 playlist item, 1 replay)
+
+RELATED COMMANDS:
+  runbox run <short>   Run a runnable by short ID
+  runbox template list List templates only
+  runbox history       List past runs only
+  runbox playlist show Show playlist items")]
+    List {
+        /// Filter by type: template, replay, playlist (default: show all)
+        #[arg(short = 't', long, value_name = "TYPE")]
+        r#type: Option<String>,
+        /// Filter playlist items by playlist ID/prefix
+        #[arg(short, long, value_name = "ID")]
+        playlist: Option<String>,
+        /// Filter by repository (name, org/name, or "." for current)
+        #[arg(short, long, value_name = "REPO")]
+        repo: Option<String>,
+        /// Show runnables from ALL repos (disable auto-filter)
+        #[arg(long)]
+        all_repos: bool,
+        /// Filter by tag (can be repeated) - placeholder for future
+        #[arg(long, value_name = "TAG")]
+        tag: Vec<String>,
+        /// Max items to show (default: 50)
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Output short IDs only (one per line)
+        #[arg(long)]
+        short: bool,
+        /// Show additional details
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// Stop a running process
     #[command(after_help = "\
 EXAMPLES:
@@ -834,6 +913,17 @@ fn main() -> Result<()> {
             &storage, command, runtime, dry_run, timeout, env_vars, cwd, no_git,
         ),
         Commands::Ps { status, all, limit } => cmd_ps(&storage, status, all, limit),
+        Commands::List {
+            r#type,
+            playlist,
+            repo,
+            all_repos,
+            tag,
+            limit,
+            json,
+            short,
+            verbose,
+        } => cmd_list(&storage, r#type, playlist, repo, all_repos, tag, limit, json, short, verbose),
         Commands::Stop { run_id, force } => cmd_stop(&storage, &run_id, force),
         Commands::Logs {
             run_id,
@@ -1463,6 +1553,294 @@ fn cmd_ps(
     }
     Ok(())
 }
+
+// === List Command ===
+
+/// Detect the current repository from the working directory.
+/// Supports both regular git repos and worktrees.
+fn detect_current_repo() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    
+    if !output.status.success() {
+        return None;
+    }
+    
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Some(normalize_repo_url(&url))
+}
+
+/// Normalize a git remote URL to "org/repo" format.
+/// Handles SSH and HTTPS URLs.
+fn normalize_repo_url(url: &str) -> String {
+    // Handle various formats:
+    // git@github.com:proboscis/runbox.git → proboscis/runbox
+    // https://github.com/proboscis/runbox.git → proboscis/runbox
+    // https://github.com/proboscis/runbox → proboscis/runbox
+    let url = url.trim_end_matches(".git");
+    
+    // Check for SSH format: git@host:org/repo
+    // SSH format has colon NOT followed by // and no :// in the URL before that colon
+    if let Some(idx) = url.rfind(':') {
+        let after_colon = &url[idx + 1..];
+        // SSH format: colon is NOT part of a URL scheme (no :// before)
+        // and is NOT followed by // (would indicate a different URL format)
+        if !after_colon.starts_with("//") && !url.contains("://") {
+            return after_colon.to_string();
+        }
+    }
+    
+    // HTTPS format: https://github.com/org/repo
+    // Split by '/' and take last two components
+    let parts: Vec<&str> = url.rsplitn(3, '/').collect();
+    if parts.len() >= 2 {
+        return format!("{}/{}", parts[1], parts[0]);
+    }
+    
+    url.to_string()
+}
+
+/// Check if a repo URL matches a filter.
+/// The filter can be:
+/// - Full match: "org/repo"
+/// - Partial match: "repo" (matches any org)
+fn repo_matches(repo_url: &Option<String>, filter: &str) -> bool {
+    let Some(url) = repo_url else {
+        return false;
+    };
+    
+    let normalized = normalize_repo_url(url);
+    
+    // Full match
+    if normalized == filter {
+        return true;
+    }
+    
+    // Partial match (repo name only)
+    if let Some(repo_name) = normalized.split('/').last() {
+        if repo_name == filter {
+            return true;
+        }
+    }
+    
+    false
+}
+
+/// Runnable info for JSON serialization
+#[derive(serde::Serialize)]
+struct RunnableInfo {
+    short_id: String,
+    #[serde(rename = "type")]
+    runnable_type: String,
+    source: String,
+    name: String,
+    tags: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_url: Option<String>,
+}
+
+
+/// Safely truncate a string to max_chars characters, adding "..." if truncated.
+/// This is UTF-8 safe and won't panic on multi-byte characters.
+fn truncate_string(s: &str, max_chars: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars.saturating_sub(3)).collect();
+        format!("{}...", truncated)
+    }
+}
+
+fn cmd_list(
+    storage: &Storage,
+    type_filter: Option<String>,
+    playlist_filter: Option<String>,
+    repo_arg: Option<String>,
+    all_repos: bool,
+    _tag_filter: Vec<String>,  // Placeholder for future
+    limit: usize,
+    json_output: bool,
+    short_output: bool,
+    verbose: bool,
+) -> Result<()> {
+    use runbox_core::RunnableType;
+    
+    // Parse type filter
+    let type_filter: Option<RunnableType> = if let Some(ref t) = type_filter {
+        Some(t.parse().map_err(|e: String| anyhow::anyhow!("{}", e))?)
+    } else if playlist_filter.is_some() {
+        // --playlist implies --type playlist
+        Some(RunnableType::Playlist)
+    } else {
+        None
+    };
+    
+    // Determine repo filter
+    let repo_filter: Option<String> = if all_repos {
+        // Explicitly show all repos
+        None
+    } else if let Some(r) = repo_arg {
+        if r == "." {
+            // "." means current repo
+            detect_current_repo()
+        } else {
+            Some(r)
+        }
+    } else {
+        // Auto-detect from current directory
+        detect_current_repo()
+    };
+    
+    // Show hint about repo filtering
+    let show_repo_hint = !all_repos && repo_filter.is_some() && !json_output && !short_output;
+    if show_repo_hint {
+        if let Some(ref repo) = repo_filter {
+            eprintln!("Showing runnables for: {} (use --all-repos to show all)\n", repo);
+        }
+    }
+    
+    // Get all runnables
+    let all_runnables = storage.list_all_runnables(limit * 2)?; // Get more to account for filtering
+    
+    // Apply filters
+    let filtered: Vec<_> = all_runnables
+        .into_iter()
+        .filter(|r| {
+            // Type filter
+            if let Some(ref t) = type_filter {
+                if &r.runnable_type() != t {
+                    return false;
+                }
+            }
+            
+            // Playlist filter
+            if let Some(ref pl) = playlist_filter {
+                match r.playlist_id() {
+                    Some(pid) => {
+                        let pl_name = pid.trim_start_matches("pl_");
+                        if !pl_name.starts_with(pl) && !pid.starts_with(pl) {
+                            return false;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+            
+            // Repo filter
+            if let Some(ref repo) = repo_filter {
+                let runnable_repo = storage.get_runnable_repo_url(r);
+                if !repo_matches(&runnable_repo, repo) {
+                    return false;
+                }
+            }
+            
+            true
+        })
+        .take(limit)
+        .collect();
+    
+    if filtered.is_empty() {
+        if json_output {
+            println!("[]");
+        } else if !short_output {
+            println!("No runnables found.");
+        }
+        return Ok(());
+    }
+    
+    // Collect info for output
+    let infos: Vec<RunnableInfo> = filtered
+        .iter()
+        .map(|r| {
+            let repo_url = if verbose {
+                storage.get_runnable_repo_url(r)
+            } else {
+                None
+            };
+            RunnableInfo {
+                short_id: r.short_id(),
+                runnable_type: r.type_label().to_string(),
+                source: r.source_label(),
+                name: storage.get_runnable_display_name(r),
+                tags: r.tags_label(),
+                repo_url,
+            }
+        })
+        .collect();
+    
+    // Output
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&infos)?);
+    } else if short_output {
+        for info in &infos {
+            println!("{}", info.short_id);
+        }
+    } else {
+        // Table output
+        if verbose {
+            println!(
+                "{:<10} {:<10} {:<16} {:<24} {:<6} {}",
+                "SHORT", "TYPE", "SOURCE", "NAME", "TAGS", "REPO"
+            );
+        } else {
+            println!(
+                "{:<10} {:<10} {:<16} {:<24} {}",
+                "SHORT", "TYPE", "SOURCE", "NAME", "TAGS"
+            );
+        }
+        println!("{}", "─".repeat(if verbose { 90 } else { 70 }));
+        
+        for info in &infos {
+            let name_truncated = truncate_string(&info.name, 24);
+            
+            if verbose {
+                let repo_display = info.repo_url.as_deref().unwrap_or("-");
+                let repo_truncated = truncate_string(repo_display, 20);
+                println!(
+                    "{:<10} {:<10} {:<16} {:<24} {:<6} {}",
+                    info.short_id,
+                    info.runnable_type,
+                    info.source,
+                    name_truncated,
+                    info.tags,
+                    repo_truncated
+                );
+            } else {
+                println!(
+                    "{:<10} {:<10} {:<16} {:<24} {}",
+                    info.short_id,
+                    info.runnable_type,
+                    info.source,
+                    name_truncated,
+                    info.tags
+                );
+            }
+        }
+        
+        // Summary line
+        let mut type_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for r in &filtered {
+            *type_counts.entry(r.type_label()).or_insert(0) += 1;
+        }
+        
+        let summary_parts: Vec<String> = type_counts
+            .iter()
+            .map(|(t, c)| format!("{} {}s", c, t))
+            .collect();
+        
+        println!(
+            "\n{} runnables ({})",
+            filtered.len(),
+            summary_parts.join(", ")
+        );
+    }
+    
+    Ok(())
+}
+
 // === Stop Command ===
 fn cmd_stop(storage: &Storage, run_id: &str, force: bool) -> Result<()> {
     let full_run_id = resolve_run_id(storage, run_id)?;
