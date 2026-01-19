@@ -14,6 +14,7 @@ pub mod xdg;
 pub mod local_storage;
 pub mod record;
 pub mod task;
+pub mod index;
 
 pub use binding::BindingResolver;
 pub use config::{ConfigResolver, ConfigSource, ResolvedValue, RunboxConfig, VerboseLogger};
@@ -34,3 +35,4 @@ pub use xdg::{
 pub use local_storage::{LayeredStorage, Scope, locate_local_runbox_dir};
 pub use record::{Record, RecordCommand, RecordGitState, RecordValidationError};
 pub use task::{Task, TaskHandle, TaskRuntime, TaskStatus};
+pub use index::{EntityType, Index, IndexedEntity};
