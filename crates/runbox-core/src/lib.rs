@@ -10,6 +10,10 @@ pub mod runtime;
 pub mod storage;
 pub mod template;
 pub mod validation;
+pub mod xdg;
+pub mod local_storage;
+pub mod record;
+pub mod task;
 
 pub use binding::BindingResolver;
 pub use config::{ConfigResolver, ConfigSource, ResolvedValue, RunboxConfig, VerboseLogger};
@@ -23,3 +27,10 @@ pub use runtime::{BackgroundAdapter, RuntimeAdapter, RuntimeRegistry, TmuxAdapte
 pub use storage::{short_id, Storage};
 pub use template::{Bindings, RunTemplate, TemplateCodeState, TemplateExec};
 pub use validation::{ValidationType, Validator};
+pub use xdg::{
+    legacy_macos_dir, runbox_cache_dir, runbox_config_dir, runbox_data_dir, runbox_state_dir,
+    xdg_cache_home, xdg_config_home, xdg_data_home, xdg_state_home,
+};
+pub use local_storage::{LayeredStorage, Scope, locate_local_runbox_dir};
+pub use record::{Record, RecordCommand, RecordGitState, RecordValidationError};
+pub use task::{Task, TaskHandle, TaskRuntime, TaskStatus};

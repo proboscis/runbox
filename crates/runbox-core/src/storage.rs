@@ -1,3 +1,4 @@
+use crate::xdg::{legacy_macos_dir, runbox_data_dir, runbox_state_dir};
 use crate::{Playlist, Run, RunResult, RunStatus, RunTemplate};
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -10,6 +11,8 @@ fn normalize_for_match(id: &str) -> String {
         .trim_start_matches("tpl_")
         .trim_start_matches("pl_")
         .trim_start_matches("result_")
+        .trim_start_matches("rec_")
+        .trim_start_matches("task_")
         .replace('-', "")
         .to_lowercase()
 }
@@ -21,47 +24,206 @@ pub fn short_id(full_id: &str) -> String {
 }
 
 /// Storage for runs, templates, and playlists
+///
+/// Uses XDG Base Directory Specification for storage:
+/// - Data (templates, playlists, records): $XDG_DATA_HOME/runbox/
+/// - State (logs, sqlite): $XDG_STATE_HOME/runbox/
+///
+/// On macOS, this intentionally uses ~/.local/share and ~/.local/state
+/// rather than ~/Library/Application Support for cross-platform consistency.
 pub struct Storage {
-    base_dir: PathBuf,
+    /// Base directory for data files (templates, playlists, runs/records)
+    data_dir: PathBuf,
+    /// Base directory for state files (logs)
+    state_dir: PathBuf,
 }
 
 impl Storage {
-    /// Create a new Storage
+    /// Create a new Storage with XDG-compliant paths
     ///
-    /// Uses RUNBOX_HOME environment variable if set, otherwise uses XDG data directory
+    /// Uses RUNBOX_HOME environment variable if set, otherwise uses XDG paths.
+    /// If legacy macOS storage exists, migrates data automatically.
     pub fn new() -> Result<Self> {
-        let base_dir = if let Ok(home) = std::env::var("RUNBOX_HOME") {
-            PathBuf::from(home)
-        } else {
-            dirs::data_dir()
-                .context("Could not find data directory")?
-                .join("runbox")
-        };
-        Self::with_base_dir(base_dir)
+        // Check for RUNBOX_HOME override (for testing and custom setups)
+        if let Ok(home) = std::env::var("RUNBOX_HOME") {
+            let base_dir = PathBuf::from(home);
+            return Self::with_unified_base_dir(base_dir);
+        }
+
+        // Use XDG paths
+        let data_dir = runbox_data_dir();
+        let state_dir = runbox_state_dir();
+
+        // Check for legacy macOS data and migrate if needed
+        if let Some(legacy_dir) = legacy_macos_dir() {
+            if let Err(e) = Self::migrate_from_legacy(&legacy_dir, &data_dir, &state_dir) { eprintln!("[runbox] Migration warning: {}", e); }
+        }
+
+        Self::with_data_and_state_dirs(data_dir, state_dir)
     }
 
+    /// Create storage with unified base dir (legacy mode, for RUNBOX_HOME and tests)
+    pub fn with_unified_base_dir(base_dir: PathBuf) -> Result<Self> {
+        // In legacy mode, data and state are in the same directory
+        Self::with_data_and_state_dirs(base_dir.clone(), base_dir)
+    }
+
+    /// Alias for backward compatibility
     pub fn with_base_dir(base_dir: PathBuf) -> Result<Self> {
-        fs::create_dir_all(base_dir.join("runs"))?;
-        fs::create_dir_all(base_dir.join("templates"))?;
-        fs::create_dir_all(base_dir.join("playlists"))?;
-        fs::create_dir_all(base_dir.join("results"))?;
-        fs::create_dir_all(base_dir.join("blobs"))?;
-        fs::create_dir_all(base_dir.join("logs"))?;
-
-        Ok(Self { base_dir })
+        Self::with_unified_base_dir(base_dir)
     }
 
-    /// Get the base directory
+    /// Create storage with separate data and state directories (XDG mode)
+    pub fn with_data_and_state_dirs(data_dir: PathBuf, state_dir: PathBuf) -> Result<Self> {
+        // Create data directories
+        fs::create_dir_all(data_dir.join("runs"))?;
+        fs::create_dir_all(data_dir.join("templates"))?;
+        fs::create_dir_all(data_dir.join("playlists"))?;
+        fs::create_dir_all(data_dir.join("results"))?;
+        fs::create_dir_all(data_dir.join("blobs"))?;
+
+        // Create state directories
+        fs::create_dir_all(state_dir.join("logs"))?;
+
+        Ok(Self { data_dir, state_dir })
+    }
+
+    /// Migrate data from legacy macOS path to XDG paths
+    fn migrate_from_legacy(legacy_dir: &PathBuf, data_dir: &PathBuf, state_dir: &PathBuf) -> Result<()> {
+        eprintln!(
+            "[runbox] Migrating from legacy storage: {}",
+            legacy_dir.display()
+        );
+        eprintln!(
+            "[runbox]   → Data: {}",
+            data_dir.display()
+        );
+        eprintln!(
+            "[runbox]   → State: {}",
+            state_dir.display()
+        );
+
+        // Create target directories
+        fs::create_dir_all(data_dir)?;
+        fs::create_dir_all(state_dir)?;
+
+        // Data directories to migrate
+        let data_subdirs = ["runs", "templates", "playlists", "results", "blobs"];
+        for subdir in &data_subdirs {
+            let src = legacy_dir.join(subdir);
+            let dst = data_dir.join(subdir);
+            if src.exists() && src.is_dir() {
+                if let Err(e) = Self::migrate_directory(&src, &dst) { eprintln!("[runbox] Warning: failed to migrate {}: {}", subdir, e); }
+            }
+        }
+
+        // State directories to migrate
+        let state_subdirs = ["logs"];
+        for subdir in &state_subdirs {
+            let src = legacy_dir.join(subdir);
+            let dst = state_dir.join(subdir);
+            if src.exists() && src.is_dir() {
+                if let Err(e) = Self::migrate_directory(&src, &dst) { eprintln!("[runbox] Warning: failed to migrate {}: {}", subdir, e); }
+            }
+        }
+
+        // Check if legacy directory is now empty and remove it
+        match Self::is_dir_empty(legacy_dir) {
+            Ok(true) => {
+                eprintln!("[runbox] Removing empty legacy directory");
+                let _ = fs::remove_dir_all(legacy_dir);
+            }
+            Ok(false) => {
+                eprintln!(
+                    "[runbox] Legacy directory not empty, keeping: {}",
+                    legacy_dir.display()
+                );
+            }
+            Err(_) => {
+                // Directory might already be gone or inaccessible, ignore
+            }
+        }
+
+        eprintln!("[runbox] Migration complete");
+        Ok(())
+    }
+    fn migrate_directory(src: &PathBuf, dst: &PathBuf) -> Result<()> {
+        fs::create_dir_all(dst)?;
+
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+
+            // Skip if destination already exists (don't overwrite)
+            if dst_path.exists() {
+                continue;
+            }
+
+            // Try to rename (move) first - fastest on same filesystem
+            if fs::rename(&src_path, &dst_path).is_err() {
+                // If rename fails (cross-filesystem), copy then delete
+                if src_path.is_dir() {
+                    Self::copy_dir_recursive(&src_path, &dst_path)?;
+                } else {
+                    fs::copy(&src_path, &dst_path)?;
+                }
+                if src_path.is_dir() {
+                    fs::remove_dir_all(&src_path)?;
+                } else {
+                    fs::remove_file(&src_path)?;
+                }
+            }
+        }
+
+        // Try to remove source directory if empty
+        let _ = fs::remove_dir(src);
+
+        Ok(())
+    }
+
+    /// Copy directory recursively
+    fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> Result<()> {
+        fs::create_dir_all(dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+
+            if src_path.is_dir() {
+                Self::copy_dir_recursive(&src_path, &dst_path)?;
+            } else {
+                fs::copy(&src_path, &dst_path)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Check if a directory is empty
+    fn is_dir_empty(dir: &PathBuf) -> Result<bool> {
+        Ok(fs::read_dir(dir)?.next().is_none())
+    }
+
+    /// Get the base directory (for backward compatibility, returns data_dir)
     pub fn base_dir(&self) -> &PathBuf {
-        &self.base_dir
+        &self.data_dir
     }
 
+    /// Get the data directory
+    pub fn data_dir(&self) -> &PathBuf {
+        &self.data_dir
+    }
+
+    /// Get the state directory
+    pub fn state_dir(&self) -> &PathBuf {
+        &self.state_dir
+    }
     // === Run operations ===
 
     /// Save a run (with atomic write via rename)
     pub fn save_run(&self, run: &Run) -> Result<PathBuf> {
-        let path = self.base_dir.join("runs").join(format!("{}.json", run.run_id));
-        let temp_path = self.base_dir.join("runs").join(format!("{}.json.tmp", run.run_id));
+        let path = self.data_dir.join("runs").join(format!("{}.json", run.run_id));
+        let temp_path = self.data_dir.join("runs").join(format!("{}.json.tmp", run.run_id));
 
         let json = serde_json::to_string_pretty(run)?;
 
@@ -89,8 +251,8 @@ impl Storage {
     where
         F: FnOnce(&mut Run),
     {
-        let path = self.base_dir.join("runs").join(format!("{}.json", run_id));
-        let lock_path = self.base_dir.join("runs").join(format!("{}.json.lock", run_id));
+        let path = self.data_dir.join("runs").join(format!("{}.json", run_id));
+        let lock_path = self.data_dir.join("runs").join(format!("{}.json.lock", run_id));
 
         // Acquire exclusive lock
         let lock_file = File::create(&lock_path)?;
@@ -135,7 +297,7 @@ impl Storage {
         update_fn(&mut current_run);
 
         // Write atomically
-        let temp_path = self.base_dir.join("runs").join(format!("{}.json.tmp", run_id));
+        let temp_path = self.data_dir.join("runs").join(format!("{}.json.tmp", run_id));
         let json = serde_json::to_string_pretty(&current_run)?;
 
         let mut file = File::create(&temp_path)?;
@@ -166,7 +328,7 @@ impl Storage {
 
     /// Load a run by ID
     pub fn load_run(&self, run_id: &str) -> Result<Run> {
-        let path = self.base_dir.join("runs").join(format!("{}.json", run_id));
+        let path = self.data_dir.join("runs").join(format!("{}.json", run_id));
         let json = fs::read_to_string(&path)
             .with_context(|| format!("Run not found: {}", run_id))?;
         let run: Run = serde_json::from_str(&json)?;
@@ -175,7 +337,7 @@ impl Storage {
 
     /// List all runs, sorted by modification time (newest first)
     pub fn list_runs(&self, limit: usize) -> Result<Vec<Run>> {
-        let runs_dir = self.base_dir.join("runs");
+        let runs_dir = self.data_dir.join("runs");
         let mut entries: Vec<_> = fs::read_dir(&runs_dir)?
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -205,19 +367,91 @@ impl Storage {
 
     /// Delete a run by ID
     pub fn delete_run(&self, run_id: &str) -> Result<()> {
-        let path = self.base_dir.join("runs").join(format!("{}.json", run_id));
+        let path = self.data_dir.join("runs").join(format!("{}.json", run_id));
         fs::remove_file(&path).with_context(|| format!("Run not found: {}", run_id))?;
         Ok(())
     }
 
     /// Get the log path for a run
     pub fn log_path(&self, run_id: &str) -> PathBuf {
-        self.base_dir.join("logs").join(format!("{}.log", run_id))
+        self.state_dir.join("logs").join(format!("{}.log", run_id))
     }
 
     /// Get the logs directory
     pub fn logs_dir(&self) -> PathBuf {
-        self.base_dir.join("logs")
+        self.state_dir.join("logs")
+    }
+
+
+    // === Record operations ===
+
+    /// Save a record (with atomic write via rename)
+    pub fn save_record(&self, record: &crate::Record) -> Result<PathBuf> {
+        let records_dir = self.data_dir.join("records");
+        fs::create_dir_all(&records_dir)?;
+        
+        let path = records_dir.join(format!("{}.json", record.record_id));
+        let temp_path = records_dir.join(format!("{}.json.tmp", record.record_id));
+
+        let json = serde_json::to_string_pretty(record)?;
+
+        let mut file = File::create(&temp_path)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+
+        fs::rename(&temp_path, &path)?;
+
+        Ok(path)
+    }
+
+    /// Load a record by ID
+    pub fn load_record(&self, record_id: &str) -> Result<crate::Record> {
+        let path = self.data_dir.join("records").join(format!("{}.json", record_id));
+        let json = fs::read_to_string(&path)
+            .with_context(|| format!("Record not found: {}", record_id))?;
+        let record: crate::Record = serde_json::from_str(&json)?;
+        Ok(record)
+    }
+
+    /// List all records, sorted by creation time (newest first)
+    pub fn list_records(&self, limit: usize) -> Result<Vec<crate::Record>> {
+        let records_dir = self.data_dir.join("records");
+        if !records_dir.exists() {
+            return Ok(Vec::new());
+        }
+        
+        let mut entries: Vec<_> = fs::read_dir(&records_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "json")
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        // Sort by modification time (newest first)
+        entries.sort_by(|a, b| {
+            let a_time = a.metadata().and_then(|m| m.modified()).ok();
+            let b_time = b.metadata().and_then(|m| m.modified()).ok();
+            b_time.cmp(&a_time)
+        });
+
+        let records: Vec<crate::Record> = entries
+            .into_iter()
+            .take(limit)
+            .filter_map(|e| fs::read_to_string(e.path()).ok())
+            .filter_map(|json| serde_json::from_str(&json).ok())
+            .collect();
+
+        Ok(records)
+    }
+
+    /// Resolve a record ID (supports short IDs)
+    pub fn resolve_record_id(&self, input: &str) -> Result<String> {
+        let records = self.list_records(usize::MAX)?;
+        resolve_id_from_items(&records, input, |r| &r.record_id)
     }
 
     // === Template operations ===
@@ -225,7 +459,7 @@ impl Storage {
     /// Save a template
     pub fn save_template(&self, template: &RunTemplate) -> Result<PathBuf> {
         let path = self
-            .base_dir
+            .base_dir()
             .join("templates")
             .join(format!("{}.json", template.template_id));
         if path.exists() {
@@ -239,7 +473,7 @@ impl Storage {
     /// Load a template by ID
     pub fn load_template(&self, template_id: &str) -> Result<RunTemplate> {
         let path = self
-            .base_dir
+            .base_dir()
             .join("templates")
             .join(format!("{}.json", template_id));
         let json = fs::read_to_string(&path)
@@ -250,7 +484,7 @@ impl Storage {
 
     /// List all templates
     pub fn list_templates(&self) -> Result<Vec<RunTemplate>> {
-        let templates_dir = self.base_dir.join("templates");
+        let templates_dir = self.data_dir.join("templates");
         let templates: Vec<RunTemplate> = fs::read_dir(&templates_dir)?
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -268,7 +502,7 @@ impl Storage {
     /// Delete a template by ID
     pub fn delete_template(&self, template_id: &str) -> Result<()> {
         let path = self
-            .base_dir
+            .base_dir()
             .join("templates")
             .join(format!("{}.json", template_id));
         fs::remove_file(&path).with_context(|| format!("Template not found: {}", template_id))?;
@@ -280,7 +514,7 @@ impl Storage {
     /// Save a playlist
     pub fn save_playlist(&self, playlist: &Playlist) -> Result<PathBuf> {
         let path = self
-            .base_dir
+            .base_dir()
             .join("playlists")
             .join(format!("{}.json", playlist.playlist_id));
         let json = serde_json::to_string_pretty(playlist)?;
@@ -291,7 +525,7 @@ impl Storage {
     /// Load a playlist by ID
     pub fn load_playlist(&self, playlist_id: &str) -> Result<Playlist> {
         let path = self
-            .base_dir
+            .base_dir()
             .join("playlists")
             .join(format!("{}.json", playlist_id));
         let json = fs::read_to_string(&path)
@@ -302,7 +536,7 @@ impl Storage {
 
     /// List all playlists
     pub fn list_playlists(&self) -> Result<Vec<Playlist>> {
-        let playlists_dir = self.base_dir.join("playlists");
+        let playlists_dir = self.data_dir.join("playlists");
         let playlists: Vec<Playlist> = fs::read_dir(&playlists_dir)?
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -319,7 +553,7 @@ impl Storage {
 
     pub fn delete_playlist(&self, playlist_id: &str) -> Result<()> {
         let path = self
-            .base_dir
+            .base_dir()
             .join("playlists")
             .join(format!("{}.json", playlist_id));
         fs::remove_file(&path).with_context(|| format!("Playlist not found: {}", playlist_id))?;
@@ -330,11 +564,11 @@ impl Storage {
 
     pub fn save_result(&self, result: &RunResult) -> Result<PathBuf> {
         let path = self
-            .base_dir
+            .base_dir()
             .join("results")
             .join(format!("{}.json", result.result_id));
         let temp_path = self
-            .base_dir
+            .base_dir()
             .join("results")
             .join(format!("{}.json.tmp", result.result_id));
 
@@ -352,7 +586,7 @@ impl Storage {
 
     pub fn load_result(&self, result_id: &str) -> Result<RunResult> {
         let path = self
-            .base_dir
+            .base_dir()
             .join("results")
             .join(format!("{}.json", result_id));
         let json = fs::read_to_string(&path)
@@ -362,7 +596,7 @@ impl Storage {
     }
 
     pub fn list_results(&self, limit: usize) -> Result<Vec<RunResult>> {
-        let results_dir = self.base_dir.join("results");
+        let results_dir = self.data_dir.join("results");
         let mut entries: Vec<_> = fs::read_dir(&results_dir)?
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -399,7 +633,7 @@ impl Storage {
 
     pub fn delete_result(&self, result_id: &str) -> Result<()> {
         let path = self
-            .base_dir
+            .base_dir()
             .join("results")
             .join(format!("{}.json", result_id));
         fs::remove_file(&path).with_context(|| format!("Result not found: {}", result_id))?;
@@ -414,10 +648,10 @@ impl Storage {
         let hash = format!("{:x}", hasher.finalize());
         let blob_ref = format!("blobs/{}", hash);
 
-        let blob_path = self.base_dir.join("blobs").join(&hash);
+        let blob_path = self.data_dir.join("blobs").join(&hash);
 
         if !blob_path.exists() {
-            let temp_path = self.base_dir.join("blobs").join(format!("{}.tmp", hash));
+            let temp_path = self.data_dir.join("blobs").join(format!("{}.tmp", hash));
             let mut file = File::create(&temp_path)?;
             file.write_all(content)?;
             file.sync_all()?;
@@ -430,7 +664,7 @@ impl Storage {
 
     pub fn load_blob(&self, blob_ref: &str) -> Result<Vec<u8>> {
         let hash = blob_ref.trim_start_matches("blobs/");
-        let blob_path = self.base_dir.join("blobs").join(hash);
+        let blob_path = self.data_dir.join("blobs").join(hash);
         let content = fs::read(&blob_path)
             .with_context(|| format!("Blob not found: {}", blob_ref))?;
         Ok(content)
@@ -438,15 +672,15 @@ impl Storage {
 
     pub fn blob_exists(&self, blob_ref: &str) -> bool {
         let hash = blob_ref.trim_start_matches("blobs/");
-        self.base_dir.join("blobs").join(hash).exists()
+        self.data_dir.join("blobs").join(hash).exists()
     }
 
     pub fn blobs_dir(&self) -> PathBuf {
-        self.base_dir.join("blobs")
+        self.data_dir.join("blobs")
     }
 
     pub fn results_dir(&self) -> PathBuf {
-        self.base_dir.join("results")
+        self.data_dir.join("results")
     }
 
     // === ID Resolution ===
@@ -1304,7 +1538,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn test_resolve_runnable_ambiguous() {
         let dir = tempdir().unwrap();
         let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
@@ -1365,5 +1598,42 @@ mod tests {
             crate::Runnable::Template(id) => assert_eq!(id, "tpl_aaa"),
             _ => panic!("Expected Template runnable"),
         }
+    }
+
+    #[test]
+    fn test_record_storage() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        let record = crate::Record::new(
+            crate::RecordGitState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch_ref: None,
+            },
+            crate::RecordCommand {
+                argv: vec!["echo".to_string(), "hello".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+            },
+        );
+
+        // Save
+        storage.save_record(&record).unwrap();
+
+        // Load
+        let loaded = storage.load_record(&record.record_id).unwrap();
+        assert_eq!(loaded.record_id, record.record_id);
+        assert_eq!(loaded.git_state.repo_url, "git@github.com:org/repo.git");
+        assert_eq!(loaded.command.argv, vec!["echo", "hello"]);
+
+        // List
+        let records = storage.list_records(10).unwrap();
+        assert_eq!(records.len(), 1);
+
+        // Resolve by short ID
+        let short = &record.record_id[4..8];
+        let resolved = storage.resolve_record_id(short).unwrap();
+        assert_eq!(resolved, record.record_id);
     }
 }
