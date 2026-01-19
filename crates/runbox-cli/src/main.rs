@@ -6,7 +6,7 @@ use runbox_core::{
     default_pid_path, default_socket_path, short_id, BindingResolver,
     CodeState, ConfigResolver, DaemonClient, Exec, GitContext, LogRef, Playlist, PlaylistItem,
     Run, Runnable, RunStatus, RunTemplate, RuntimeRegistry, Storage, Timeline, Validator,
-    VerboseLogger,
+    VerboseLogger, Record, RecordGitState, RecordCommand,
 };
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -615,7 +615,48 @@ RELATED COMMANDS:
         #[command(subcommand)]
         command: DaemonCommands,
     },
-    /// Display the full tutorial in the terminal
+    /// Create runbox entities (records, templates)
+    #[command(after_help = "\
+EXAMPLES:
+  # Create a record from stdin
+  cat record.json | runbox create record
+
+  # Create a record from a file
+  runbox create record --from-file record.json
+
+  # Create a record with minimal fields
+  echo '{ \"command\": { \"argv\": [\"echo\", \"hello\"], \"cwd\": \".\" } }' | runbox create record
+
+RECORD JSON FORMAT:
+  {
+    \"id\": \"rec_custom-id\",           // optional, auto-generated if missing
+    \"git_state\": {
+      \"repo_url\": \"git@github.com:org/repo.git\",
+      \"commit\": \"abc123...\"           // 40-char hex
+    },
+    \"command\": {
+      \"argv\": [\"python\", \"train.py\"],
+      \"cwd\": \".\",
+      \"env\": {}                          // optional
+    },
+    \"exit_code\": 0,                      // optional
+    \"started_at\": \"2025-01-19T10:00:00Z\", // optional
+    \"ended_at\": \"2025-01-19T10:05:00Z\",   // optional
+    \"tags\": [\"ml\", \"training\"],      // optional
+    \"source\": \"doeff\"                  // optional, default: external
+  }
+
+EXTERNAL TOOL INTEGRATION:
+  This command allows external tools like doeff to register execution
+  records in runbox for unified history and querying.
+
+RELATED COMMANDS:
+  runbox list --type record   List all records
+  runbox query                Query records with SQL")]
+    Create {
+        #[command(subcommand)]
+        command: CreateCommands,
+    },
     #[command(after_help = "\
 EXAMPLES:
   # Show the complete tutorial
@@ -635,6 +676,7 @@ CONTENTS:
   - Configuration
   - Troubleshooting
   - Examples")]
+    /// Display the full tutorial in the terminal
     Tutorial,
 }
 #[derive(Subcommand)]
@@ -865,6 +907,27 @@ enum ResultCommands {
         result_id: String,
     },
 }
+
+#[derive(Subcommand)]
+enum CreateCommands {
+    /// Create a record from JSON input
+    #[command(after_help = "\
+EXAMPLES:
+  # Create from stdin
+  cat record.json | runbox create record
+
+  # Create from file
+  runbox create record --from-file record.json
+
+  # Minimal record (ID auto-generated)
+  echo '{\"command\":{\"argv\":[\"echo\"],\"cwd\":\".\"}}' | runbox create record")]
+    Record {
+        /// Read JSON from file instead of stdin
+        #[arg(long, value_name = "FILE")]
+        from_file: Option<String>,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let storage = if let Ok(home) = std::env::var("RUNBOX_HOME") {
@@ -989,6 +1052,9 @@ fn main() -> Result<()> {
             verbose,
         ),
         Commands::Validate { path } => cmd_validate(&path),
+        Commands::Create { command } => match command {
+            CreateCommands::Record { from_file } => cmd_create_record(&storage, from_file),
+        },
         Commands::Daemon { command } => match command {
             DaemonCommands::Start => cmd_daemon_start(),
             DaemonCommands::Stop => cmd_daemon_stop(),
@@ -2693,5 +2759,129 @@ fn cmd_validate(path: &str) -> Result<()> {
     let validator = Validator::new()?;
     let validation_type = validator.validate_file(Path::new(path))?;
     println!("Valid {} file: {}", validation_type, path);
+    Ok(())
+}
+
+/// Create a record from JSON input
+fn cmd_create_record(storage: &Storage, from_file: Option<String>) -> Result<()> {
+    use std::io::Read;
+    
+    // Read JSON from file or stdin
+    let json_str = if let Some(file_path) = from_file {
+        std::fs::read_to_string(&file_path)
+            .with_context(|| format!("Failed to read file: {}", file_path))?
+    } else {
+        let mut buffer = String::new();
+        std::io::stdin().read_to_string(&mut buffer)
+            .context("Failed to read from stdin")?;
+        buffer
+    };
+    
+    // Parse JSON
+    let json: serde_json::Value = serde_json::from_str(&json_str)
+        .context("Invalid JSON")?;
+    
+    // Extract or generate record_id
+    let record_id = json.get("id")
+        .or_else(|| json.get("record_id"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| format!("rec_{}", uuid::Uuid::new_v4()));
+    
+    // Extract git_state (optional but recommended)
+    let git_state = if let Some(gs) = json.get("git_state") {
+        RecordGitState {
+            repo_url: gs.get("repo_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            commit: gs.get("commit")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&"0".repeat(40))
+                .to_string(),
+            patch_ref: gs.get("patch_ref")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        }
+    } else {
+        // Try to capture current git context
+        match GitContext::from_current_dir() {
+            Ok(ctx) => RecordGitState {
+                repo_url: ctx.get_remote_url().unwrap_or("unknown".to_string()),
+                commit: ctx.get_head_commit().unwrap_or("0".repeat(40)),
+                patch_ref: None,
+            },
+            Err(_) => RecordGitState {
+                repo_url: "unknown".to_string(),
+                commit: "0".repeat(40),
+                patch_ref: None,
+            },
+        }
+    };
+    
+    // Extract command (required)
+    let command = json.get("command")
+        .context("Missing 'command' field")?;
+    let argv: Vec<String> = command.get("argv")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(String::from).collect())
+        .unwrap_or_default();
+    if argv.is_empty() {
+        bail!("Command argv must not be empty");
+    }
+    let cwd = command.get("cwd")
+        .and_then(|v| v.as_str())
+        .unwrap_or(".")
+        .to_string();
+    let env = command.get("env")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect())
+        .unwrap_or_default();
+    
+    let record_command = RecordCommand { argv, cwd, env };
+    
+    // Create the record
+    let mut record = Record::with_id(record_id.clone(), git_state, record_command);
+    
+    // Extract optional fields
+    if let Some(exit_code) = json.get("exit_code").and_then(|v| v.as_i64()) {
+        record.exit_code = Some(exit_code as i32);
+    }
+    if let Some(started_at) = json.get("started_at").and_then(|v| v.as_str()) {
+        record.started_at = chrono::DateTime::parse_from_rfc3339(started_at)
+            .ok()
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+    }
+    if let Some(ended_at) = json.get("ended_at").and_then(|v| v.as_str()) {
+        record.ended_at = chrono::DateTime::parse_from_rfc3339(ended_at)
+            .ok()
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+    }
+    if let Some(tags) = json.get("tags").and_then(|v| v.as_array()) {
+        record.tags = tags.iter().filter_map(|v| v.as_str()).map(String::from).collect();
+    }
+    if let Some(source) = json.get("source").and_then(|v| v.as_str()) {
+        record.source = source.to_string();
+    } else {
+        record.source = "external".to_string();
+    }
+    if let Some(log_ref) = json.get("log_ref").and_then(|v| v.as_str()) {
+        record.log_ref = Some(log_ref.to_string());
+    }
+    
+    // Validate the record
+    record.validate().context("Record validation failed")?;
+    
+    // Save the record
+    let saved_path = storage.save_record(&record)?;
+    
+    println!("Created record: {}", record.record_id);
+    println!("  Short ID: {}", record.short_id());
+    println!("  Command:  {:?}", record.command.argv);
+    println!("  Source:   {}", record.source);
+    println!("  Path:     {}", saved_path.display());
+    
     Ok(())
 }
