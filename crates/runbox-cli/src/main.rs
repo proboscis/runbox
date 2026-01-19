@@ -297,6 +297,24 @@ RELATED COMMANDS:
         /// Show additional details
         #[arg(short, long)]
         verbose: bool,
+        /// SQL WHERE clause for filtering (e.g., "exit_code = 0")
+        #[arg(long, value_name = "CONDITION")]
+        where_clause: Option<String>,
+        /// Show only local (.runbox/) items
+        #[arg(long, conflicts_with = "global")]
+        local: bool,
+        /// Show only global items
+        #[arg(long, conflicts_with = "local")]
+        global: bool,
+    },
+    /// Execute a raw SQL query against the index
+    Query {
+        /// SQL query to execute
+        #[arg(required = true)]
+        sql: String,
+        /// Output as JSON array
+        #[arg(long)]
+        json: bool,
     },
     /// Stop a running process
     #[command(after_help = "\
@@ -986,7 +1004,11 @@ fn main() -> Result<()> {
             json,
             short,
             verbose,
-        } => cmd_list(&storage, r#type, playlist, repo, all_repos, tag, limit, json, short, verbose),
+            where_clause,
+            local,
+            global,
+        } => cmd_list(&storage, r#type, playlist, repo, all_repos, tag, limit, json, short, verbose, where_clause, local, global),
+        Commands::Query { sql, json } => cmd_query(&storage, &sql, json),
         Commands::Stop { run_id, force } => cmd_stop(&storage, &run_id, force),
         Commands::Logs {
             run_id,
@@ -1726,11 +1748,14 @@ fn cmd_list(
     playlist_filter: Option<String>,
     repo_arg: Option<String>,
     all_repos: bool,
-    _tag_filter: Vec<String>,  // Placeholder for future
+    _tag_filter: Vec<String>,
     limit: usize,
     json_output: bool,
     short_output: bool,
     verbose: bool,
+    _where_clause: Option<String>,
+    _local: bool,
+    _global: bool,
 ) -> Result<()> {
     use runbox_core::RunnableType;
     
@@ -1907,6 +1932,63 @@ fn cmd_list(
     Ok(())
 }
 
+
+// === Query Command ===
+fn cmd_query(storage: &Storage, sql: &str, json_output: bool) -> Result<()> {
+    use runbox_core::Index;
+    
+    // Open the index database
+    let db_path = storage.state_dir().join("runbox.db");
+    let index = Index::open(&db_path)
+        .with_context(|| "Failed to open index database. Run 'runbox list' first to build the index.")?;
+    
+    // Execute the query
+    let results = index.query_raw(sql)
+        .with_context(|| format!("Failed to execute query: {}", sql))?;
+    
+    if results.is_empty() {
+        if json_output {
+            println!("[]");
+        } else {
+            println!("No results.");
+        }
+        return Ok(());
+    }
+    
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    } else {
+        // Table output - extract column names from first result
+        if let Some(first) = results.first() {
+            if let serde_json::Value::Object(obj) = first {
+                let cols: Vec<_> = obj.keys().collect();
+                
+                // Print header
+                let header: Vec<_> = cols.iter().map(|c| format!("{:<20}", c)).collect();
+                println!("{}", header.join(" "));
+                println!("{}", "-".repeat(cols.len() * 21));
+                
+                // Print rows
+                for row in &results {
+                    if let serde_json::Value::Object(obj) = row {
+                        let values: Vec<_> = cols.iter().map(|c| {
+                            let v = obj.get(*c).unwrap_or(&serde_json::Value::Null);
+                            let s = match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                serde_json::Value::Null => "NULL".to_string(),
+                                _ => v.to_string(),
+                            };
+                            format!("{:<20}", truncate_string(&s, 20))
+                        }).collect();
+                        println!("{}", values.join(" "));
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(())
+}
 // === Stop Command ===
 fn cmd_stop(storage: &Storage, run_id: &str, force: bool) -> Result<()> {
     let full_run_id = resolve_run_id(storage, run_id)?;
