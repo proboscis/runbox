@@ -6,7 +6,7 @@ use runbox_core::{
     default_pid_path, default_socket_path, short_id, BindingResolver,
     CodeState, ConfigResolver, DaemonClient, Exec, GitContext, LogRef, Playlist, PlaylistItem,
     Run, Runnable, RunStatus, RunTemplate, RuntimeRegistry, Storage, Timeline, Validator,
-    VerboseLogger, Record, RecordGitState, RecordCommand,
+    VerboseLogger, Record, RecordGitState, RecordCommand, Index,
 };
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -1753,9 +1753,9 @@ fn cmd_list(
     json_output: bool,
     short_output: bool,
     verbose: bool,
-    _where_clause: Option<String>,
-    _local: bool,
-    _global: bool,
+    where_clause: Option<String>,
+    local: bool,
+    global: bool,
 ) -> Result<()> {
     use runbox_core::RunnableType;
     
@@ -1793,6 +1793,60 @@ fn cmd_list(
         }
     }
     
+    // Handle --where-clause: use Index query mode
+    if let Some(ref where_cond) = where_clause {
+        let db_path = storage.state_dir().join("runbox.db");
+        let index = Index::open(&db_path)
+            .with_context(|| "Failed to open index database. Run 'runbox list' first to build the index.")?;
+        
+        let results = index.query(None, Some(where_cond), limit)?;
+        
+        if results.is_empty() {
+            if json_output {
+                println!("[]");
+            } else if !short_output {
+                println!("No results matching WHERE clause.");
+            }
+            return Ok(());
+        }
+        
+        // Output indexed entities
+        if json_output {
+            let items: Vec<_> = results.iter().map(|e| {
+                serde_json::json!({
+                    "short_id": &e.id[..std::cmp::min(8, e.id.len())],
+                    "type": e.entity_type.to_string(),
+                    "name": e.name,
+                    "exit_code": e.exit_code,
+                    "tags": e.tags,
+                })
+            }).collect();
+            println!("{}", serde_json::to_string_pretty(&items)?);
+        } else if short_output {
+            for e in &results {
+                println!("{}", &e.id[..std::cmp::min(8, e.id.len())]);
+            }
+        } else {
+            println!("{:<10} {:<10} {:<24} {:<8} {}", "SHORT", "TYPE", "NAME", "EXIT", "TAGS");
+            println!("{}", "-".repeat(70));
+            for e in &results {
+                let short = &e.id[..std::cmp::min(8, e.id.len())];
+                let name = e.name.as_deref().unwrap_or("-");
+                let name_trunc = truncate_string(name, 24);
+                let exit = e.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string());
+                let tags = if e.tags.is_empty() { "-".to_string() } else { e.tags.join(",") };
+                println!("{:<10} {:<10} {:<24} {:<8} {}", short, e.entity_type, name_trunc, exit, truncate_string(&tags, 20));
+            }
+        }
+        
+        return Ok(());
+    }
+
+    // Handle --local/--global scope filtering (placeholder - not yet implemented)
+    if local || global {
+        eprintln!("Warning: --local and --global filters are not yet fully implemented");
+    }
+
     // Get all runnables
     let all_runnables = storage.list_all_runnables(limit * 2)?; // Get more to account for filtering
     
