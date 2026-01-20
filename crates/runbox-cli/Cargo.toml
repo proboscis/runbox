@@ -20,6 +20,10 @@ dirs = "5"
 dialoguer = "0.11"
 chrono = { version = "0.4", features = ["serde"] }
 log = "0.4"
+# TUI dependencies - use older versions for Rust 1.87 compatibility
+ratatui = "0.26"
+crossterm = "0.27"
+tokio = { version = "1", features = ["full"] }
 
 [features]
 # Enable tests that require tmux to be installed
