@@ -3,10 +3,10 @@ use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use dialoguer::{theme::ColorfulTheme, Input};
 use runbox_core::{
-    default_pid_path, default_socket_path, short_id, BindingResolver,
-    CodeState, ConfigResolver, DaemonClient, Exec, GitContext, LogRef, Playlist, PlaylistItem,
-    Run, Runnable, RunStatus, RunTemplate, RuntimeRegistry, Storage, Timeline, Validator,
-    VerboseLogger, Record, RecordGitState, RecordCommand, Index,
+    default_pid_path, default_socket_path, find_skill_by_name, find_skills, short_id,
+    BindingResolver, CodeState, ConfigResolver, DaemonClient, Exec, GitContext, Index, LogRef,
+    Platform, Playlist, PlaylistItem, Record, RecordCommand, RecordGitState, Run, RunStatus,
+    RunTemplate, Runnable, RuntimeRegistry, Skill, Storage, Timeline, Validator, VerboseLogger,
 };
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -677,6 +677,39 @@ RELATED COMMANDS:
     },
     #[command(after_help = "\
 EXAMPLES:
+  # List available skills
+  runbox skill list
+
+  # Show skill details
+  runbox skill show runbox-cli
+
+  # Export a skill with installation guides
+  runbox skill export runbox-cli --output ./my-skill
+
+OUTPUT STRUCTURE:
+  my-skill/
+  ├── SKILL.md              # The skill content
+  ├── INSTALL.md            # Unified install guide
+  ├── install/
+  │   ├── claude-code.md
+  │   ├── opencode.md
+  │   ├── gemini.md
+  │   ├── codex.md
+  │   └── cursor.md
+  └── install.sh            # Auto-install script
+
+SUPPORTED PLATFORMS:
+  - Claude Code  (~/.claude/skills/)
+  - OpenCode     (~/.opencode/skills/)
+  - Gemini CLI   (project GEMINI.md)
+  - Codex        (AGENTS.md)
+  - Cursor       (~/.cursor/rules/)")]
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommands,
+    },
+    #[command(after_help = "\
+EXAMPLES:
   # Show the complete tutorial
   runbox tutorial
   # Pipe to a pager for easier reading
@@ -694,7 +727,6 @@ CONTENTS:
   - Configuration
   - Troubleshooting
   - Examples")]
-    /// Display the full tutorial in the terminal
     Tutorial,
 }
 #[derive(Subcommand)]
@@ -940,9 +972,21 @@ EXAMPLES:
   # Minimal record (ID auto-generated)
   echo '{\"command\":{\"argv\":[\"echo\"],\"cwd\":\".\"}}' | runbox create record")]
     Record {
-        /// Read JSON from file instead of stdin
         #[arg(long, value_name = "FILE")]
         from_file: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillCommands {
+    List,
+    Show {
+        skill_name: String,
+    },
+    Export {
+        skill_name: String,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -1007,7 +1051,21 @@ fn main() -> Result<()> {
             where_clause,
             local,
             global,
-        } => cmd_list(&storage, r#type, playlist, repo, all_repos, tag, limit, json, short, verbose, where_clause, local, global),
+        } => cmd_list(
+            &storage,
+            r#type,
+            playlist,
+            repo,
+            all_repos,
+            tag,
+            limit,
+            json,
+            short,
+            verbose,
+            where_clause,
+            local,
+            global,
+        ),
         Commands::Query { sql, json } => cmd_query(&storage, &sql, json),
         Commands::Stop { run_id, force } => cmd_stop(&storage, &run_id, force),
         Commands::Logs {
@@ -1043,7 +1101,14 @@ fn main() -> Result<()> {
                 binding,
                 runtime,
                 dry_run,
-            } => cmd_playlist_run(&storage, &selector, item.as_deref(), binding, runtime, dry_run),
+            } => cmd_playlist_run(
+                &storage,
+                &selector,
+                item.as_deref(),
+                binding,
+                runtime,
+                dry_run,
+            ),
         },
         Commands::Result { command } => match command {
             ResultCommands::List { limit } => cmd_result_list(&storage, limit),
@@ -1082,6 +1147,11 @@ fn main() -> Result<()> {
             DaemonCommands::Stop => cmd_daemon_stop(),
             DaemonCommands::Status => cmd_daemon_status(),
             DaemonCommands::Ping => cmd_daemon_ping(),
+        },
+        Commands::Skill { command } => match command {
+            SkillCommands::List => cmd_skill_list(),
+            SkillCommands::Show { skill_name } => cmd_skill_show(&skill_name),
+            SkillCommands::Export { skill_name, output } => cmd_skill_export(&skill_name, output),
         },
         Commands::Tutorial => cmd_tutorial(),
     }
@@ -1392,38 +1462,66 @@ fn cmd_run_direct(
 // === Unified Run Command ===
 
 /// Display a box showing what is being run
-fn display_run_info(runnable: &Runnable, template: Option<&RunTemplate>, run: Option<&runbox_core::Run>) {
+fn display_run_info(
+    runnable: &Runnable,
+    template: Option<&RunTemplate>,
+    run: Option<&runbox_core::Run>,
+) {
     let width = 55;
     let border = "─".repeat(width);
-    
+
     println!("┌{}┐", border);
-    
+
     match runnable {
         Runnable::Template(id) => {
             println!("│ {:<width$}│", format!("TEMPLATE: {}", id), width = width);
             if let Some(tpl) = template {
-                println!("│ {:<width$}│", format!("Name: {}", tpl.name), width = width);
+                println!(
+                    "│ {:<width$}│",
+                    format!("Name: {}", tpl.name),
+                    width = width
+                );
             }
         }
         Runnable::Replay(id) => {
             println!("│ {:<width$}│", format!("REPLAY: {}", id), width = width);
             if let Some(r) = run {
                 if let Some(created) = r.timeline.created_at {
-                    println!("│ {:<width$}│", format!("Original: {}", created.format("%Y-%m-%d %H:%M:%S")), width = width);
+                    println!(
+                        "│ {:<width$}│",
+                        format!("Original: {}", created.format("%Y-%m-%d %H:%M:%S")),
+                        width = width
+                    );
                 }
             }
         }
-        Runnable::PlaylistItem { playlist_id, index, label, .. } => {
-            let label_str = label.as_ref().map(|l| format!(" {:?}", l)).unwrap_or_default();
-            println!("│ {:<width$}│", format!("PLAYLIST ITEM: {}[{}]{}", playlist_id, index, label_str), width = width);
+        Runnable::PlaylistItem {
+            playlist_id,
+            index,
+            label,
+            ..
+        } => {
+            let label_str = label
+                .as_ref()
+                .map(|l| format!(" {:?}", l))
+                .unwrap_or_default();
+            println!(
+                "│ {:<width$}│",
+                format!("PLAYLIST ITEM: {}[{}]{}", playlist_id, index, label_str),
+                width = width
+            );
             if let Some(tpl) = template {
-                println!("│ {:<width$}│", format!("Template: {}", tpl.template_id), width = width);
+                println!(
+                    "│ {:<width$}│",
+                    format!("Template: {}", tpl.template_id),
+                    width = width
+                );
             }
         }
     }
-    
+
     println!("├{}┤", border);
-    
+
     if let Some(tpl) = template {
         let cmd = tpl.exec.argv.join(" ");
         let cmd_display = if cmd.len() > width - 10 {
@@ -1431,8 +1529,16 @@ fn display_run_info(runnable: &Runnable, template: Option<&RunTemplate>, run: Op
         } else {
             cmd
         };
-        println!("│ {:<width$}│", format!("Command: {}", cmd_display), width = width);
-        println!("│ {:<width$}│", format!("Cwd:     {}", tpl.exec.cwd), width = width);
+        println!(
+            "│ {:<width$}│",
+            format!("Command: {}", cmd_display),
+            width = width
+        );
+        println!(
+            "│ {:<width$}│",
+            format!("Cwd:     {}", tpl.exec.cwd),
+            width = width
+        );
     } else if let Some(r) = run {
         let cmd = r.exec.argv.join(" ");
         let cmd_display = if cmd.len() > width - 10 {
@@ -1440,13 +1546,31 @@ fn display_run_info(runnable: &Runnable, template: Option<&RunTemplate>, run: Op
         } else {
             cmd
         };
-        println!("│ {:<width$}│", format!("Command: {}", cmd_display), width = width);
-        println!("│ {:<width$}│", format!("Cwd:     {}", r.exec.cwd), width = width);
+        println!(
+            "│ {:<width$}│",
+            format!("Command: {}", cmd_display),
+            width = width
+        );
+        println!(
+            "│ {:<width$}│",
+            format!("Cwd:     {}", r.exec.cwd),
+            width = width
+        );
         if !r.code_state.repo_url.is_empty() {
-            println!("│ {:<width$}│", format!("Commit:  {}", r.code_state.base_commit.get(..8).unwrap_or(&r.code_state.base_commit)), width = width);
+            println!(
+                "│ {:<width$}│",
+                format!(
+                    "Commit:  {}",
+                    r.code_state
+                        .base_commit
+                        .get(..8)
+                        .unwrap_or(&r.code_state.base_commit)
+                ),
+                width = width
+            );
         }
     }
-    
+
     println!("└{}┘", border);
 }
 
@@ -1460,7 +1584,7 @@ fn cmd_run_unified(
 ) -> Result<()> {
     // Resolve the short ID to a Runnable
     let runnable = storage.resolve_runnable(short_id, 100)?;
-    
+
     match &runnable {
         Runnable::Template(template_id) => {
             // Load template for display
@@ -1476,7 +1600,12 @@ fn cmd_run_unified(
             println!();
             cmd_run_replay(storage, run_id, runtime, dry_run)
         }
-        Runnable::PlaylistItem { template_id, playlist_id, index, label } => {
+        Runnable::PlaylistItem {
+            template_id,
+            playlist_id,
+            index,
+            label,
+        } => {
             // Load template for display
             let template = storage.load_template(template_id)?;
             let runnable_with_info = Runnable::PlaylistItem {
@@ -1499,11 +1628,10 @@ fn cmd_run_replay(
     runtime: RuntimeType,
     dry_run: bool,
 ) -> Result<()> {
-    
     // Resolve and load the original run
     let resolved_id = storage.resolve_run_id(run_id)?;
     let original_run = storage.load_run(&resolved_id)?;
-    
+
     if dry_run {
         println!("Dry run - would replay:");
         println!("  Original run: {}", original_run.run_id);
@@ -1515,7 +1643,7 @@ fn cmd_run_replay(
         }
         return Ok(());
     }
-    
+
     // Create a new run with the same exec and code_state
     let new_run_id = format!("run_{}", uuid::Uuid::new_v4());
     let exec = Exec {
@@ -1529,18 +1657,18 @@ fn cmd_run_replay(
         base_commit: original_run.code_state.base_commit.clone(),
         patch: original_run.code_state.patch.clone(),
     };
-    
+
     let mut run = Run::new(exec, code_state);
     run.run_id = new_run_id;
     run.validate()?;
-    
+
     // Execute the run
     let registry = RuntimeRegistry::new();
     let runtime_name = runtime.to_string();
     let adapter = registry
         .get(&runtime_name)
         .context(format!("Unknown runtime: {}", runtime_name))?;
-    
+
     let log_path = storage.log_path(&run.run_id);
     run.runtime = runtime_name.clone();
     run.log_ref = Some(LogRef {
@@ -1552,22 +1680,22 @@ fn cmd_run_replay(
         ended_at: None,
     };
     run.status = RunStatus::Pending;
-    
+
     storage.save_run(&run)?;
-    
+
     println!("Starting replay: {}", run.run_id);
     println!("Original run: {}", original_run.run_id);
     println!("Runtime: {}", runtime_name);
     println!("Command: {:?}", run.exec.argv);
-    
+
     let handle = adapter.spawn(&run.exec, &run.run_id, &log_path)?;
-    
+
     let saved = storage.save_run_if_status_with(&run.run_id, &[RunStatus::Pending], |current| {
         current.handle = Some(handle.clone());
         current.status = RunStatus::Running;
         current.timeline.started_at = Some(Utc::now());
     })?;
-    
+
     if !saved {
         let _ = storage.save_run_if_status_with(
             &run.run_id,
@@ -1580,15 +1708,15 @@ fn cmd_run_replay(
         );
         log::debug!("Run {} already exited - daemon captured status", run.run_id);
     }
-    
+
     println!("Run started: {}", run.run_id);
     println!("Short ID: {}", run.short_id());
     println!("Logs: {}", log_path.display());
-    
+
     if matches!(runtime, RuntimeType::Tmux) {
         println!("Attach with: runbox attach {}", run.short_id());
     }
-    
+
     Ok(())
 }
 
@@ -1651,11 +1779,11 @@ fn detect_current_repo() -> Option<String> {
         .args(["remote", "get-url", "origin"])
         .output()
         .ok()?;
-    
+
     if !output.status.success() {
         return None;
     }
-    
+
     let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Some(normalize_repo_url(&url))
 }
@@ -1668,7 +1796,7 @@ fn normalize_repo_url(url: &str) -> String {
     // https://github.com/proboscis/runbox.git → proboscis/runbox
     // https://github.com/proboscis/runbox → proboscis/runbox
     let url = url.trim_end_matches(".git");
-    
+
     // Check for SSH format: git@host:org/repo
     // SSH format has colon NOT followed by // and no :// in the URL before that colon
     if let Some(idx) = url.rfind(':') {
@@ -1679,14 +1807,14 @@ fn normalize_repo_url(url: &str) -> String {
             return after_colon.to_string();
         }
     }
-    
+
     // HTTPS format: https://github.com/org/repo
     // Split by '/' and take last two components
     let parts: Vec<&str> = url.rsplitn(3, '/').collect();
     if parts.len() >= 2 {
         return format!("{}/{}", parts[1], parts[0]);
     }
-    
+
     url.to_string()
 }
 
@@ -1698,21 +1826,21 @@ fn repo_matches(repo_url: &Option<String>, filter: &str) -> bool {
     let Some(url) = repo_url else {
         return false;
     };
-    
+
     let normalized = normalize_repo_url(url);
-    
+
     // Full match
     if normalized == filter {
         return true;
     }
-    
+
     // Partial match (repo name only)
     if let Some(repo_name) = normalized.split('/').last() {
         if repo_name == filter {
             return true;
         }
     }
-    
+
     false
 }
 
@@ -1728,7 +1856,6 @@ struct RunnableInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     repo_url: Option<String>,
 }
-
 
 /// Safely truncate a string to max_chars characters, adding "..." if truncated.
 /// This is UTF-8 safe and won't panic on multi-byte characters.
@@ -1758,7 +1885,7 @@ fn cmd_list(
     global: bool,
 ) -> Result<()> {
     use runbox_core::RunnableType;
-    
+
     // Parse type filter
     let type_filter: Option<RunnableType> = if let Some(ref t) = type_filter {
         Some(t.parse().map_err(|e: String| anyhow::anyhow!("{}", e))?)
@@ -1768,7 +1895,7 @@ fn cmd_list(
     } else {
         None
     };
-    
+
     // Determine repo filter
     let repo_filter: Option<String> = if all_repos {
         // Explicitly show all repos
@@ -1784,23 +1911,27 @@ fn cmd_list(
         // Auto-detect from current directory
         detect_current_repo()
     };
-    
+
     // Show hint about repo filtering
     let show_repo_hint = !all_repos && repo_filter.is_some() && !json_output && !short_output;
     if show_repo_hint {
         if let Some(ref repo) = repo_filter {
-            eprintln!("Showing runnables for: {} (use --all-repos to show all)\n", repo);
+            eprintln!(
+                "Showing runnables for: {} (use --all-repos to show all)\n",
+                repo
+            );
         }
     }
-    
+
     // Handle --where-clause: use Index query mode
     if let Some(ref where_cond) = where_clause {
         let db_path = storage.state_dir().join("runbox.db");
-        let index = Index::open(&db_path)
-            .with_context(|| "Failed to open index database. Run 'runbox list' first to build the index.")?;
-        
+        let index = Index::open(&db_path).with_context(|| {
+            "Failed to open index database. Run 'runbox list' first to build the index."
+        })?;
+
         let results = index.query(None, Some(where_cond), limit)?;
-        
+
         if results.is_empty() {
             if json_output {
                 println!("[]");
@@ -1809,36 +1940,56 @@ fn cmd_list(
             }
             return Ok(());
         }
-        
+
         // Output indexed entities
         if json_output {
-            let items: Vec<_> = results.iter().map(|e| {
-                serde_json::json!({
-                    "short_id": &e.id[..std::cmp::min(8, e.id.len())],
-                    "type": e.entity_type.to_string(),
-                    "name": e.name,
-                    "exit_code": e.exit_code,
-                    "tags": e.tags,
+            let items: Vec<_> = results
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "short_id": &e.id[..std::cmp::min(8, e.id.len())],
+                        "type": e.entity_type.to_string(),
+                        "name": e.name,
+                        "exit_code": e.exit_code,
+                        "tags": e.tags,
+                    })
                 })
-            }).collect();
+                .collect();
             println!("{}", serde_json::to_string_pretty(&items)?);
         } else if short_output {
             for e in &results {
                 println!("{}", &e.id[..std::cmp::min(8, e.id.len())]);
             }
         } else {
-            println!("{:<10} {:<10} {:<24} {:<8} {}", "SHORT", "TYPE", "NAME", "EXIT", "TAGS");
+            println!(
+                "{:<10} {:<10} {:<24} {:<8} {}",
+                "SHORT", "TYPE", "NAME", "EXIT", "TAGS"
+            );
             println!("{}", "-".repeat(70));
             for e in &results {
                 let short = &e.id[..std::cmp::min(8, e.id.len())];
                 let name = e.name.as_deref().unwrap_or("-");
                 let name_trunc = truncate_string(name, 24);
-                let exit = e.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string());
-                let tags = if e.tags.is_empty() { "-".to_string() } else { e.tags.join(",") };
-                println!("{:<10} {:<10} {:<24} {:<8} {}", short, e.entity_type, name_trunc, exit, truncate_string(&tags, 20));
+                let exit = e
+                    .exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let tags = if e.tags.is_empty() {
+                    "-".to_string()
+                } else {
+                    e.tags.join(",")
+                };
+                println!(
+                    "{:<10} {:<10} {:<24} {:<8} {}",
+                    short,
+                    e.entity_type,
+                    name_trunc,
+                    exit,
+                    truncate_string(&tags, 20)
+                );
             }
         }
-        
+
         return Ok(());
     }
 
@@ -1849,7 +2000,7 @@ fn cmd_list(
 
     // Get all runnables
     let all_runnables = storage.list_all_runnables(limit * 2)?; // Get more to account for filtering
-    
+
     // Apply filters
     let filtered: Vec<_> = all_runnables
         .into_iter()
@@ -1860,7 +2011,7 @@ fn cmd_list(
                     return false;
                 }
             }
-            
+
             // Playlist filter
             if let Some(ref pl) = playlist_filter {
                 match r.playlist_id() {
@@ -1873,7 +2024,7 @@ fn cmd_list(
                     None => return false,
                 }
             }
-            
+
             // Repo filter
             if let Some(ref repo) = repo_filter {
                 let runnable_repo = storage.get_runnable_repo_url(r);
@@ -1881,12 +2032,12 @@ fn cmd_list(
                     return false;
                 }
             }
-            
+
             true
         })
         .take(limit)
         .collect();
-    
+
     if filtered.is_empty() {
         if json_output {
             println!("[]");
@@ -1895,7 +2046,7 @@ fn cmd_list(
         }
         return Ok(());
     }
-    
+
     // Collect info for output
     let infos: Vec<RunnableInfo> = filtered
         .iter()
@@ -1915,7 +2066,7 @@ fn cmd_list(
             }
         })
         .collect();
-    
+
     // Output
     if json_output {
         println!("{}", serde_json::to_string_pretty(&infos)?);
@@ -1937,10 +2088,10 @@ fn cmd_list(
             );
         }
         println!("{}", "─".repeat(if verbose { 90 } else { 70 }));
-        
+
         for info in &infos {
             let name_truncated = truncate_string(&info.name, 24);
-            
+
             if verbose {
                 let repo_display = info.repo_url.as_deref().unwrap_or("-");
                 let repo_truncated = truncate_string(repo_display, 20);
@@ -1956,50 +2107,48 @@ fn cmd_list(
             } else {
                 println!(
                     "{:<10} {:<10} {:<16} {:<24} {}",
-                    info.short_id,
-                    info.runnable_type,
-                    info.source,
-                    name_truncated,
-                    info.tags
+                    info.short_id, info.runnable_type, info.source, name_truncated, info.tags
                 );
             }
         }
-        
+
         // Summary line
-        let mut type_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        let mut type_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
         for r in &filtered {
             *type_counts.entry(r.type_label()).or_insert(0) += 1;
         }
-        
+
         let summary_parts: Vec<String> = type_counts
             .iter()
             .map(|(t, c)| format!("{} {}s", c, t))
             .collect();
-        
+
         println!(
             "\n{} runnables ({})",
             filtered.len(),
             summary_parts.join(", ")
         );
     }
-    
+
     Ok(())
 }
-
 
 // === Query Command ===
 fn cmd_query(storage: &Storage, sql: &str, json_output: bool) -> Result<()> {
     use runbox_core::Index;
-    
+
     // Open the index database
     let db_path = storage.state_dir().join("runbox.db");
-    let index = Index::open(&db_path)
-        .with_context(|| "Failed to open index database. Run 'runbox list' first to build the index.")?;
-    
+    let index = Index::open(&db_path).with_context(|| {
+        "Failed to open index database. Run 'runbox list' first to build the index."
+    })?;
+
     // Execute the query
-    let results = index.query_raw(sql)
+    let results = index
+        .query_raw(sql)
         .with_context(|| format!("Failed to execute query: {}", sql))?;
-    
+
     if results.is_empty() {
         if json_output {
             println!("[]");
@@ -2008,7 +2157,7 @@ fn cmd_query(storage: &Storage, sql: &str, json_output: bool) -> Result<()> {
         }
         return Ok(());
     }
-    
+
     if json_output {
         println!("{}", serde_json::to_string_pretty(&results)?);
     } else {
@@ -2016,31 +2165,34 @@ fn cmd_query(storage: &Storage, sql: &str, json_output: bool) -> Result<()> {
         if let Some(first) = results.first() {
             if let serde_json::Value::Object(obj) = first {
                 let cols: Vec<_> = obj.keys().collect();
-                
+
                 // Print header
                 let header: Vec<_> = cols.iter().map(|c| format!("{:<20}", c)).collect();
                 println!("{}", header.join(" "));
                 println!("{}", "-".repeat(cols.len() * 21));
-                
+
                 // Print rows
                 for row in &results {
                     if let serde_json::Value::Object(obj) = row {
-                        let values: Vec<_> = cols.iter().map(|c| {
-                            let v = obj.get(*c).unwrap_or(&serde_json::Value::Null);
-                            let s = match v {
-                                serde_json::Value::String(s) => s.clone(),
-                                serde_json::Value::Null => "NULL".to_string(),
-                                _ => v.to_string(),
-                            };
-                            format!("{:<20}", truncate_string(&s, 20))
-                        }).collect();
+                        let values: Vec<_> = cols
+                            .iter()
+                            .map(|c| {
+                                let v = obj.get(*c).unwrap_or(&serde_json::Value::Null);
+                                let s = match v {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    serde_json::Value::Null => "NULL".to_string(),
+                                    _ => v.to_string(),
+                                };
+                                format!("{:<20}", truncate_string(&s, 20))
+                            })
+                            .collect();
                         println!("{}", values.join(" "));
                     }
                 }
             }
         }
     }
-    
+
     Ok(())
 }
 // === Stop Command ===
@@ -2306,7 +2458,11 @@ fn cmd_playlist_list(storage: &Storage) -> Result<()> {
     }
     Ok(())
 }
-fn cmd_playlist_show(storage: &Storage, playlist_id: Option<&str>, json_output: bool) -> Result<()> {
+fn cmd_playlist_show(
+    storage: &Storage,
+    playlist_id: Option<&str>,
+    json_output: bool,
+) -> Result<()> {
     match playlist_id {
         Some(id) => {
             // Show specific playlist
@@ -2484,15 +2640,13 @@ fn cmd_playlist_run(
             let resolved_playlist_id = storage.resolve_playlist_id(selector)?;
             let playlist = storage.load_playlist(&resolved_playlist_id)?;
 
-            let (idx, found_item) = playlist
-                .resolve_item(item_sel)
-                .with_context(|| {
-                    format!(
-                        "Item '{}' not found in playlist '{}'. Use index (0, 1, ...) or short ID.",
-                        item_sel,
-                        short_id(&resolved_playlist_id)
-                    )
-                })?;
+            let (idx, found_item) = playlist.resolve_item(item_sel).with_context(|| {
+                format!(
+                    "Item '{}' not found in playlist '{}'. Use index (0, 1, ...) or short ID.",
+                    item_sel,
+                    short_id(&resolved_playlist_id)
+                )
+            })?;
 
             let item = found_item.clone();
             (playlist, idx, item)
@@ -2901,41 +3055,45 @@ fn cmd_validate(path: &str) -> Result<()> {
 /// Create a record from JSON input
 fn cmd_create_record(storage: &Storage, from_file: Option<String>) -> Result<()> {
     use std::io::Read;
-    
+
     // Read JSON from file or stdin
     let json_str = if let Some(file_path) = from_file {
         std::fs::read_to_string(&file_path)
             .with_context(|| format!("Failed to read file: {}", file_path))?
     } else {
         let mut buffer = String::new();
-        std::io::stdin().read_to_string(&mut buffer)
+        std::io::stdin()
+            .read_to_string(&mut buffer)
             .context("Failed to read from stdin")?;
         buffer
     };
-    
+
     // Parse JSON
-    let json: serde_json::Value = serde_json::from_str(&json_str)
-        .context("Invalid JSON")?;
-    
+    let json: serde_json::Value = serde_json::from_str(&json_str).context("Invalid JSON")?;
+
     // Extract or generate record_id
-    let record_id = json.get("id")
+    let record_id = json
+        .get("id")
         .or_else(|| json.get("record_id"))
         .and_then(|v| v.as_str())
         .map(String::from)
         .unwrap_or_else(|| format!("rec_{}", uuid::Uuid::new_v4()));
-    
+
     // Extract git_state (optional but recommended)
     let git_state = if let Some(gs) = json.get("git_state") {
         RecordGitState {
-            repo_url: gs.get("repo_url")
+            repo_url: gs
+                .get("repo_url")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
                 .to_string(),
-            commit: gs.get("commit")
+            commit: gs
+                .get("commit")
                 .and_then(|v| v.as_str())
                 .unwrap_or(&"0".repeat(40))
                 .to_string(),
-            patch_ref: gs.get("patch_ref")
+            patch_ref: gs
+                .get("patch_ref")
                 .and_then(|v| v.as_str())
                 .map(String::from),
         }
@@ -2954,33 +3112,42 @@ fn cmd_create_record(storage: &Storage, from_file: Option<String>) -> Result<()>
             },
         }
     };
-    
+
     // Extract command (required)
-    let command = json.get("command")
-        .context("Missing 'command' field")?;
-    let argv: Vec<String> = command.get("argv")
+    let command = json.get("command").context("Missing 'command' field")?;
+    let argv: Vec<String> = command
+        .get("argv")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(String::from).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(String::from)
+                .collect()
+        })
         .unwrap_or_default();
     if argv.is_empty() {
         bail!("Command argv must not be empty");
     }
-    let cwd = command.get("cwd")
+    let cwd = command
+        .get("cwd")
         .and_then(|v| v.as_str())
         .unwrap_or(".")
         .to_string();
-    let env = command.get("env")
+    let env = command
+        .get("env")
         .and_then(|v| v.as_object())
-        .map(|obj| obj.iter()
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-            .collect())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
         .unwrap_or_default();
-    
+
     let record_command = RecordCommand { argv, cwd, env };
-    
+
     // Create the record
     let mut record = Record::with_id(record_id.clone(), git_state, record_command);
-    
+
     // Extract optional fields
     if let Some(exit_code) = json.get("exit_code").and_then(|v| v.as_i64()) {
         record.exit_code = Some(exit_code as i32);
@@ -2996,7 +3163,11 @@ fn cmd_create_record(storage: &Storage, from_file: Option<String>) -> Result<()>
             .map(|dt| dt.with_timezone(&chrono::Utc));
     }
     if let Some(tags) = json.get("tags").and_then(|v| v.as_array()) {
-        record.tags = tags.iter().filter_map(|v| v.as_str()).map(String::from).collect();
+        record.tags = tags
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(String::from)
+            .collect();
     }
     if let Some(source) = json.get("source").and_then(|v| v.as_str()) {
         record.source = source.to_string();
@@ -3006,18 +3177,142 @@ fn cmd_create_record(storage: &Storage, from_file: Option<String>) -> Result<()>
     if let Some(log_ref) = json.get("log_ref").and_then(|v| v.as_str()) {
         record.log_ref = Some(log_ref.to_string());
     }
-    
+
     // Validate the record
     record.validate().context("Record validation failed")?;
-    
+
     // Save the record
     let saved_path = storage.save_record(&record)?;
-    
+
     println!("Created record: {}", record.record_id);
     println!("  Short ID: {}", record.short_id());
     println!("  Command:  {:?}", record.command.argv);
     println!("  Source:   {}", record.source);
     println!("  Path:     {}", saved_path.display());
-    
+
+    Ok(())
+}
+
+fn cmd_skill_list() -> Result<()> {
+    let skills = find_skills();
+
+    if skills.is_empty() {
+        println!("No skills found.");
+        println!();
+        println!("Skills are searched in:");
+        for platform in Platform::all() {
+            if let Some(dir) = platform.skill_dir() {
+                println!("  {} - {}", platform.name(), dir.display());
+            }
+        }
+        return Ok(());
+    }
+
+    println!("{:<25} {:<15} {}", "NAME", "PLATFORM", "PATH");
+    println!("{}", "─".repeat(80));
+
+    for (platform, path, name) in &skills {
+        let path_str = path.to_string_lossy();
+        let short_path = if path_str.len() > 40 {
+            format!("...{}", &path_str[path_str.len() - 37..])
+        } else {
+            path_str.to_string()
+        };
+        println!("{:<25} {:<15} {}", name, platform.name(), short_path);
+    }
+
+    println!();
+    println!("{} skill(s) found", skills.len());
+
+    Ok(())
+}
+
+fn cmd_skill_show(skill_name: &str) -> Result<()> {
+    let (platform, path) = find_skill_by_name(skill_name)
+        .ok_or_else(|| anyhow::anyhow!("Skill not found: {}", skill_name))?;
+
+    let skill = Skill::load(&path)?;
+
+    println!("Skill: {}", skill.metadata.name);
+    println!("Platform: {}", platform.name());
+    println!("Path: {}", path.display());
+    if let Some(ref version) = skill.metadata.version {
+        println!("Version: {}", version);
+    }
+    println!();
+    println!("Description:");
+    println!("  {}", skill.metadata.description);
+    println!();
+
+    if !skill.references.is_empty() {
+        println!("References ({}):", skill.references.len());
+        for ref_path in &skill.references {
+            println!("  - {}", ref_path.display());
+        }
+        println!();
+    }
+
+    if !skill.examples.is_empty() {
+        println!("Examples ({}):", skill.examples.len());
+        for ex_path in &skill.examples {
+            println!("  - {}", ex_path.display());
+        }
+        println!();
+    }
+
+    println!("Content preview (first 20 lines):");
+    println!("{}", "─".repeat(60));
+    for (i, line) in skill.content.lines().take(20).enumerate() {
+        println!("{:3} │ {}", i + 1, line);
+    }
+    if skill.content.lines().count() > 20 {
+        println!("... ({} more lines)", skill.content.lines().count() - 20);
+    }
+
+    Ok(())
+}
+
+fn cmd_skill_export(skill_name: &str, output: Option<PathBuf>) -> Result<()> {
+    let (_platform, path) = find_skill_by_name(skill_name)
+        .ok_or_else(|| anyhow::anyhow!("Skill not found: {}", skill_name))?;
+
+    let skill = Skill::load(&path)?;
+    let output_dir = output.unwrap_or_else(|| PathBuf::from(skill_name));
+
+    println!("Exporting skill: {}", skill.metadata.name);
+    println!("Source: {}", path.display());
+    println!("Output: {}", output_dir.display());
+    println!();
+
+    let result = skill.export(&output_dir)?;
+
+    println!("Export complete!");
+    println!();
+    println!("Created files:");
+    println!("  SKILL.md           - Main skill file");
+    if result.references_count > 0 {
+        println!(
+            "  references/        - {} reference file(s)",
+            result.references_count
+        );
+    }
+    if result.examples_count > 0 {
+        println!(
+            "  examples/          - {} example file(s)",
+            result.examples_count
+        );
+    }
+    println!("  INSTALL.md         - Unified installation guide");
+    println!("  install/           - Platform-specific guides");
+    println!("    claude-code.md");
+    println!("    opencode.md");
+    println!("    gemini.md");
+    println!("    codex.md");
+    println!("    cursor.md");
+    println!("  install.sh         - Auto-install script");
+    println!();
+    println!("To install, run:");
+    println!("  cd {} && ./install.sh", output_dir.display());
+
     Ok(())
 }
