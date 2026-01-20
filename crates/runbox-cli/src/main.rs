@@ -1,3 +1,4 @@
+mod tui;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -219,6 +220,35 @@ RELATED COMMANDS:
         #[arg(short, long, default_value = "20")]
         limit: usize,
     },
+    /// Interactive TUI process monitor
+    #[command(after_help = "\
+EXAMPLES:
+  # Launch interactive monitor
+  runbox monitor
+
+FEATURES:
+  - Real-time process list with auto-refresh
+  - Keyboard navigation (j/k, arrows)
+  - View logs for any process
+  - Stop processes directly
+  - Attach to tmux/zellij sessions
+
+KEYBINDINGS:
+  j/↓         Move selection down
+  k/↑         Move selection up
+  Enter/l     View logs for selected process
+  s           Stop selected process (SIGTERM)
+  S           Force stop (SIGKILL)
+  a           Attach to tmux/zellij session
+  r           Refresh process list
+  ?           Show help
+  q/Esc       Quit
+
+RELATED COMMANDS:
+  runbox ps        Static process list
+  runbox logs      View logs directly
+  runbox stop      Stop a process")]
+    Monitor,
     /// List all runnables (templates, replays, playlist items) in unified table
     #[command(after_help = "\
 EXAMPLES:
@@ -994,6 +1024,7 @@ fn main() -> Result<()> {
             &storage, command, runtime, dry_run, timeout, env_vars, cwd, no_git,
         ),
         Commands::Ps { status, all, limit } => cmd_ps(&storage, status, all, limit),
+        Commands::Monitor => cmd_monitor(&storage),
         Commands::List {
             r#type,
             playlist,
@@ -1592,6 +1623,10 @@ fn cmd_run_replay(
     Ok(())
 }
 
+// === Monitor Command (TUI) ===
+fn cmd_monitor(storage: &Storage) -> Result<()> {
+    tui::run(storage)
+}
 // === Ps Command ===
 fn cmd_ps(
     storage: &Storage,
