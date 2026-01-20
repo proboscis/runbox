@@ -675,6 +675,43 @@ RELATED COMMANDS:
         #[command(subcommand)]
         command: CreateCommands,
     },
+    /// Export skills with multi-platform installation guides
+    #[command(after_help = "\
+EXAMPLES:
+  # List available skills
+  runbox skill list
+
+  # Export a skill to a directory
+  runbox skill export runbox-cli --output ./exported-skill
+
+  # Export with all install guides
+  runbox skill export runbox-cli -o ~/skills/runbox
+
+OUTPUT STRUCTURE:
+  exported-skill/
+  ├── SKILL.md              # The skill content
+  ├── INSTALL.md            # Unified install guide
+  ├── install/
+  │   ├── claude-code.md    # Claude Code installation
+  │   ├── opencode.md       # OpenCode installation
+  │   ├── gemini.md         # Gemini CLI installation
+  │   ├── codex.md          # Codex installation
+  │   └── cursor.md         # Cursor installation
+  └── install.sh            # Auto-install script
+
+SUPPORTED PLATFORMS:
+  - Claude Code  (~/.claude/skills/)
+  - OpenCode     (~/.opencode/skills/)
+  - Gemini CLI   (~/.gemini/instructions/)
+  - Codex        (~/.codex/instructions/)
+  - Cursor       (.cursor/rules/)
+
+RELATED COMMANDS:
+  runbox tutorial   Show the full runbox tutorial")]
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommands,
+    },
     #[command(after_help = "\
 EXAMPLES:
   # Show the complete tutorial
@@ -946,6 +983,42 @@ EXAMPLES:
     },
 }
 
+
+#[derive(Subcommand)]
+enum SkillCommands {
+    /// List available skills
+    #[command(after_help = "\
+EXAMPLES:
+  runbox skill list
+
+OUTPUT:
+  NAME           DESCRIPTION
+  ----------------------------------------------------------------
+  runbox-cli     Runbox CLI skill for AI assistants")]
+    List,
+
+    /// Export a skill to a directory with platform-specific install guides
+    #[command(after_help = "\
+EXAMPLES:
+  # Export to current directory
+  runbox skill export runbox-cli
+
+  # Export to specific directory
+  runbox skill export runbox-cli --output ./my-skill
+
+  # The output directory will contain:
+  # - SKILL.md: The skill content
+  # - INSTALL.md: Unified installation guide
+  # - install/: Platform-specific guides
+  # - install.sh: Auto-install script")]
+    Export {
+        /// Name of the skill to export
+        skill_name: String,
+        /// Output directory (default: ./<skill-name>)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+}
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let storage = if let Ok(home) = std::env::var("RUNBOX_HOME") {
@@ -1082,6 +1155,10 @@ fn main() -> Result<()> {
             DaemonCommands::Stop => cmd_daemon_stop(),
             DaemonCommands::Status => cmd_daemon_status(),
             DaemonCommands::Ping => cmd_daemon_ping(),
+        },
+        Commands::Skill { command } => match command {
+            SkillCommands::List => cmd_skill_list(),
+            SkillCommands::Export { skill_name, output } => cmd_skill_export(&skill_name, output),
         },
         Commands::Tutorial => cmd_tutorial(),
     }
@@ -3020,4 +3097,533 @@ fn cmd_create_record(storage: &Storage, from_file: Option<String>) -> Result<()>
     println!("  Path:     {}", saved_path.display());
     
     Ok(())
+}
+
+// === Skill Commands ===
+
+/// Embedded skill content for runbox-cli
+const RUNBOX_CLI_SKILL: &str = include_str!("../../../docs/opencode-skill.md");
+
+/// Available skills with metadata
+struct SkillInfo {
+    name: &'static str,
+    description: &'static str,
+    content: &'static str,
+}
+
+fn get_available_skills() -> Vec<SkillInfo> {
+    vec![
+        SkillInfo {
+            name: "runbox-cli",
+            description: "Runbox CLI skill for AI coding assistants",
+            content: RUNBOX_CLI_SKILL,
+        },
+    ]
+}
+
+fn cmd_skill_list() -> Result<()> {
+    let skills = get_available_skills();
+    
+    println!("NAME             DESCRIPTION");
+    println!("{}", "-".repeat(64));
+    
+    for skill in &skills {
+        println!("{:<16} {}", skill.name, skill.description);
+    }
+    
+    println!();
+    println!("{} skill(s) available", skills.len());
+    println!();
+    println!("Export with: runbox skill export <name> --output <dir>");
+    
+    Ok(())
+}
+
+fn cmd_skill_export(skill_name: &str, output: Option<PathBuf>) -> Result<()> {
+    let skills = get_available_skills();
+    
+    let skill = skills.iter()
+        .find(|s| s.name == skill_name)
+        .ok_or_else(|| anyhow::anyhow!(
+            "Skill '{}' not found. Use 'runbox skill list' to see available skills.",
+            skill_name
+        ))?;
+    
+    // Determine output directory
+    let output_dir = output.unwrap_or_else(|| PathBuf::from(skill_name));
+    
+    // Create directory structure
+    std::fs::create_dir_all(&output_dir)
+        .with_context(|| format!("Failed to create directory: {}", output_dir.display()))?;
+    std::fs::create_dir_all(output_dir.join("install"))
+        .with_context(|| format!("Failed to create install directory"))?;
+    
+    // Write SKILL.md
+    let skill_path = output_dir.join("SKILL.md");
+    std::fs::write(&skill_path, skill.content)
+        .with_context(|| format!("Failed to write SKILL.md"))?;
+    println!("Created: {}", skill_path.display());
+    
+    // Generate and write INSTALL.md
+    let install_md = generate_install_md(skill_name);
+    let install_path = output_dir.join("INSTALL.md");
+    std::fs::write(&install_path, &install_md)
+        .with_context(|| format!("Failed to write INSTALL.md"))?;
+    println!("Created: {}", install_path.display());
+    
+    // Generate platform-specific install guides
+    let platforms = vec![
+        ("claude-code", generate_claude_code_guide(skill_name)),
+        ("opencode", generate_opencode_guide(skill_name)),
+        ("gemini", generate_gemini_guide(skill_name)),
+        ("codex", generate_codex_guide(skill_name)),
+        ("cursor", generate_cursor_guide(skill_name)),
+    ];
+    
+    for (platform, content) in platforms {
+        let path = output_dir.join("install").join(format!("{}.md", platform));
+        std::fs::write(&path, &content)
+            .with_context(|| format!("Failed to write {}.md", platform))?;
+        println!("Created: {}", path.display());
+    }
+    
+    // Generate install.sh
+    let install_sh = generate_install_script(skill_name);
+    let script_path = output_dir.join("install.sh");
+    std::fs::write(&script_path, &install_sh)
+        .with_context(|| format!("Failed to write install.sh"))?;
+    
+    // Make install.sh executable on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms)?;
+    }
+    println!("Created: {} (executable)", script_path.display());
+    
+    println!();
+    println!("Skill '{}' exported to: {}", skill_name, output_dir.display());
+    println!();
+    println!("Next steps:");
+    println!("  1. Review INSTALL.md for unified installation instructions");
+    println!("  2. Or run: ./install.sh to auto-detect and install");
+    println!("  3. Or see install/<platform>.md for specific instructions");
+    
+    Ok(())
+}
+
+fn generate_install_md(skill_name: &str) -> String {
+    format!(r#"# Installing {} Skill
+
+This directory contains the {} skill for AI coding assistants.
+
+## Quick Install
+
+Run the auto-installer (detects your platform automatically):
+
+```bash
+./install.sh
+```
+
+## Manual Installation
+
+Choose your AI assistant:
+
+### Claude Code (Anthropic)
+
+```bash
+mkdir -p ~/.claude/skills/{}
+cp SKILL.md ~/.claude/skills/{}/SKILL.md
+```
+
+See [install/claude-code.md](install/claude-code.md) for details.
+
+### OpenCode
+
+```bash
+mkdir -p ~/.opencode/skills/{}
+cp SKILL.md ~/.opencode/skills/{}/SKILL.md
+```
+
+See [install/opencode.md](install/opencode.md) for details.
+
+### Gemini CLI (Google)
+
+```bash
+mkdir -p ~/.gemini/instructions
+cp SKILL.md ~/.gemini/instructions/{}.md
+```
+
+See [install/gemini.md](install/gemini.md) for details.
+
+### Codex (OpenAI)
+
+```bash
+mkdir -p ~/.codex/instructions
+cp SKILL.md ~/.codex/instructions/{}.md
+```
+
+See [install/codex.md](install/codex.md) for details.
+
+### Cursor
+
+```bash
+mkdir -p .cursor/rules
+cp SKILL.md .cursor/rules/{}.md
+```
+
+See [install/cursor.md](install/cursor.md) for details.
+
+## Verification
+
+After installation, test the skill by asking your AI assistant about runbox commands.
+"#, skill_name, skill_name, skill_name, skill_name, skill_name, skill_name, skill_name, skill_name, skill_name)
+}
+
+fn generate_claude_code_guide(skill_name: &str) -> String {
+    format!(r#"# Claude Code Installation Guide
+
+## Overview
+
+Claude Code stores skills in `~/.claude/skills/`. Each skill is a directory containing a `SKILL.md` file.
+
+## Installation
+
+1. Create the skill directory:
+
+```bash
+mkdir -p ~/.claude/skills/{}
+```
+
+2. Copy the skill file:
+
+```bash
+cp SKILL.md ~/.claude/skills/{}/SKILL.md
+```
+
+## Skill Format
+
+Claude Code skills use Markdown with optional YAML frontmatter:
+
+```markdown
+---
+name: {}
+description: Runbox CLI skill for AI coding assistants
+version: 1.0.0
+---
+
+# Skill Content
+
+Your skill instructions here...
+```
+
+## Usage
+
+Once installed, Claude Code will automatically load the skill and use it when relevant commands are detected.
+
+## Verification
+
+Ask Claude Code: "What runbox commands can I use?"
+
+## Uninstallation
+
+```bash
+rm -rf ~/.claude/skills/{}
+```
+"#, skill_name, skill_name, skill_name, skill_name)
+}
+
+fn generate_opencode_guide(skill_name: &str) -> String {
+    format!(r#"# OpenCode Installation Guide
+
+## Overview
+
+OpenCode stores skills in `~/.opencode/skills/`. The structure is similar to Claude Code.
+
+## Installation
+
+1. Create the skill directory:
+
+```bash
+mkdir -p ~/.opencode/skills/{}
+```
+
+2. Copy the skill file:
+
+```bash
+cp SKILL.md ~/.opencode/skills/{}/SKILL.md
+```
+
+## Skill Format
+
+OpenCode skills use the same Markdown format as Claude Code:
+
+```markdown
+# Skill Title
+
+Description and instructions...
+
+## Trigger Phrases
+
+This skill should be used when the user asks to...
+```
+
+## Usage
+
+OpenCode automatically loads skills from the skills directory.
+
+## Verification
+
+Ask OpenCode: "Show me runbox commands"
+
+## Uninstallation
+
+```bash
+rm -rf ~/.opencode/skills/{}
+```
+"#, skill_name, skill_name, skill_name)
+}
+
+fn generate_gemini_guide(skill_name: &str) -> String {
+    format!(r#"# Gemini CLI Installation Guide
+
+## Overview
+
+Gemini CLI stores instructions in `~/.gemini/instructions/`. Each instruction file is a standalone Markdown file.
+
+## Installation
+
+1. Create the instructions directory:
+
+```bash
+mkdir -p ~/.gemini/instructions
+```
+
+2. Copy the skill file:
+
+```bash
+cp SKILL.md ~/.gemini/instructions/{}.md
+```
+
+## Instruction Format
+
+Gemini uses plain Markdown files:
+
+```markdown
+# Runbox CLI Instructions
+
+Instructions for using runbox commands...
+```
+
+## Configuration
+
+You may need to configure Gemini CLI to use custom instructions. Check your Gemini CLI settings.
+
+## Usage
+
+Gemini CLI will use the instructions when relevant topics are detected.
+
+## Verification
+
+Ask Gemini: "How do I use runbox?"
+
+## Uninstallation
+
+```bash
+rm ~/.gemini/instructions/{}.md
+```
+"#, skill_name, skill_name)
+}
+
+fn generate_codex_guide(skill_name: &str) -> String {
+    format!(r#"# Codex (OpenAI CLI) Installation Guide
+
+## Overview
+
+Codex CLI stores instructions in `~/.codex/instructions/`. Instructions are Markdown files that provide context to the AI.
+
+## Installation
+
+1. Create the instructions directory:
+
+```bash
+mkdir -p ~/.codex/instructions
+```
+
+2. Copy the skill file:
+
+```bash
+cp SKILL.md ~/.codex/instructions/{}.md
+```
+
+## Instruction Format
+
+Codex uses Markdown files:
+
+```markdown
+# Runbox CLI
+
+Context and instructions for working with runbox...
+```
+
+## Usage
+
+Codex will automatically include relevant instructions in its context.
+
+## Verification
+
+Ask Codex: "What can runbox do?"
+
+## Uninstallation
+
+```bash
+rm ~/.codex/instructions/{}.md
+```
+"#, skill_name, skill_name)
+}
+
+fn generate_cursor_guide(skill_name: &str) -> String {
+    format!(r#"# Cursor Installation Guide
+
+## Overview
+
+Cursor stores rules in `.cursor/rules/` within your project directory. Rules are project-specific and provide context to Cursor's AI.
+
+## Installation (Project-Level)
+
+1. Create the rules directory in your project:
+
+```bash
+mkdir -p .cursor/rules
+```
+
+2. Copy the skill file:
+
+```bash
+cp SKILL.md .cursor/rules/{}.md
+```
+
+## Installation (Global)
+
+For global rules that apply to all projects:
+
+```bash
+mkdir -p ~/.cursor/rules
+cp SKILL.md ~/.cursor/rules/{}.md
+```
+
+## Rule Format
+
+Cursor rules use Markdown:
+
+```markdown
+# Runbox CLI Rules
+
+Instructions for using runbox in this project...
+```
+
+## Usage
+
+Cursor automatically loads rules from the `.cursor/rules/` directory.
+
+## Verification
+
+In Cursor, ask: "How do I run commands with runbox?"
+
+## Uninstallation
+
+```bash
+rm .cursor/rules/{}.md
+# or for global:
+rm ~/.cursor/rules/{}.md
+```
+"#, skill_name, skill_name, skill_name, skill_name)
+}
+
+fn generate_install_script(skill_name: &str) -> String {
+    format!(r#"#!/bin/bash
+# Auto-install script for {} skill
+# Detects the AI assistant and installs accordingly
+
+set -e
+
+SKILL_NAME="{}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SKILL_FILE="$SCRIPT_DIR/SKILL.md"
+
+if [ ! -f "$SKILL_FILE" ]; then
+    echo "Error: SKILL.md not found in $SCRIPT_DIR"
+    exit 1
+fi
+
+echo "Installing $SKILL_NAME skill..."
+echo ""
+
+# Detect and install for each platform
+installed=0
+
+# Claude Code
+if [ -d "$HOME/.claude" ] || command -v claude &> /dev/null; then
+    echo "Detected: Claude Code"
+    mkdir -p "$HOME/.claude/skills/$SKILL_NAME"
+    cp "$SKILL_FILE" "$HOME/.claude/skills/$SKILL_NAME/SKILL.md"
+    echo "  Installed to: ~/.claude/skills/$SKILL_NAME/"
+    installed=$((installed + 1))
+fi
+
+# OpenCode
+if [ -d "$HOME/.opencode" ] || command -v opencode &> /dev/null; then
+    echo "Detected: OpenCode"
+    mkdir -p "$HOME/.opencode/skills/$SKILL_NAME"
+    cp "$SKILL_FILE" "$HOME/.opencode/skills/$SKILL_NAME/SKILL.md"
+    echo "  Installed to: ~/.opencode/skills/$SKILL_NAME/"
+    installed=$((installed + 1))
+fi
+
+# Gemini CLI
+if [ -d "$HOME/.gemini" ] || command -v gemini &> /dev/null; then
+    echo "Detected: Gemini CLI"
+    mkdir -p "$HOME/.gemini/instructions"
+    cp "$SKILL_FILE" "$HOME/.gemini/instructions/$SKILL_NAME.md"
+    echo "  Installed to: ~/.gemini/instructions/$SKILL_NAME.md"
+    installed=$((installed + 1))
+fi
+
+# Codex
+if [ -d "$HOME/.codex" ] || command -v codex &> /dev/null; then
+    echo "Detected: Codex"
+    mkdir -p "$HOME/.codex/instructions"
+    cp "$SKILL_FILE" "$HOME/.codex/instructions/$SKILL_NAME.md"
+    echo "  Installed to: ~/.codex/instructions/$SKILL_NAME.md"
+    installed=$((installed + 1))
+fi
+
+# Cursor (project-level check)
+if [ -d ".cursor" ]; then
+    echo "Detected: Cursor (project-level)"
+    mkdir -p ".cursor/rules"
+    cp "$SKILL_FILE" ".cursor/rules/$SKILL_NAME.md"
+    echo "  Installed to: .cursor/rules/$SKILL_NAME.md"
+    installed=$((installed + 1))
+fi
+
+echo ""
+if [ $installed -eq 0 ]; then
+    echo "No AI assistants detected."
+    echo ""
+    echo "Manual installation options:"
+    echo "  Claude Code: mkdir -p ~/.claude/skills/$SKILL_NAME && cp SKILL.md ~/.claude/skills/$SKILL_NAME/"
+    echo "  OpenCode:    mkdir -p ~/.opencode/skills/$SKILL_NAME && cp SKILL.md ~/.opencode/skills/$SKILL_NAME/"
+    echo "  Gemini CLI:  mkdir -p ~/.gemini/instructions && cp SKILL.md ~/.gemini/instructions/$SKILL_NAME.md"
+    echo "  Codex:       mkdir -p ~/.codex/instructions && cp SKILL.md ~/.codex/instructions/$SKILL_NAME.md"
+    echo "  Cursor:      mkdir -p .cursor/rules && cp SKILL.md .cursor/rules/$SKILL_NAME.md"
+    exit 1
+else
+    echo "Installed $SKILL_NAME skill to $installed platform(s)."
+    echo ""
+    echo "Test by asking your AI assistant about runbox commands."
+fi
+"#, skill_name, skill_name)
 }
