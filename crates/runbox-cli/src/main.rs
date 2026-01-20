@@ -675,6 +675,45 @@ RELATED COMMANDS:
         #[command(subcommand)]
         command: CreateCommands,
     },
+    /// Manage skills (export, list) for AI coding assistants
+    #[command(after_help = "\
+EXAMPLES:
+  # List available skills
+  runbox skill list
+
+  # Export a skill with installation guides
+  runbox skill export runbox-cli --output ./exported-skill
+
+  # Show skill details
+  runbox skill show runbox-cli
+
+OUTPUT STRUCTURE:
+  exported-skill/
+  ├── SKILL.md                 # The skill content
+  ├── references/              # Reference files (if any)
+  ├── examples/                # Example files (if any)
+  ├── INSTALL.md               # Unified install guide
+  ├── install/
+  │   ├── claude-code.md       # Claude Code installation
+  │   ├── opencode.md          # OpenCode installation
+  │   ├── gemini.md            # Gemini CLI installation
+  │   ├── codex.md             # Codex installation
+  │   └── cursor.md            # Cursor installation
+  └── install.sh               # Auto-install script
+
+SUPPORTED PLATFORMS:
+  - Claude Code  (~/.claude/skills/)
+  - OpenCode     (~/.opencode/skills/)
+  - Gemini CLI   (project GEMINI.md)
+  - Codex        (AGENTS.md)
+  - Cursor       (~/.cursor/rules/)
+
+RELATED COMMANDS:
+  runbox template list   List available templates")]
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommands,
+    },
     #[command(after_help = "\
 EXAMPLES:
   # Show the complete tutorial
@@ -946,6 +985,52 @@ EXAMPLES:
     },
 }
 
+#[derive(Subcommand)]
+enum SkillCommands {
+    /// List all available skills from all platforms
+    #[command(after_help = "\
+EXAMPLES:
+  runbox skill list
+
+OUTPUT:
+  NAME                  PLATFORM       PATH
+  ────────────────────────────────────────────────────────────
+  runbox-cli            Claude Code    ~/.claude/skills/runbox-cli
+  daily-progress        Claude Code    ~/.claude/skills/daily-progress")]
+    List,
+
+    /// Show details about a specific skill
+    #[command(after_help = "\
+EXAMPLES:
+  runbox skill show runbox-cli
+  runbox skill show daily-progress")]
+    Show {
+        /// Skill name
+        skill_name: String,
+    },
+
+    /// Export a skill with platform-specific installation guides
+    #[command(after_help = "\
+EXAMPLES:
+  # Export to a directory
+  runbox skill export runbox-cli --output ./my-skill
+
+  # The output directory will contain:
+  # - SKILL.md (the skill file)
+  # - references/ (if any)
+  # - examples/ (if any)
+  # - INSTALL.md (unified guide)
+  # - install/ (platform-specific guides)
+  # - install.sh (auto-install script)")]
+    Export {
+        /// Skill name to export
+        skill_name: String,
+        /// Output directory
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let storage = if let Ok(home) = std::env::var("RUNBOX_HOME") {
@@ -1076,6 +1161,11 @@ fn main() -> Result<()> {
         Commands::Validate { path } => cmd_validate(&path),
         Commands::Create { command } => match command {
             CreateCommands::Record { from_file } => cmd_create_record(&storage, from_file),
+        },
+        Commands::Skill { command } => match command {
+            SkillCommands::List => cmd_skill_list(),
+            SkillCommands::Show { skill_name } => cmd_skill_show(&skill_name),
+            SkillCommands::Export { skill_name, output } => cmd_skill_export(&skill_name, &output),
         },
         Commands::Daemon { command } => match command {
             DaemonCommands::Start => cmd_daemon_start(),
@@ -3019,5 +3109,140 @@ fn cmd_create_record(storage: &Storage, from_file: Option<String>) -> Result<()>
     println!("  Source:   {}", record.source);
     println!("  Path:     {}", saved_path.display());
     
+    Ok(())
+}
+
+// === Skill Commands ===
+
+fn cmd_skill_list() -> Result<()> {
+    use runbox_core::{find_skills, Platform};
+
+    let skills = find_skills();
+
+    if skills.is_empty() {
+        println!("No skills found.");
+        println!();
+        println!("Skills are searched in the following locations:");
+        for platform in Platform::all() {
+            if let Some(dir) = platform.skill_dir() {
+                println!("  {} - {}", platform.name(), dir.display());
+            }
+        }
+        return Ok(());
+    }
+
+    // Print header
+    println!(
+        "{:<25} {:<15} {}",
+        "NAME", "PLATFORM", "PATH"
+    );
+    println!("{}", "─".repeat(80));
+
+    // Print each skill
+    for (platform, path, name) in &skills {
+        let path_str = path.to_string_lossy();
+        let short_path = if path_str.len() > 40 {
+            format!("...{}", &path_str[path_str.len() - 37..])
+        } else {
+            path_str.to_string()
+        };
+        println!(
+            "{:<25} {:<15} {}",
+            name,
+            platform.name(),
+            short_path
+        );
+    }
+
+    println!();
+    println!("{} skill(s) found", skills.len());
+
+    Ok(())
+}
+
+fn cmd_skill_show(skill_name: &str) -> Result<()> {
+    use runbox_core::{find_skill_by_name, Skill};
+
+    let (platform, path) = find_skill_by_name(skill_name)
+        .ok_or_else(|| anyhow::anyhow!("Skill not found: {}", skill_name))?;
+
+    let skill = Skill::load(&path)?;
+
+    println!("Skill: {}", skill.metadata.name);
+    println!("Platform: {}", platform.name());
+    println!("Path: {}", path.display());
+    if let Some(ref version) = skill.metadata.version {
+        println!("Version: {}", version);
+    }
+    println!();
+    println!("Description:");
+    println!("  {}", skill.metadata.description);
+    println!();
+
+    if !skill.references.is_empty() {
+        println!("References ({}):", skill.references.len());
+        for ref_path in &skill.references {
+            println!("  - {}", ref_path.display());
+        }
+        println!();
+    }
+
+    if !skill.examples.is_empty() {
+        println!("Examples ({}):", skill.examples.len());
+        for ex_path in &skill.examples {
+            println!("  - {}", ex_path.display());
+        }
+        println!();
+    }
+
+    println!("Content preview (first 20 lines):");
+    println!("{}", "─".repeat(60));
+    for (i, line) in skill.content.lines().take(20).enumerate() {
+        println!("{:3} │ {}", i + 1, line);
+    }
+    if skill.content.lines().count() > 20 {
+        println!("... ({} more lines)", skill.content.lines().count() - 20);
+    }
+
+    Ok(())
+}
+
+fn cmd_skill_export(skill_name: &str, output: &Path) -> Result<()> {
+    use runbox_core::{find_skill_by_name, Skill};
+
+    let (_platform, path) = find_skill_by_name(skill_name)
+        .ok_or_else(|| anyhow::anyhow!("Skill not found: {}", skill_name))?;
+
+    let skill = Skill::load(&path)?;
+
+    println!("Exporting skill: {}", skill.metadata.name);
+    println!("Source: {}", path.display());
+    println!("Output: {}", output.display());
+    println!();
+
+    let result = skill.export(output)?;
+
+    println!("Export complete!");
+    println!();
+    println!("Created files:");
+    println!("  SKILL.md           - Main skill file");
+    if result.references_count > 0 {
+        println!("  references/        - {} reference file(s)", result.references_count);
+    }
+    if result.examples_count > 0 {
+        println!("  examples/          - {} example file(s)", result.examples_count);
+    }
+    println!("  INSTALL.md         - Unified installation guide");
+    println!("  install/           - Platform-specific guides");
+    println!("    claude-code.md");
+    println!("    opencode.md");
+    println!("    gemini.md");
+    println!("    codex.md");
+    println!("    cursor.md");
+    println!("  install.sh         - Auto-install script");
+    println!();
+    println!("To install, run:");
+    println!("  cd {} && ./install.sh", output.display());
+
     Ok(())
 }

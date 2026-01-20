@@ -15,6 +15,8 @@ pub mod local_storage;
 pub mod record;
 pub mod task;
 pub mod index;
+pub mod skill;
+pub mod skill_export;
 
 pub use binding::BindingResolver;
 pub use config::{ConfigResolver, ConfigSource, ResolvedValue, RunboxConfig, VerboseLogger};
@@ -36,3 +38,4 @@ pub use local_storage::{LayeredStorage, Scope, locate_local_runbox_dir};
 pub use record::{Record, RecordCommand, RecordGitState, RecordValidationError};
 pub use task::{Task, TaskHandle, TaskRuntime, TaskStatus};
 pub use index::{EntityType, Index, IndexedEntity};
+pub use skill::{find_skill_by_name, find_skills, ExportResult, Platform, Skill, SkillError, SkillMetadata};

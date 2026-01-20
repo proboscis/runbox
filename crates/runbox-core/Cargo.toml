@@ -8,6 +8,7 @@ description = "Core types and logic for runbox"
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = "0.9"
 uuid = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
