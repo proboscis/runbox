@@ -1855,6 +1855,8 @@ struct RunnableInfo {
     tags: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     repo_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    playlist_name: Option<String>,
 }
 
 /// Safely truncate a string to max_chars characters, adding "..." if truncated.
@@ -2047,12 +2049,19 @@ fn cmd_list(
         return Ok(());
     }
 
+    let show_extra_columns = all_repos || verbose;
+
     // Collect info for output
     let infos: Vec<RunnableInfo> = filtered
         .iter()
         .map(|r| {
-            let repo_url = if verbose {
+            let repo_url = if show_extra_columns {
                 storage.get_runnable_repo_url(r)
+            } else {
+                None
+            };
+            let playlist_name = if show_extra_columns {
+                storage.get_runnable_playlist_name(r)
             } else {
                 None
             };
@@ -2063,6 +2072,7 @@ fn cmd_list(
                 name: storage.get_runnable_display_name(r),
                 tags: r.tags_label(),
                 repo_url,
+                playlist_name,
             }
         })
         .collect();
@@ -2076,10 +2086,10 @@ fn cmd_list(
         }
     } else {
         // Table output
-        if verbose {
+        if show_extra_columns {
             println!(
-                "{:<10} {:<10} {:<16} {:<24} {:<6} {}",
-                "SHORT", "TYPE", "SOURCE", "NAME", "TAGS", "REPO"
+                "{:<10} {:<10} {:<16} {:<24} {:<6} {:<20} {}",
+                "SHORT", "TYPE", "SOURCE", "NAME", "TAGS", "REPO", "PLAYLIST"
             );
         } else {
             println!(
@@ -2087,22 +2097,25 @@ fn cmd_list(
                 "SHORT", "TYPE", "SOURCE", "NAME", "TAGS"
             );
         }
-        println!("{}", "─".repeat(if verbose { 90 } else { 70 }));
+        println!("{}", "─".repeat(if show_extra_columns { 110 } else { 70 }));
 
         for info in &infos {
             let name_truncated = truncate_string(&info.name, 24);
 
-            if verbose {
+            if show_extra_columns {
                 let repo_display = info.repo_url.as_deref().unwrap_or("-");
                 let repo_truncated = truncate_string(repo_display, 20);
+                let playlist_display = info.playlist_name.as_deref().unwrap_or("-");
+                let playlist_truncated = truncate_string(playlist_display, 20);
                 println!(
-                    "{:<10} {:<10} {:<16} {:<24} {:<6} {}",
+                    "{:<10} {:<10} {:<16} {:<24} {:<6} {:<20} {}",
                     info.short_id,
                     info.runnable_type,
                     info.source,
                     name_truncated,
                     info.tags,
-                    repo_truncated
+                    repo_truncated,
+                    playlist_truncated
                 );
             } else {
                 println!(
