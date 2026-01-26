@@ -29,7 +29,7 @@ pub use record::{Record, RecordCommand, RecordGitState, RecordValidationError};
 pub use result::{Artifact, Execution, Output, RunResult};
 pub use run::{CodeState, Exec, LogRef, Patch, Run, RunStatus, RuntimeHandle, Timeline};
 pub use runnable::{
-    format_ambiguous_matches, ResolveResult, Runnable, RunnableMatch, RunnableType,
+    format_ambiguous_matches, stable_short_id, ResolveResult, Runnable, RunnableMatch, RunnableType,
 };
 pub use runtime::{BackgroundAdapter, RuntimeAdapter, RuntimeRegistry, TmuxAdapter};
 pub use skill::{
