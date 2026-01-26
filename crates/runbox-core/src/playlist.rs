@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::runnable::stable_short_id;
+
 /// A collection of RunTemplate references
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Playlist {
@@ -18,17 +20,20 @@ pub struct PlaylistItem {
 
 impl PlaylistItem {
     /// Generate a short ID for this playlist item based on hash of playlist_id, index, and template_id.
-    /// The short ID is deterministic and unique within a playlist.
+    /// The short ID is deterministic, unique within a playlist, and stable across Rust versions (uses SHA256).
+    ///
+    /// This uses the same algorithm as `Runnable::PlaylistItem.short_id()` to ensure consistency
+    /// between `runbox playlist show` and `runbox run <short_id>`.
     pub fn short_id(&self, playlist_id: &str, index: usize) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        playlist_id.hash(&mut hasher);
-        index.hash(&mut hasher);
-        self.template_id.hash(&mut hasher);
-
-        format!("{:08x}", hasher.finish() as u32) // First 8 hex chars
+        // Use the same format as Runnable::PlaylistItem.short_id()
+        // Format: "playlist_item\0" + playlist_id + "\0" + index + "\0" + template_id
+        let mut data = b"playlist_item\0".to_vec();
+        data.extend_from_slice(playlist_id.as_bytes());
+        data.push(0);
+        data.extend_from_slice(index.to_string().as_bytes());
+        data.push(0);
+        data.extend_from_slice(self.template_id.as_bytes());
+        stable_short_id(&data)
     }
 }
 
