@@ -71,7 +71,7 @@ fn create_playlist(home: &std::path::Path, id: &str, name: &str, items: &[(&str,
             }
         })
         .collect();
-    
+
     let playlist = serde_json::json!({
         "playlist_id": id,
         "name": name,
@@ -85,7 +85,7 @@ fn create_playlist(home: &std::path::Path, id: &str, name: &str, items: &[(&str,
 fn test_list_empty() {
     let home = setup_home();
     let output = runbox(&["list", "--all-repos"], home.path());
-    
+
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("No runnables found"));
@@ -96,9 +96,9 @@ fn test_list_templates_only() {
     let home = setup_home();
     create_template(home.path(), "tpl_echo", "Echo Command");
     create_template(home.path(), "tpl_train", "Train Model");
-    
+
     let output = runbox(&["list", "--type", "template", "--all-repos"], home.path());
-    
+
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("template"));
@@ -112,9 +112,9 @@ fn test_list_replays_only() {
     let home = setup_home();
     create_run(home.path(), "run_550e8400-e29b-41d4-a716-446655440000");
     create_run(home.path(), "run_a1b2c3d4-e5f6-7890-abcd-ef1234567890");
-    
+
     let output = runbox(&["list", "--type", "replay", "--all-repos"], home.path());
-    
+
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("replay"));
@@ -127,13 +127,18 @@ fn test_list_replays_only() {
 fn test_list_playlist_items() {
     let home = setup_home();
     create_template(home.path(), "tpl_echo", "Echo Command");
-    create_playlist(home.path(), "pl_daily", "Daily Tasks", &[
-        ("tpl_echo", Some("Morning Echo")),
-        ("tpl_echo", Some("Evening Echo")),
-    ]);
-    
+    create_playlist(
+        home.path(),
+        "pl_daily",
+        "Daily Tasks",
+        &[
+            ("tpl_echo", Some("Morning Echo")),
+            ("tpl_echo", Some("Evening Echo")),
+        ],
+    );
+
     let output = runbox(&["list", "--type", "playlist", "--all-repos"], home.path());
-    
+
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("playlist"));
@@ -149,12 +154,15 @@ fn test_list_all_types() {
     let home = setup_home();
     create_template(home.path(), "tpl_echo", "Echo Command");
     create_run(home.path(), "run_550e8400-e29b-41d4-a716-446655440000");
-    create_playlist(home.path(), "pl_daily", "Daily Tasks", &[
-        ("tpl_echo", Some("Morning Echo")),
-    ]);
-    
+    create_playlist(
+        home.path(),
+        "pl_daily",
+        "Daily Tasks",
+        &[("tpl_echo", Some("Morning Echo"))],
+    );
+
     let output = runbox(&["list", "--all-repos"], home.path());
-    
+
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("template"));
@@ -167,15 +175,21 @@ fn test_list_all_types() {
 fn test_list_filter_by_playlist() {
     let home = setup_home();
     create_template(home.path(), "tpl_echo", "Echo Command");
-    create_playlist(home.path(), "pl_daily", "Daily Tasks", &[
-        ("tpl_echo", Some("Morning Echo")),
-    ]);
-    create_playlist(home.path(), "pl_weekly", "Weekly Tasks", &[
-        ("tpl_echo", Some("Weekly Report")),
-    ]);
-    
+    create_playlist(
+        home.path(),
+        "pl_daily",
+        "Daily Tasks",
+        &[("tpl_echo", Some("Morning Echo"))],
+    );
+    create_playlist(
+        home.path(),
+        "pl_weekly",
+        "Weekly Tasks",
+        &[("tpl_echo", Some("Weekly Report"))],
+    );
+
     let output = runbox(&["list", "--playlist", "daily", "--all-repos"], home.path());
-    
+
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Morning Echo"));
@@ -187,12 +201,12 @@ fn test_list_filter_by_playlist() {
 fn test_list_json_output() {
     let home = setup_home();
     create_template(home.path(), "tpl_echo", "Echo Command");
-    
+
     let output = runbox(&["list", "--json", "--all-repos"], home.path());
-    
+
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    
+
     // Should be valid JSON
     let json: serde_json::Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
     assert!(json.is_array());
@@ -207,12 +221,12 @@ fn test_list_short_output() {
     let home = setup_home();
     create_template(home.path(), "tpl_echo", "Echo Command");
     create_template(home.path(), "tpl_train", "Train Model");
-    
+
     let output = runbox(&["list", "--short", "--all-repos"], home.path());
-    
+
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    
+
     // Should have exactly 2 lines, each with 8-char hex short ID
     let lines: Vec<&str> = stdout.trim().lines().collect();
     assert_eq!(lines.len(), 2);
@@ -228,9 +242,9 @@ fn test_list_limit() {
     create_template(home.path(), "tpl_a", "Template A");
     create_template(home.path(), "tpl_b", "Template B");
     create_template(home.path(), "tpl_c", "Template C");
-    
+
     let output = runbox(&["list", "--limit", "2", "--all-repos"], home.path());
-    
+
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("2 runnables"));
@@ -240,9 +254,9 @@ fn test_list_limit() {
 fn test_list_verbose_shows_repo() {
     let home = setup_home();
     create_template(home.path(), "tpl_echo", "Echo Command");
-    
+
     let output = runbox(&["list", "--verbose", "--all-repos"], home.path());
-    
+
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("REPO"));
@@ -252,10 +266,73 @@ fn test_list_verbose_shows_repo() {
 #[test]
 fn test_list_invalid_type() {
     let home = setup_home();
-    
+
     let output = runbox(&["list", "--type", "invalid", "--all-repos"], home.path());
-    
+
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Invalid runnable type") || stderr.contains("invalid"));
+}
+
+#[test]
+fn test_list_all_repos_shows_repo_and_playlist_columns() {
+    let home = setup_home();
+    create_template(home.path(), "tpl_echo", "Echo Command");
+    create_playlist(
+        home.path(),
+        "pl_game_run",
+        "Card Game 2026",
+        &[("tpl_echo", Some("Game Echo"))],
+    );
+
+    let output = runbox(&["list", "--all-repos"], home.path());
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("REPO"),
+        "Should show REPO column header when --all-repos"
+    );
+    assert!(
+        stdout.contains("PLAYLIST"),
+        "Should show PLAYLIST column header when --all-repos"
+    );
+    assert!(
+        stdout.contains("Card Game 2026"),
+        "Should show playlist display name"
+    );
+}
+
+#[test]
+fn test_list_all_repos_json_includes_playlist_name() {
+    let home = setup_home();
+    create_template(home.path(), "tpl_echo", "Echo Command");
+    create_playlist(
+        home.path(),
+        "pl_game_run",
+        "Card Game 2026",
+        &[("tpl_echo", Some("Game Echo"))],
+    );
+
+    let output = runbox(&["list", "--all-repos", "--json"], home.path());
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
+    let arr = json.as_array().unwrap();
+
+    let playlist_item = arr
+        .iter()
+        .find(|v| v["type"] == "playlist")
+        .expect("Should have playlist item");
+    assert_eq!(
+        playlist_item["playlist_name"], "Card Game 2026",
+        "Should include playlist display name in JSON"
+    );
+    assert!(
+        playlist_item["repo_url"].is_string(),
+        "Should include repo_url in JSON"
+    );
 }
