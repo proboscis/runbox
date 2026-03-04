@@ -9,6 +9,9 @@ build/
 .DS_Store
 
 # orch runtime files (keep config.yaml)
-.orch/*.log
-.orch/*.pid
+.orch/*
+!.orch/config.yaml
 ORCH_PROMPT.md
+
+# worktree working directories
+.git-worktrees/
