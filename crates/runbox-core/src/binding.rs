@@ -88,11 +88,7 @@ impl BindingResolver {
     }
 
     /// Build a Run from a template with resolved bindings
-    pub fn build_run(
-        &self,
-        template: &RunTemplate,
-        code_state: CodeState,
-    ) -> Result<Run> {
+    pub fn build_run(&self, template: &RunTemplate, code_state: CodeState) -> Result<Run> {
         let bindings = self.resolve(template)?;
 
         // Resolve argv
@@ -158,14 +154,8 @@ mod tests {
         bindings.insert("i".to_string(), "42".to_string());
         bindings.insert("name".to_string(), "test".to_string());
 
-        assert_eq!(
-            substitute_variables("--index={i}", &bindings),
-            "--index=42"
-        );
-        assert_eq!(
-            substitute_variables("{name}_{i}", &bindings),
-            "test_42"
-        );
+        assert_eq!(substitute_variables("--index={i}", &bindings), "--index=42");
+        assert_eq!(substitute_variables("{name}_{i}", &bindings), "test_42");
     }
 
     #[test]

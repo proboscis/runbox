@@ -169,11 +169,7 @@ impl DaemonClient {
                     return Ok(stream);
                 }
                 Err(e) => {
-                    log::debug!(
-                        "Connection attempt {} failed: {}, retrying...",
-                        attempt,
-                        e
-                    );
+                    log::debug!("Connection attempt {} failed: {}, retrying...", attempt, e);
                     // Cap at 500ms to be responsive
                     retry_delay = std::cmp::min(retry_delay * 2, Duration::from_millis(500));
                 }
@@ -211,12 +207,9 @@ impl DaemonClient {
             cmd.arg("--socket").arg(&self.socket_path);
         }
 
-        let child = cmd.spawn().with_context(|| {
-            format!(
-                "Failed to start daemon from {}",
-                daemon_path.display()
-            )
-        })?;
+        let child = cmd
+            .spawn()
+            .with_context(|| format!("Failed to start daemon from {}", daemon_path.display()))?;
 
         log::debug!("Started daemon process {}", child.id());
 
@@ -373,7 +366,10 @@ mod tests {
 
     #[test]
     fn test_response_serialization() {
-        let response = Response::Spawned { pid: 1234, pgid: 1234 };
+        let response = Response::Spawned {
+            pid: 1234,
+            pgid: 1234,
+        };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("Spawned"));
         assert!(json.contains("1234"));

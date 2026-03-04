@@ -51,8 +51,14 @@ impl RuntimeRegistry {
         let mut adapters: HashMap<String, Box<dyn RuntimeAdapter>> = HashMap::new();
         adapters.insert("background".to_string(), Box::new(BackgroundAdapter::new()));
         adapters.insert("bg".to_string(), Box::new(BackgroundAdapter::new()));
-        adapters.insert("tmux".to_string(), Box::new(TmuxAdapter::new("runbox".to_string())));
-        adapters.insert("zellij".to_string(), Box::new(ZellijAdapter::new("runbox".to_string())));
+        adapters.insert(
+            "tmux".to_string(),
+            Box::new(TmuxAdapter::new("runbox".to_string())),
+        );
+        adapters.insert(
+            "zellij".to_string(),
+            Box::new(ZellijAdapter::new("runbox".to_string())),
+        );
         Self { adapters }
     }
 

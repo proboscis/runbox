@@ -22,12 +22,19 @@ fn setup_template(temp: &TempDir, template_id: &str) {
     });
 
     let template_path = templates_dir.join(format!("{}.json", template_id));
-    fs::write(&template_path, serde_json::to_string_pretty(&template_json).unwrap()).unwrap();
+    fs::write(
+        &template_path,
+        serde_json::to_string_pretty(&template_json).unwrap(),
+    )
+    .unwrap();
 }
 
 /// Helper to check if a template exists in storage
 fn template_exists(temp: &TempDir, template_id: &str) -> bool {
-    let template_path = temp.path().join("templates").join(format!("{}.json", template_id));
+    let template_path = temp
+        .path()
+        .join("templates")
+        .join(format!("{}.json", template_id));
     template_path.exists()
 }
 
@@ -38,7 +45,10 @@ fn test_template_delete() {
 
     // Setup: create a template
     setup_template(&temp, template_id);
-    assert!(template_exists(&temp, template_id), "Template should exist before deletion");
+    assert!(
+        template_exists(&temp, template_id),
+        "Template should exist before deletion"
+    );
 
     // Run delete command
     Command::cargo_bin("runbox")
@@ -50,7 +60,10 @@ fn test_template_delete() {
         .stdout(predicate::str::contains("Template deleted"));
 
     // Verify template no longer exists
-    assert!(!template_exists(&temp, template_id), "Template should not exist after deletion");
+    assert!(
+        !template_exists(&temp, template_id),
+        "Template should not exist after deletion"
+    );
 }
 
 #[test]
@@ -60,7 +73,10 @@ fn test_template_delete_short_id() {
 
     // Setup: create a template
     setup_template(&temp, template_id);
-    assert!(template_exists(&temp, template_id), "Template should exist before deletion");
+    assert!(
+        template_exists(&temp, template_id),
+        "Template should exist before deletion"
+    );
 
     // Run delete command with short ID
     Command::cargo_bin("runbox")
@@ -72,7 +88,10 @@ fn test_template_delete_short_id() {
         .stdout(predicate::str::contains("Template deleted"));
 
     // Verify template no longer exists
-    assert!(!template_exists(&temp, template_id), "Template should not exist after deletion");
+    assert!(
+        !template_exists(&temp, template_id),
+        "Template should not exist after deletion"
+    );
 }
 
 #[test]

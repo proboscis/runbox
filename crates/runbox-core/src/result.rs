@@ -107,7 +107,9 @@ impl RunResult {
     pub fn validate(&self) -> Result<(), ResultValidationError> {
         // result_id format
         if !self.result_id.starts_with("result_") {
-            return Err(ResultValidationError::InvalidResultId(self.result_id.clone()));
+            return Err(ResultValidationError::InvalidResultId(
+                self.result_id.clone(),
+            ));
         }
 
         // run_id format
@@ -171,13 +173,7 @@ mod tests {
         let started = Utc::now();
         let finished = started + chrono::Duration::seconds(1);
 
-        let result = RunResult::new(
-            "run_test".to_string(),
-            started,
-            finished,
-            0,
-        )
-        .with_output(
+        let result = RunResult::new("run_test".to_string(), started, finished, 0).with_output(
             Some("blobs/stdout_abc123".to_string()),
             Some("blobs/stderr_abc123".to_string()),
         );

@@ -35,7 +35,10 @@ impl std::str::FromStr for RunnableType {
             "template" => Ok(RunnableType::Template),
             "replay" => Ok(RunnableType::Replay),
             "playlist" => Ok(RunnableType::Playlist),
-            _ => Err(format!("Invalid runnable type: {}. Valid types: template, replay, playlist", s)),
+            _ => Err(format!(
+                "Invalid runnable type: {}. Valid types: template, replay, playlist",
+                s
+            )),
         }
     }
 }
@@ -64,7 +67,10 @@ pub enum Runnable {
 fn stable_short_id(data: &[u8]) -> String {
     let hash = Sha256::digest(data);
     // Take first 4 bytes (8 hex chars)
-    format!("{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3])
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        hash[0], hash[1], hash[2], hash[3]
+    )
 }
 
 /// Check if a string looks like a valid UUID hex portion (for replay short ID extraction)
@@ -91,10 +97,8 @@ impl Runnable {
             Runnable::Replay(run_id) => {
                 // run_id format: "run_{uuid}"
                 // Extract hex chars from UUID, removing "run_" prefix and dashes
-                let uuid_part = run_id
-                    .trim_start_matches("run_")
-                    .replace('-', "");
-                
+                let uuid_part = run_id.trim_start_matches("run_").replace('-', "");
+
                 // If it looks like valid UUID hex, extract first 8 chars (lowercase)
                 if is_valid_uuid_hex(&uuid_part) {
                     uuid_part.chars().take(8).collect::<String>().to_lowercase()
@@ -168,7 +172,7 @@ impl Runnable {
     /// Returns the source label for display in list view.
     ///
     /// - Template: "-" (no source, it's a root definition)
-    /// - Replay: shortened run_id 
+    /// - Replay: shortened run_id
     /// - PlaylistItem: "name[index]" format
     pub fn source_label(&self) -> String {
         match self {
@@ -178,9 +182,7 @@ impl Runnable {
                 run_id.trim_start_matches("run_").chars().take(10).collect()
             }
             Runnable::PlaylistItem {
-                playlist_id,
-                index,
-                ..
+                playlist_id, index, ..
             } => {
                 // Format as "name[idx]" - strip the "pl_" prefix for brevity
                 let name = playlist_id.trim_start_matches("pl_");
@@ -298,7 +300,7 @@ mod tests {
         // If this test fails after a code change, it means short IDs have changed
         let runnable = Runnable::Template("tpl_echo".to_string());
         let short_id = runnable.short_id();
-        
+
         // SHA256("template\0tpl_echo") first 4 bytes as hex
         // This is a known value that should not change
         assert_eq!(short_id.len(), 8);
@@ -331,11 +333,11 @@ mod tests {
         // Non-UUID run ID should fallback to hash
         let runnable = Runnable::Replay("run_custom_id_123".to_string());
         let short_id = runnable.short_id();
-        
+
         // Should be 8 hex chars (from hash)
         assert_eq!(short_id.len(), 8);
         assert!(short_id.chars().all(|c| c.is_ascii_hexdigit()));
-        
+
         // Should be deterministic
         let short_id2 = Runnable::Replay("run_custom_id_123".to_string()).short_id();
         assert_eq!(short_id, short_id2);
@@ -384,7 +386,7 @@ mod tests {
             label: None,
         };
         let short_id = runnable.short_id();
-        
+
         assert_eq!(short_id.len(), 8);
         assert!(short_id.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -578,10 +580,22 @@ mod tests {
 
     #[test]
     fn test_runnable_type_from_str() {
-        assert_eq!("template".parse::<RunnableType>().unwrap(), RunnableType::Template);
-        assert_eq!("replay".parse::<RunnableType>().unwrap(), RunnableType::Replay);
-        assert_eq!("playlist".parse::<RunnableType>().unwrap(), RunnableType::Playlist);
-        assert_eq!("TEMPLATE".parse::<RunnableType>().unwrap(), RunnableType::Template);
+        assert_eq!(
+            "template".parse::<RunnableType>().unwrap(),
+            RunnableType::Template
+        );
+        assert_eq!(
+            "replay".parse::<RunnableType>().unwrap(),
+            RunnableType::Replay
+        );
+        assert_eq!(
+            "playlist".parse::<RunnableType>().unwrap(),
+            RunnableType::Playlist
+        );
+        assert_eq!(
+            "TEMPLATE".parse::<RunnableType>().unwrap(),
+            RunnableType::Template
+        );
         assert!("invalid".parse::<RunnableType>().is_err());
     }
 

@@ -51,10 +51,7 @@ fn setup_git_repo(temp: &TempDir) -> String {
         .output()
         .expect("Failed to get commit hash");
 
-    String::from_utf8(output.stdout)
-        .unwrap()
-        .trim()
-        .to_string()
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
 /// Create a run record in the storage
@@ -138,8 +135,15 @@ fn test_replay_creates_worktree_and_executes() {
 
     // Verify worktree was created
     let worktree_path = worktree_dir.join(run_id);
-    assert!(worktree_path.exists(), "Worktree should exist at {:?}", worktree_path);
-    assert!(worktree_path.join("README.md").exists(), "README.md should exist in worktree");
+    assert!(
+        worktree_path.exists(),
+        "Worktree should exist at {:?}",
+        worktree_path
+    );
+    assert!(
+        worktree_path.join("README.md").exists(),
+        "README.md should exist in worktree"
+    );
 }
 
 #[test]
@@ -177,7 +181,10 @@ fn test_replay_with_keep_flag_preserves_worktree() {
 
     // Verify worktree still exists after command finishes
     let worktree_path = worktree_dir.join(run_id);
-    assert!(worktree_path.exists(), "Worktree should be preserved with --keep");
+    assert!(
+        worktree_path.exists(),
+        "Worktree should be preserved with --keep"
+    );
 }
 
 #[test]
@@ -216,7 +223,10 @@ fn test_replay_with_cleanup_removes_worktree() {
 
     // Verify worktree was removed
     let worktree_path = worktree_dir.join(run_id);
-    assert!(!worktree_path.exists(), "Worktree should be removed with --cleanup");
+    assert!(
+        !worktree_path.exists(),
+        "Worktree should be removed with --cleanup"
+    );
 }
 
 #[test]
@@ -255,7 +265,10 @@ fn test_replay_with_fresh_creates_new_worktree() {
 
     // Verify worktree was created
     let worktree_path = worktree_dir.join(run_id);
-    assert!(worktree_path.exists(), "Worktree should be created with --fresh");
+    assert!(
+        worktree_path.exists(),
+        "Worktree should be created with --fresh"
+    );
 }
 
 #[test]
@@ -294,7 +307,9 @@ fn test_replay_with_reuse_reuses_existing_worktree() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Created worktree:"))
-        .stdout(predicate::str::contains(first_worktree_path.to_str().unwrap()));
+        .stdout(predicate::str::contains(
+            first_worktree_path.to_str().unwrap(),
+        ));
 
     assert!(
         first_worktree_path.exists(),
@@ -318,7 +333,9 @@ fn test_replay_with_reuse_reuses_existing_worktree() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Reusing existing worktree:"))
-        .stdout(predicate::str::contains(first_worktree_path.to_str().unwrap()));
+        .stdout(predicate::str::contains(
+            first_worktree_path.to_str().unwrap(),
+        ));
 
     let second_worktree_path = worktree_dir.join(run_id_second);
     assert!(
@@ -360,7 +377,12 @@ fn test_replay_not_in_git_repo() {
 
     // Create a run record (even though we won't be able to use it)
     let run_id = "run_abcd1234-0000-0000-0000-000000000000";
-    create_run_record(&temp, run_id, "a1b2c3d4e5f6789012345678901234567890abcd", ".");
+    create_run_record(
+        &temp,
+        run_id,
+        "a1b2c3d4e5f6789012345678901234567890abcd",
+        ".",
+    );
 
     Command::cargo_bin("runbox")
         .unwrap()

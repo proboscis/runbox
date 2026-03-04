@@ -74,10 +74,17 @@ fn test_create_record_from_file() {
     std::fs::write(&record_file, full_record_json("rec_test-from-file")).unwrap();
 
     runbox_cmd(&temp)
-        .args(["create", "record", "--from-file", record_file.to_str().unwrap()])
+        .args([
+            "create",
+            "record",
+            "--from-file",
+            record_file.to_str().unwrap(),
+        ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Created record: rec_test-from-file"))
+        .stdout(predicate::str::contains(
+            "Created record: rec_test-from-file",
+        ))
         .stdout(predicate::str::contains("Source:   doeff"));
 
     // Verify the specific file was created
@@ -110,10 +117,16 @@ fn test_create_record_auto_generates_id() {
         .clone();
 
     let stdout = String::from_utf8(output).unwrap();
-    assert!(stdout.contains("Created record: rec_"), "Should auto-generate rec_ ID");
+    assert!(
+        stdout.contains("Created record: rec_"),
+        "Should auto-generate rec_ ID"
+    );
 
     // Extract the generated ID and verify it's a valid UUID format
-    let id_line = stdout.lines().find(|l| l.contains("Created record:")).unwrap();
+    let id_line = stdout
+        .lines()
+        .find(|l| l.contains("Created record:"))
+        .unwrap();
     let id = id_line.split("Created record: ").nth(1).unwrap().trim();
     assert!(id.starts_with("rec_"), "ID should start with rec_");
     assert!(id.len() > 10, "ID should be long enough to contain UUID");

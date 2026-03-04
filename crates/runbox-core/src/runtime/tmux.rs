@@ -80,11 +80,7 @@ impl RuntimeAdapter for TmuxAdapter {
 
         // Build full command with env prefix and log redirection
         let full_cmd = if env_prefix.is_empty() {
-            format!(
-                "exec {} > '{}' 2>&1",
-                cmd_str,
-                log_path.display()
-            )
+            format!("exec {} > '{}' 2>&1", cmd_str, log_path.display())
         } else {
             format!(
                 "{} exec {} > '{}' 2>&1",
@@ -215,9 +211,6 @@ mod tests {
     fn test_shell_escape() {
         assert_eq!(TmuxAdapter::shell_escape("hello"), "'hello'");
         assert_eq!(TmuxAdapter::shell_escape("hello world"), "'hello world'");
-        assert_eq!(
-            TmuxAdapter::shell_escape("it's"),
-            "'it'\"'\"'s'"
-        );
+        assert_eq!(TmuxAdapter::shell_escape("it's"), "'it'\"'\"'s'");
     }
 }

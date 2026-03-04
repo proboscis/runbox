@@ -11,7 +11,12 @@ fn runbox_cmd(temp_dir: &TempDir) -> Command {
 }
 
 /// Create a test playlist JSON directly in the storage directory
-fn create_test_playlist(temp_dir: &TempDir, playlist_id: &str, name: &str, items: &[(&str, Option<&str>)]) {
+fn create_test_playlist(
+    temp_dir: &TempDir,
+    playlist_id: &str,
+    name: &str,
+    items: &[(&str, Option<&str>)],
+) {
     let playlists_dir = temp_dir.path().join("playlists");
     fs::create_dir_all(&playlists_dir).unwrap();
 
@@ -35,7 +40,11 @@ fn create_test_playlist(temp_dir: &TempDir, playlist_id: &str, name: &str, items
     });
 
     let playlist_path = playlists_dir.join(format!("{}.json", playlist_id));
-    fs::write(&playlist_path, serde_json::to_string_pretty(&playlist_json).unwrap()).unwrap();
+    fs::write(
+        &playlist_path,
+        serde_json::to_string_pretty(&playlist_json).unwrap(),
+    )
+    .unwrap();
 }
 
 /// Create a test template JSON directly in the storage directory
@@ -63,12 +72,19 @@ fn create_test_template(temp_dir: &TempDir, template_id: &str, name: &str) {
     });
 
     let template_path = templates_dir.join(format!("{}.json", template_id));
-    fs::write(&template_path, serde_json::to_string_pretty(&template_json).unwrap()).unwrap();
+    fs::write(
+        &template_path,
+        serde_json::to_string_pretty(&template_json).unwrap(),
+    )
+    .unwrap();
 }
 
 /// Load a playlist from storage and return its items
 fn load_playlist_items(temp_dir: &TempDir, playlist_id: &str) -> Vec<String> {
-    let playlist_path = temp_dir.path().join("playlists").join(format!("{}.json", playlist_id));
+    let playlist_path = temp_dir
+        .path()
+        .join("playlists")
+        .join(format!("{}.json", playlist_id));
     let content = fs::read_to_string(&playlist_path).unwrap();
     let playlist: serde_json::Value = serde_json::from_str(&content).unwrap();
     playlist["items"]
@@ -84,21 +100,37 @@ fn test_playlist_remove_by_template_id() {
     let temp = TempDir::new().unwrap();
 
     // Setup: create a template and a playlist containing it
-    create_test_template(&temp, "tpl_to-remove-1234-5678-90ab-cdef12345678", "Template to Remove");
-    create_test_template(&temp, "tpl_to-keep-1234-5678-90ab-cdef12345678", "Template to Keep");
+    create_test_template(
+        &temp,
+        "tpl_to-remove-1234-5678-90ab-cdef12345678",
+        "Template to Remove",
+    );
+    create_test_template(
+        &temp,
+        "tpl_to-keep-1234-5678-90ab-cdef12345678",
+        "Template to Keep",
+    );
     create_test_playlist(
         &temp,
         "pl_test-remove-1234",
         "Test Playlist",
         &[
-            ("tpl_to-remove-1234-5678-90ab-cdef12345678", Some("Remove Me")),
+            (
+                "tpl_to-remove-1234-5678-90ab-cdef12345678",
+                Some("Remove Me"),
+            ),
             ("tpl_to-keep-1234-5678-90ab-cdef12345678", Some("Keep Me")),
         ],
     );
 
     // Remove the template from the playlist
     runbox_cmd(&temp)
-        .args(["playlist", "remove", "pl_test-remove-1234", "tpl_to-remove-1234-5678-90ab-cdef12345678"])
+        .args([
+            "playlist",
+            "remove",
+            "pl_test-remove-1234",
+            "tpl_to-remove-1234-5678-90ab-cdef12345678",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("Removed"));
@@ -195,7 +227,12 @@ fn test_playlist_remove_not_found() {
 
     // Try to remove from a nonexistent playlist
     runbox_cmd(&temp)
-        .args(["playlist", "remove", "nonexistent", "tpl_exists-1234-5678-90ab-cdef12345678"])
+        .args([
+            "playlist",
+            "remove",
+            "nonexistent",
+            "tpl_exists-1234-5678-90ab-cdef12345678",
+        ])
         .assert()
         .failure()
         .stderr(predicate::str::contains("No item found"));
@@ -206,8 +243,16 @@ fn test_playlist_remove_template_not_in_playlist() {
     let temp = TempDir::new().unwrap();
 
     // Setup: create templates and a playlist that doesn't contain the template to remove
-    create_test_template(&temp, "tpl_in-playlist-1234-5678-90ab-cdef12345678", "In Playlist");
-    create_test_template(&temp, "tpl_not-in-playlist-1234-5678-90ab-cdef12345678", "Not In Playlist");
+    create_test_template(
+        &temp,
+        "tpl_in-playlist-1234-5678-90ab-cdef12345678",
+        "In Playlist",
+    );
+    create_test_template(
+        &temp,
+        "tpl_not-in-playlist-1234-5678-90ab-cdef12345678",
+        "Not In Playlist",
+    );
     create_test_playlist(
         &temp,
         "pl_has-item-1234-5678",
@@ -217,7 +262,12 @@ fn test_playlist_remove_template_not_in_playlist() {
 
     // Try to remove a template that is not in the playlist
     runbox_cmd(&temp)
-        .args(["playlist", "remove", "pl_has-item-1234-5678", "tpl_not-in-playlist-1234-5678-90ab-cdef12345678"])
+        .args([
+            "playlist",
+            "remove",
+            "pl_has-item-1234-5678",
+            "tpl_not-in-playlist-1234-5678-90ab-cdef12345678",
+        ])
         .assert()
         .failure()
         .stderr(predicate::str::contains("not found in playlist"));
@@ -232,12 +282,21 @@ fn test_playlist_remove_empty_playlist() {
     let temp = TempDir::new().unwrap();
 
     // Setup: create a template and an empty playlist
-    create_test_template(&temp, "tpl_orphan-1234-5678-90ab-cdef12345678", "Orphan Template");
+    create_test_template(
+        &temp,
+        "tpl_orphan-1234-5678-90ab-cdef12345678",
+        "Orphan Template",
+    );
     create_test_playlist(&temp, "pl_empty-1234-5678", "Empty Playlist", &[]);
 
     // Try to remove a template from an empty playlist
     runbox_cmd(&temp)
-        .args(["playlist", "remove", "pl_empty-1234-5678", "tpl_orphan-1234-5678-90ab-cdef12345678"])
+        .args([
+            "playlist",
+            "remove",
+            "pl_empty-1234-5678",
+            "tpl_orphan-1234-5678-90ab-cdef12345678",
+        ])
         .assert()
         .failure()
         .stderr(predicate::str::contains("not found in playlist"));

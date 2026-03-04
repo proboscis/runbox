@@ -56,7 +56,9 @@ impl Storage {
 
         // Check for legacy macOS data and migrate if needed
         if let Some(legacy_dir) = legacy_macos_dir() {
-            if let Err(e) = Self::migrate_from_legacy(&legacy_dir, &data_dir, &state_dir) { eprintln!("[runbox] Migration warning: {}", e); }
+            if let Err(e) = Self::migrate_from_legacy(&legacy_dir, &data_dir, &state_dir) {
+                eprintln!("[runbox] Migration warning: {}", e);
+            }
         }
 
         Self::with_data_and_state_dirs(data_dir, state_dir)
@@ -85,23 +87,24 @@ impl Storage {
         // Create state directories
         fs::create_dir_all(state_dir.join("logs"))?;
 
-        Ok(Self { data_dir, state_dir })
+        Ok(Self {
+            data_dir,
+            state_dir,
+        })
     }
 
     /// Migrate data from legacy macOS path to XDG paths
-    fn migrate_from_legacy(legacy_dir: &PathBuf, data_dir: &PathBuf, state_dir: &PathBuf) -> Result<()> {
+    fn migrate_from_legacy(
+        legacy_dir: &PathBuf,
+        data_dir: &PathBuf,
+        state_dir: &PathBuf,
+    ) -> Result<()> {
         eprintln!(
             "[runbox] Migrating from legacy storage: {}",
             legacy_dir.display()
         );
-        eprintln!(
-            "[runbox]   → Data: {}",
-            data_dir.display()
-        );
-        eprintln!(
-            "[runbox]   → State: {}",
-            state_dir.display()
-        );
+        eprintln!("[runbox]   → Data: {}", data_dir.display());
+        eprintln!("[runbox]   → State: {}", state_dir.display());
 
         // Create target directories
         fs::create_dir_all(data_dir)?;
@@ -113,7 +116,9 @@ impl Storage {
             let src = legacy_dir.join(subdir);
             let dst = data_dir.join(subdir);
             if src.exists() && src.is_dir() {
-                if let Err(e) = Self::migrate_directory(&src, &dst) { eprintln!("[runbox] Warning: failed to migrate {}: {}", subdir, e); }
+                if let Err(e) = Self::migrate_directory(&src, &dst) {
+                    eprintln!("[runbox] Warning: failed to migrate {}: {}", subdir, e);
+                }
             }
         }
 
@@ -123,7 +128,9 @@ impl Storage {
             let src = legacy_dir.join(subdir);
             let dst = state_dir.join(subdir);
             if src.exists() && src.is_dir() {
-                if let Err(e) = Self::migrate_directory(&src, &dst) { eprintln!("[runbox] Warning: failed to migrate {}: {}", subdir, e); }
+                if let Err(e) = Self::migrate_directory(&src, &dst) {
+                    eprintln!("[runbox] Warning: failed to migrate {}: {}", subdir, e);
+                }
             }
         }
 
@@ -222,8 +229,14 @@ impl Storage {
 
     /// Save a run (with atomic write via rename)
     pub fn save_run(&self, run: &Run) -> Result<PathBuf> {
-        let path = self.data_dir.join("runs").join(format!("{}.json", run.run_id));
-        let temp_path = self.data_dir.join("runs").join(format!("{}.json.tmp", run.run_id));
+        let path = self
+            .data_dir
+            .join("runs")
+            .join(format!("{}.json", run.run_id));
+        let temp_path = self
+            .data_dir
+            .join("runs")
+            .join(format!("{}.json.tmp", run.run_id));
 
         let json = serde_json::to_string_pretty(run)?;
 
@@ -252,7 +265,10 @@ impl Storage {
         F: FnOnce(&mut Run),
     {
         let path = self.data_dir.join("runs").join(format!("{}.json", run_id));
-        let lock_path = self.data_dir.join("runs").join(format!("{}.json.lock", run_id));
+        let lock_path = self
+            .data_dir
+            .join("runs")
+            .join(format!("{}.json.lock", run_id));
 
         // Acquire exclusive lock
         let lock_file = File::create(&lock_path)?;
@@ -297,7 +313,10 @@ impl Storage {
         update_fn(&mut current_run);
 
         // Write atomically
-        let temp_path = self.data_dir.join("runs").join(format!("{}.json.tmp", run_id));
+        let temp_path = self
+            .data_dir
+            .join("runs")
+            .join(format!("{}.json.tmp", run_id));
         let json = serde_json::to_string_pretty(&current_run)?;
 
         let mut file = File::create(&temp_path)?;
@@ -329,8 +348,8 @@ impl Storage {
     /// Load a run by ID
     pub fn load_run(&self, run_id: &str) -> Result<Run> {
         let path = self.data_dir.join("runs").join(format!("{}.json", run_id));
-        let json = fs::read_to_string(&path)
-            .with_context(|| format!("Run not found: {}", run_id))?;
+        let json =
+            fs::read_to_string(&path).with_context(|| format!("Run not found: {}", run_id))?;
         let run: Run = serde_json::from_str(&json)?;
         Ok(run)
     }
@@ -382,14 +401,13 @@ impl Storage {
         self.state_dir.join("logs")
     }
 
-
     // === Record operations ===
 
     /// Save a record (with atomic write via rename)
     pub fn save_record(&self, record: &crate::Record) -> Result<PathBuf> {
         let records_dir = self.data_dir.join("records");
         fs::create_dir_all(&records_dir)?;
-        
+
         let path = records_dir.join(format!("{}.json", record.record_id));
         let temp_path = records_dir.join(format!("{}.json.tmp", record.record_id));
 
@@ -407,7 +425,10 @@ impl Storage {
 
     /// Load a record by ID
     pub fn load_record(&self, record_id: &str) -> Result<crate::Record> {
-        let path = self.data_dir.join("records").join(format!("{}.json", record_id));
+        let path = self
+            .data_dir
+            .join("records")
+            .join(format!("{}.json", record_id));
         let json = fs::read_to_string(&path)
             .with_context(|| format!("Record not found: {}", record_id))?;
         let record: crate::Record = serde_json::from_str(&json)?;
@@ -420,7 +441,7 @@ impl Storage {
         if !records_dir.exists() {
             return Ok(Vec::new());
         }
-        
+
         let mut entries: Vec<_> = fs::read_dir(&records_dir)?
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -665,8 +686,8 @@ impl Storage {
     pub fn load_blob(&self, blob_ref: &str) -> Result<Vec<u8>> {
         let hash = blob_ref.trim_start_matches("blobs/");
         let blob_path = self.data_dir.join("blobs").join(hash);
-        let content = fs::read(&blob_path)
-            .with_context(|| format!("Blob not found: {}", blob_ref))?;
+        let content =
+            fs::read(&blob_path).with_context(|| format!("Blob not found: {}", blob_ref))?;
         Ok(content)
     }
 
@@ -831,7 +852,7 @@ impl Storage {
     /// A vector of all Runnables: templates first, then replays, then playlist items
     pub fn list_all_runnables(&self, replay_limit: usize) -> Result<Vec<crate::Runnable>> {
         use crate::Runnable;
-        
+
         let mut runnables = Vec::new();
 
         // Collect templates
@@ -860,7 +881,7 @@ impl Storage {
     }
 
     /// Get the repo URL for a runnable.
-    /// 
+    ///
     /// - For Template: returns the template's code_state.repo_url
     /// - For Replay: returns the run's code_state.repo_url
     /// - For PlaylistItem: returns the referenced template's code_state.repo_url
@@ -869,33 +890,32 @@ impl Storage {
             crate::Runnable::Template(id) => {
                 self.load_template(id).ok().map(|t| t.code_state.repo_url)
             }
-            crate::Runnable::Replay(id) => {
-                self.load_run(id).ok().map(|r| r.code_state.repo_url)
-            }
-            crate::Runnable::PlaylistItem { template_id, .. } => {
-                self.load_template(template_id).ok().map(|t| t.code_state.repo_url)
-            }
+            crate::Runnable::Replay(id) => self.load_run(id).ok().map(|r| r.code_state.repo_url),
+            crate::Runnable::PlaylistItem { template_id, .. } => self
+                .load_template(template_id)
+                .ok()
+                .map(|t| t.code_state.repo_url),
         }
     }
 
     /// Get a display-friendly name for a runnable.
-    /// 
+    ///
     /// - For Template: returns the template's name
     /// - For Replay: returns the command (first part of argv)
     /// - For PlaylistItem: returns the label or template name
     pub fn get_runnable_display_name(&self, runnable: &crate::Runnable) -> String {
         match runnable {
-            crate::Runnable::Template(id) => {
-                self.load_template(id)
-                    .map(|t| t.name)
-                    .unwrap_or_else(|_| id.clone())
-            }
-            crate::Runnable::Replay(id) => {
-                self.load_run(id)
-                    .map(|r| r.exec.argv.join(" "))
-                    .unwrap_or_else(|_| id.clone())
-            }
-            crate::Runnable::PlaylistItem { label, template_id, .. } => {
+            crate::Runnable::Template(id) => self
+                .load_template(id)
+                .map(|t| t.name)
+                .unwrap_or_else(|_| id.clone()),
+            crate::Runnable::Replay(id) => self
+                .load_run(id)
+                .map(|r| r.exec.argv.join(" "))
+                .unwrap_or_else(|_| id.clone()),
+            crate::Runnable::PlaylistItem {
+                label, template_id, ..
+            } => {
                 if let Some(lbl) = label {
                     lbl.clone()
                 } else {
@@ -996,11 +1016,20 @@ mod tests {
     #[test]
     fn test_short_id() {
         // Test with run_id prefix
-        assert_eq!(short_id("run_550e8400-e29b-41d4-a716-446655440000"), "550e8400");
+        assert_eq!(
+            short_id("run_550e8400-e29b-41d4-a716-446655440000"),
+            "550e8400"
+        );
         // Test with template_id prefix
-        assert_eq!(short_id("tpl_a1b2c3d4-e5f6-7890-abcd-ef1234567890"), "a1b2c3d4");
+        assert_eq!(
+            short_id("tpl_a1b2c3d4-e5f6-7890-abcd-ef1234567890"),
+            "a1b2c3d4"
+        );
         // Test with playlist_id prefix
-        assert_eq!(short_id("pl_def45678-90ab-cdef-1234-567890abcdef"), "def45678");
+        assert_eq!(
+            short_id("pl_def45678-90ab-cdef-1234-567890abcdef"),
+            "def45678"
+        );
         // Test without prefix (should still work)
         assert_eq!(short_id("550e8400-e29b-41d4-a716-446655440000"), "550e8400");
         // Test short input
@@ -1152,14 +1181,12 @@ mod tests {
         storage.save_run(&run).unwrap();
 
         // CAS update should succeed when status matches
-        let result = storage.save_run_if_status_with(
-            &run.run_id,
-            &[crate::RunStatus::Running],
-            |current| {
+        let result = storage
+            .save_run_if_status_with(&run.run_id, &[crate::RunStatus::Running], |current| {
                 current.status = crate::RunStatus::Exited;
                 current.exit_code = Some(0);
-            },
-        ).unwrap();
+            })
+            .unwrap();
 
         assert!(result, "CAS should succeed when status matches");
 
@@ -1193,14 +1220,16 @@ mod tests {
         storage.save_run(&run).unwrap();
 
         // CAS update should fail when status doesn't match
-        let result = storage.save_run_if_status_with(
-            &run.run_id,
-            &[crate::RunStatus::Running], // Expecting Running but it's Exited
-            |current| {
-                current.status = crate::RunStatus::Unknown;
-                current.exit_code = Some(99);
-            },
-        ).unwrap();
+        let result = storage
+            .save_run_if_status_with(
+                &run.run_id,
+                &[crate::RunStatus::Running], // Expecting Running but it's Exited
+                |current| {
+                    current.status = crate::RunStatus::Unknown;
+                    current.exit_code = Some(99);
+                },
+            )
+            .unwrap();
 
         assert!(!result, "CAS should fail when status doesn't match");
 
@@ -1313,12 +1342,7 @@ mod tests {
         let started = Utc::now();
         let finished = started + chrono::Duration::seconds(1);
 
-        let mut result = crate::RunResult::new(
-            "run_test".to_string(),
-            started,
-            finished,
-            0,
-        );
+        let mut result = crate::RunResult::new("run_test".to_string(), started, finished, 0);
         result.result_id = "result_550e8400-e29b-41d4-a716-446655440000".to_string();
 
         storage.save_result(&result).unwrap();
@@ -1390,7 +1414,9 @@ mod tests {
         // Resolve by short ID prefix
         let resolved = storage.resolve_runnable("550e", 100).unwrap();
         match resolved {
-            crate::Runnable::Replay(id) => assert_eq!(id, "run_550e8400-e29b-41d4-a716-446655440000"),
+            crate::Runnable::Replay(id) => {
+                assert_eq!(id, "run_550e8400-e29b-41d4-a716-446655440000")
+            }
             _ => panic!("Expected Replay runnable"),
         }
     }
@@ -1435,7 +1461,12 @@ mod tests {
         // Resolve by short ID prefix
         let resolved = storage.resolve_runnable(&short_id[..4], 100).unwrap();
         match resolved {
-            crate::Runnable::PlaylistItem { playlist_id, index, template_id, .. } => {
+            crate::Runnable::PlaylistItem {
+                playlist_id,
+                index,
+                template_id,
+                ..
+            } => {
                 assert_eq!(playlist_id, "pl_daily");
                 assert_eq!(index, 0);
                 assert_eq!(template_id, "tpl_echo");
@@ -1452,7 +1483,10 @@ mod tests {
         // Use a valid hex string that doesn't match anything
         let result = storage.resolve_runnable("deadbeef", 100);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No runnable found"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No runnable found"));
     }
 
     #[test]
@@ -1530,9 +1564,13 @@ mod tests {
         storage.save_run(&run).unwrap();
 
         // Resolve by full run ID
-        let resolved = storage.resolve_runnable("run_550e8400-e29b-41d4-a716-446655440000", 100).unwrap();
+        let resolved = storage
+            .resolve_runnable("run_550e8400-e29b-41d4-a716-446655440000", 100)
+            .unwrap();
         match resolved {
-            crate::Runnable::Replay(id) => assert_eq!(id, "run_550e8400-e29b-41d4-a716-446655440000"),
+            crate::Runnable::Replay(id) => {
+                assert_eq!(id, "run_550e8400-e29b-41d4-a716-446655440000")
+            }
             _ => panic!("Expected Replay runnable"),
         }
     }

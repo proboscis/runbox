@@ -28,11 +28,20 @@ fn create_test_template(temp_dir: &TempDir, template_id: &str, name: &str) {
     });
 
     let template_path = templates_dir.join(format!("{}.json", template_id));
-    fs::write(&template_path, serde_json::to_string_pretty(&template_json).unwrap()).unwrap();
+    fs::write(
+        &template_path,
+        serde_json::to_string_pretty(&template_json).unwrap(),
+    )
+    .unwrap();
 }
 
 /// Create a test playlist JSON directly in the storage directory
-fn create_test_playlist(temp_dir: &TempDir, playlist_id: &str, name: &str, items: Vec<(&str, Option<&str>)>) {
+fn create_test_playlist(
+    temp_dir: &TempDir,
+    playlist_id: &str,
+    name: &str,
+    items: Vec<(&str, Option<&str>)>,
+) {
     let playlists_dir = temp_dir.path().join("playlists");
     fs::create_dir_all(&playlists_dir).unwrap();
 
@@ -56,7 +65,11 @@ fn create_test_playlist(temp_dir: &TempDir, playlist_id: &str, name: &str, items
     });
 
     let playlist_path = playlists_dir.join(format!("{}.json", playlist_id));
-    fs::write(&playlist_path, serde_json::to_string_pretty(&playlist_json).unwrap()).unwrap();
+    fs::write(
+        &playlist_path,
+        serde_json::to_string_pretty(&playlist_json).unwrap(),
+    )
+    .unwrap();
 }
 
 /// Helper to extract short ID from playlist show output
@@ -127,11 +140,12 @@ fn test_playlist_run_dry_run_by_global_short_id() {
         .unwrap();
 
     let stdout = String::from_utf8_lossy(&show_output.stdout);
-    
+
     // Extract the short ID from the flattened table output
     // Format: PLAYLIST  IDX  SHORT     TEMPLATE        LABEL
     let lines: Vec<&str> = stdout.lines().collect();
-    let short_id: Option<String> = lines.iter()
+    let short_id: Option<String> = lines
+        .iter()
         .skip_while(|line| !line.starts_with("---"))
         .skip(1)
         .next()
@@ -141,8 +155,15 @@ fn test_playlist_run_dry_run_by_global_short_id() {
             parts.get(2).map(|s| s.to_string())
         });
 
-    let short_id = short_id.expect(&format!("Could not extract short ID from output:\n{}", stdout));
-    assert!(short_id.chars().all(|c| c.is_ascii_hexdigit()), "Short ID should be hex: {}", short_id);
+    let short_id = short_id.expect(&format!(
+        "Could not extract short ID from output:\n{}",
+        stdout
+    ));
+    assert!(
+        short_id.chars().all(|c| c.is_ascii_hexdigit()),
+        "Short ID should be hex: {}",
+        short_id
+    );
 
     // Run using the GLOBAL short ID (one argument, not playlist + item)
     Command::cargo_bin("runbox")
@@ -240,9 +261,10 @@ fn test_playlist_run_short_id_prefix_match() {
         .unwrap();
 
     let stdout = String::from_utf8_lossy(&show_output.stdout);
-    
+
     let lines: Vec<&str> = stdout.lines().collect();
-    let short_id: Option<String> = lines.iter()
+    let short_id: Option<String> = lines
+        .iter()
         .skip_while(|line| !line.starts_with("---"))
         .skip(1)
         .next()
@@ -251,8 +273,15 @@ fn test_playlist_run_short_id_prefix_match() {
             parts.get(2).map(|s| s.to_string())
         });
 
-    let short_id = short_id.expect(&format!("Could not extract short ID from output:\n{}", stdout));
-    assert!(short_id.len() >= 4, "Short ID too short for prefix test: {}", short_id);
+    let short_id = short_id.expect(&format!(
+        "Could not extract short ID from output:\n{}",
+        stdout
+    ));
+    assert!(
+        short_id.len() >= 4,
+        "Short ID too short for prefix test: {}",
+        short_id
+    );
 
     // Use only first 4 characters (prefix match)
     let prefix = &short_id[..4];
@@ -297,10 +326,11 @@ fn test_playlist_run_multiple_playlists_global_short_id() {
         .unwrap();
 
     let stdout = String::from_utf8_lossy(&show_output.stdout);
-    
+
     // Find the line with "Backup Data"
     let lines: Vec<&str> = stdout.lines().collect();
-    let backup_line = lines.iter()
+    let backup_line = lines
+        .iter()
         .find(|line| line.contains("Backup Data"))
         .expect("Could not find Backup Data line");
 

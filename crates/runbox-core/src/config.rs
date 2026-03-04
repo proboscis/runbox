@@ -61,10 +61,12 @@ impl RunboxConfig {
     pub fn load_global() -> Result<Self> {
         let config_path = Self::global_config_path();
         if config_path.exists() {
-            let content = std::fs::read_to_string(&config_path)
-                .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
-            let config: RunboxConfig = toml::from_str(&content)
-                .with_context(|| format!("Failed to parse config file: {}", config_path.display()))?;
+            let content = std::fs::read_to_string(&config_path).with_context(|| {
+                format!("Failed to read config file: {}", config_path.display())
+            })?;
+            let config: RunboxConfig = toml::from_str(&content).with_context(|| {
+                format!("Failed to parse config file: {}", config_path.display())
+            })?;
             Ok(config)
         } else {
             Ok(Self::default())
@@ -290,14 +292,38 @@ impl VerboseLogger {
         name: &str,
         resolved: &ResolvedValue<T>,
     ) {
-        self.log_v("config", &format!("{}: {} (from: {})", name, resolved.value, resolved.source));
+        self.log_v(
+            "config",
+            &format!("{}: {} (from: {})", name, resolved.value, resolved.source),
+        );
     }
 
     /// Log all config layers checked (at -vv level)
-    pub fn log_config_layers(&self, name: &str, cli: Option<&str>, git: Option<&str>, global: Option<&str>, used: &str, source: ConfigSource) {
-        self.log_vv("config", &format!("checking CLI flag --{}: {}", name, cli.unwrap_or("not set")));
-        self.log_vv("config", &format!("checking git config runbox.{}: {}", name, git.unwrap_or("not set")));
-        self.log_vv("config", &format!("checking global config: {}", global.unwrap_or("not set")));
+    pub fn log_config_layers(
+        &self,
+        name: &str,
+        cli: Option<&str>,
+        git: Option<&str>,
+        global: Option<&str>,
+        used: &str,
+        source: ConfigSource,
+    ) {
+        self.log_vv(
+            "config",
+            &format!("checking CLI flag --{}: {}", name, cli.unwrap_or("not set")),
+        );
+        self.log_vv(
+            "config",
+            &format!(
+                "checking git config runbox.{}: {}",
+                name,
+                git.unwrap_or("not set")
+            ),
+        );
+        self.log_vv(
+            "config",
+            &format!("checking global config: {}", global.unwrap_or("not set")),
+        );
         self.log_vv("config", &format!("→ using: {} (source: {})", used, source));
     }
 }

@@ -97,7 +97,10 @@ mod tests {
 
     #[test]
     fn test_response_serialization() {
-        let response = Response::Spawned { pid: 1234, pgid: 1234 };
+        let response = Response::Spawned {
+            pid: 1234,
+            pgid: 1234,
+        };
 
         let mut buf = Vec::new();
         write_message(&mut buf, &response).unwrap();
@@ -174,6 +177,9 @@ mod tests {
         let result: std::io::Result<Request> = read_message(&mut cursor);
 
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
     }
 }

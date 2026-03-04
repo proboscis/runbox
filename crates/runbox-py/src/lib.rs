@@ -31,8 +31,11 @@ fn run_template(template_id: &str, bindings: Option<HashMap<String, String>>) ->
     let code_state = git.build_code_state(&temp_run_id).map_err(to_py_err)?;
 
     // Build and save run
-    let run = resolver.build_run(&template, code_state).map_err(to_py_err)?;
-    run.validate().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let run = resolver
+        .build_run(&template, code_state)
+        .map_err(to_py_err)?;
+    run.validate()
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     storage.save_run(&run).map_err(to_py_err)?;
 

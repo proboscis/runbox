@@ -18,15 +18,15 @@ pub struct Record {
     pub record_version: u32,
     /// Unique identifier (rec_<uuid>)
     pub record_id: String,
-    
+
     // === Git State ===
     /// Git repository state for reproducibility
     pub git_state: RecordGitState,
-    
+
     // === Execution Specification ===
     /// The command that was executed
     pub command: RecordCommand,
-    
+
     // === Result (filled after execution completes) ===
     /// Exit code (None if not yet completed or interrupted)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -37,7 +37,7 @@ pub struct Record {
     /// When the command ended
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<DateTime<Utc>>,
-    
+
     // === Metadata ===
     /// When this record was created
     pub created_at: DateTime<Utc>,
@@ -98,7 +98,7 @@ impl Record {
             source: "runbox".to_string(),
         }
     }
-    
+
     /// Create a Record with a specific ID (for external tool integration)
     pub fn with_id(record_id: String, git_state: RecordGitState, command: RecordCommand) -> Self {
         Self {
@@ -115,7 +115,7 @@ impl Record {
             source: "runbox".to_string(),
         }
     }
-    
+
     /// Get the short ID (first 8 hex characters of UUID)
     pub fn short_id(&self) -> &str {
         // record_id format: "rec_{uuid}"
@@ -125,23 +125,23 @@ impl Record {
             &self.record_id
         }
     }
-    
+
     /// Mark the record as started
     pub fn mark_started(&mut self) {
         self.started_at = Some(Utc::now());
     }
-    
+
     /// Mark the record as completed with exit code
     pub fn mark_completed(&mut self, exit_code: i32) {
         self.exit_code = Some(exit_code);
         self.ended_at = Some(Utc::now());
     }
-    
+
     /// Check if this record has completed (has exit code)
     pub fn is_completed(&self) -> bool {
         self.exit_code.is_some()
     }
-    
+
     /// Get the duration in milliseconds (if completed)
     pub fn duration_ms(&self) -> Option<i64> {
         match (self.started_at, self.ended_at) {
@@ -149,26 +149,30 @@ impl Record {
             _ => None,
         }
     }
-    
+
     /// Validate the record
     pub fn validate(&self) -> Result<(), RecordValidationError> {
         // record_id format
         if !self.record_id.starts_with("rec_") {
-            return Err(RecordValidationError::InvalidRecordId(self.record_id.clone()));
+            return Err(RecordValidationError::InvalidRecordId(
+                self.record_id.clone(),
+            ));
         }
-        
+
         // command.argv non-empty
         if self.command.argv.is_empty() {
             return Err(RecordValidationError::EmptyCommand);
         }
-        
+
         // git_state.commit format (40 hex chars)
         if self.git_state.commit.len() != 40
             || !self.git_state.commit.chars().all(|c| c.is_ascii_hexdigit())
         {
-            return Err(RecordValidationError::InvalidCommit(self.git_state.commit.clone()));
+            return Err(RecordValidationError::InvalidCommit(
+                self.git_state.commit.clone(),
+            ));
         }
-        
+
         Ok(())
     }
 }
@@ -187,7 +191,7 @@ pub enum RecordValidationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_record_creation() {
         let record = Record::new(
@@ -202,12 +206,12 @@ mod tests {
                 env: HashMap::new(),
             },
         );
-        
+
         assert!(record.record_id.starts_with("rec_"));
         assert_eq!(record.short_id().len(), 8);
         assert!(!record.is_completed());
     }
-    
+
     #[test]
     fn test_record_lifecycle() {
         let mut record = Record::new(
@@ -222,19 +226,19 @@ mod tests {
                 env: HashMap::new(),
             },
         );
-        
+
         assert!(!record.is_completed());
         assert!(record.started_at.is_none());
-        
+
         record.mark_started();
         assert!(record.started_at.is_some());
-        
+
         record.mark_completed(0);
         assert!(record.is_completed());
         assert_eq!(record.exit_code, Some(0));
         assert!(record.ended_at.is_some());
     }
-    
+
     #[test]
     fn test_record_serialization() {
         let mut record = Record::new(
@@ -253,17 +257,17 @@ mod tests {
         );
         record.tags = vec!["ml".to_string(), "training".to_string()];
         record.source = "doeff".to_string();
-        
+
         let json = serde_json::to_string_pretty(&record).unwrap();
         let parsed: Record = serde_json::from_str(&json).unwrap();
-        
+
         assert_eq!(parsed.record_id, record.record_id);
         assert_eq!(parsed.git_state.repo_url, "git@github.com:org/repo.git");
         assert_eq!(parsed.command.argv, vec!["python", "train.py"]);
         assert_eq!(parsed.tags, vec!["ml", "training"]);
         assert_eq!(parsed.source, "doeff");
     }
-    
+
     #[test]
     fn test_record_validation() {
         // Valid record
@@ -280,7 +284,7 @@ mod tests {
             },
         );
         assert!(record.validate().is_ok());
-        
+
         // Invalid record_id
         let mut invalid = record.clone();
         invalid.record_id = "invalid".to_string();
@@ -288,7 +292,7 @@ mod tests {
             invalid.validate(),
             Err(RecordValidationError::InvalidRecordId(_))
         ));
-        
+
         // Empty command
         let mut invalid = record.clone();
         invalid.command.argv = vec![];
@@ -296,7 +300,7 @@ mod tests {
             invalid.validate(),
             Err(RecordValidationError::EmptyCommand)
         ));
-        
+
         // Invalid commit
         let mut invalid = record.clone();
         invalid.git_state.commit = "short".to_string();
@@ -305,7 +309,7 @@ mod tests {
             Err(RecordValidationError::InvalidCommit(_))
         ));
     }
-    
+
     #[test]
     fn test_record_with_custom_id() {
         let record = Record::with_id(
@@ -321,7 +325,7 @@ mod tests {
                 env: HashMap::new(),
             },
         );
-        
+
         assert_eq!(record.record_id, "rec_my-custom-id");
     }
 }

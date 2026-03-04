@@ -51,7 +51,11 @@ fn setup_template_and_playlist(temp: &TempDir, template_id: &str, playlist_id: &
         .success();
 
     let playlist_file = temp.path().join("playlist.json");
-    std::fs::write(&playlist_file, valid_playlist_json(playlist_id, "Test Playlist")).unwrap();
+    std::fs::write(
+        &playlist_file,
+        valid_playlist_json(playlist_id, "Test Playlist"),
+    )
+    .unwrap();
 
     runbox_cmd(temp)
         .args(["playlist", "create", playlist_file.to_str().unwrap()])
@@ -146,7 +150,14 @@ fn test_playlist_add_multiple_items() {
         .success();
 
     runbox_cmd(&temp)
-        .args(["playlist", "add", "pl_multi", "tpl_second", "--label", "Second"])
+        .args([
+            "playlist",
+            "add",
+            "pl_multi",
+            "tpl_second",
+            "--label",
+            "Second",
+        ])
         .assert()
         .success();
 

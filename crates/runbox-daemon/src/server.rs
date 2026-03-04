@@ -144,9 +144,7 @@ impl Server {
 
             // Check for idle timeout
             if let Some(timeout) = self.idle_timeout {
-                if self.process_manager.process_count() == 0
-                    && last_activity.elapsed() > timeout
-                {
+                if self.process_manager.process_count() == 0 && last_activity.elapsed() > timeout {
                     log::info!("Idle timeout reached, exiting");
                     break;
                 }
@@ -217,14 +215,12 @@ impl Server {
                     message: e.to_string(),
                 },
             },
-            Request::Stop { run_id, force } => {
-                match self.process_manager.stop(&run_id, force) {
-                    Ok(()) => Response::Stopped,
-                    Err(e) => Response::Error {
-                        message: e.to_string(),
-                    },
-                }
-            }
+            Request::Stop { run_id, force } => match self.process_manager.stop(&run_id, force) {
+                Ok(()) => Response::Stopped,
+                Err(e) => Response::Error {
+                    message: e.to_string(),
+                },
+            },
             Request::Status { run_id } => match self.process_manager.status(&run_id) {
                 Ok((alive, exit_code, signal)) => Response::Status {
                     alive,

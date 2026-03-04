@@ -175,12 +175,15 @@ impl RuntimeAdapter for ZellijAdapter {
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
                 // Ignore various "not found" error messages
-                if !stderr.contains("not found") 
-                    && !stderr.contains("no session") 
+                if !stderr.contains("not found")
+                    && !stderr.contains("no session")
                     && !stderr.contains("doesn't exist")
-                    && !stderr.is_empty() 
+                    && !stderr.is_empty()
                 {
-                    bail!("Failed to kill zellij session: {}", String::from_utf8_lossy(&output.stderr));
+                    bail!(
+                        "Failed to kill zellij session: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
                 }
             }
 
@@ -196,9 +199,7 @@ impl RuntimeAdapter for ZellijAdapter {
                 bail!("Cannot attach from inside zellij. Detach first (Ctrl+O, D) then run: zellij attach {}", session);
             }
 
-            let err = Command::new("zellij")
-                .args(["attach", session])
-                .exec();
+            let err = Command::new("zellij").args(["attach", session]).exec();
             bail!("Failed to attach to zellij session: {}", err);
         } else {
             bail!("Invalid handle type for ZellijAdapter")

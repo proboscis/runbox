@@ -30,7 +30,11 @@ fn create_test_template(temp_dir: &TempDir, template_id: &str, name: &str) {
     });
 
     let template_path = templates_dir.join(format!("{}.json", template_id));
-    fs::write(&template_path, serde_json::to_string_pretty(&template_json).unwrap()).unwrap();
+    fs::write(
+        &template_path,
+        serde_json::to_string_pretty(&template_json).unwrap(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -38,7 +42,11 @@ fn test_template_show() {
     let temp = TempDir::new().unwrap();
 
     // Setup: create a template
-    create_test_template(&temp, "tpl_test-1234-5678-90ab-cdef12345678", "Test Template");
+    create_test_template(
+        &temp,
+        "tpl_test-1234-5678-90ab-cdef12345678",
+        "Test Template",
+    );
 
     Command::cargo_bin("runbox")
         .unwrap()
@@ -46,7 +54,9 @@ fn test_template_show() {
         .args(["template", "show", "tpl_test-1234-5678-90ab-cdef12345678"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("tpl_test-1234-5678-90ab-cdef12345678"))
+        .stdout(predicate::str::contains(
+            "tpl_test-1234-5678-90ab-cdef12345678",
+        ))
         .stdout(predicate::str::contains("Test Template"))
         .stdout(predicate::str::contains("echo"))
         .stdout(predicate::str::contains("repo_url"));
@@ -57,7 +67,11 @@ fn test_template_show_with_short_id() {
     let temp = TempDir::new().unwrap();
 
     // Setup: create a template
-    create_test_template(&temp, "tpl_abcd1234-5678-90ab-cdef12345678", "Short ID Template");
+    create_test_template(
+        &temp,
+        "tpl_abcd1234-5678-90ab-cdef12345678",
+        "Short ID Template",
+    );
 
     // Use only the first few characters of the template ID (without tpl_ prefix)
     Command::cargo_bin("runbox")
@@ -66,7 +80,9 @@ fn test_template_show_with_short_id() {
         .args(["template", "show", "abcd12"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("tpl_abcd1234-5678-90ab-cdef12345678"))
+        .stdout(predicate::str::contains(
+            "tpl_abcd1234-5678-90ab-cdef12345678",
+        ))
         .stdout(predicate::str::contains("Short ID Template"));
 }
 
@@ -75,7 +91,11 @@ fn test_template_show_all_fields() {
     let temp = TempDir::new().unwrap();
 
     // Setup: create a template with all fields
-    create_test_template(&temp, "tpl_fields-test-1234-5678-90abcdef1234", "All Fields Template");
+    create_test_template(
+        &temp,
+        "tpl_fields-test-1234-5678-90abcdef1234",
+        "All Fields Template",
+    );
 
     Command::cargo_bin("runbox")
         .unwrap()

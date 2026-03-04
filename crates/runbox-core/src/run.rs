@@ -165,9 +165,15 @@ impl Run {
 
         // base_commit format (40 hex chars)
         if self.code_state.base_commit.len() != 40
-            || !self.code_state.base_commit.chars().all(|c| c.is_ascii_hexdigit())
+            || !self
+                .code_state
+                .base_commit
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
         {
-            return Err(ValidationError::InvalidCommit(self.code_state.base_commit.clone()));
+            return Err(ValidationError::InvalidCommit(
+                self.code_state.base_commit.clone(),
+            ));
         }
 
         // patch ref format

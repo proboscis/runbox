@@ -247,7 +247,8 @@ impl ProcessManager {
         match run.status {
             RunStatus::Running | RunStatus::Pending => {
                 run.status = RunStatus::Unknown;
-                run.reconcile_reason = Some("process exited while adopted (exit code unavailable)".to_string());
+                run.reconcile_reason =
+                    Some("process exited while adopted (exit code unavailable)".to_string());
             }
             RunStatus::Killed => {
                 // CLI stopped it, just fill in timeline fields
@@ -334,13 +335,10 @@ impl ProcessManager {
                                 run.timeline.started_at = Some(Utc::now());
                             }
                             run.reconcile_reason = Some(
-                                "daemon adopted live process, upgraded from Pending".to_string()
+                                "daemon adopted live process, upgraded from Pending".to_string(),
                             );
                             self.storage.save_run(&run)?;
-                            log::info!(
-                                "Run {} upgraded from Pending to Running",
-                                run.run_id
-                            );
+                            log::info!("Run {} upgraded from Pending to Running", run.run_id);
                         }
                     } else {
                         // Process is dead but was Running - mark as Unknown
@@ -350,10 +348,8 @@ impl ProcessManager {
                             pid
                         );
                         run.status = RunStatus::Unknown;
-                        run.reconcile_reason = Some(format!(
-                            "daemon restarted, process {} not found",
-                            pid
-                        ));
+                        run.reconcile_reason =
+                            Some(format!("daemon restarted, process {} not found", pid));
                         let now = Utc::now();
                         if run.timeline.started_at.is_none() {
                             run.timeline.started_at = Some(now);
@@ -366,7 +362,10 @@ impl ProcessManager {
                 }
             } else {
                 // Running status but no handle
-                log::warn!("Run {} is Running but has no handle - marking as Unknown", run.run_id);
+                log::warn!(
+                    "Run {} is Running but has no handle - marking as Unknown",
+                    run.run_id
+                );
                 run.status = RunStatus::Unknown;
                 run.reconcile_reason = Some("daemon restarted, no runtime handle".to_string());
                 let now = Utc::now();
@@ -480,7 +479,7 @@ fn update_run_on_exit(
         let final_status = match current.status {
             RunStatus::Running | RunStatus::Pending => new_status.clone(),
             RunStatus::Killed => RunStatus::Killed, // Keep as Killed
-            _ => return, // Won't happen due to expected_statuses check
+            _ => return,                            // Won't happen due to expected_statuses check
         };
 
         // Apply updates
@@ -675,7 +674,10 @@ mod tests {
         // Check that it's dead
         let storage2 = Storage::with_base_dir(base_path).unwrap();
         let updated_run = storage2.load_run(&run_id).unwrap();
-        assert!(matches!(updated_run.status, RunStatus::Killed | RunStatus::Failed));
+        assert!(matches!(
+            updated_run.status,
+            RunStatus::Killed | RunStatus::Failed
+        ));
     }
 
     #[test]
@@ -740,8 +742,14 @@ mod tests {
         let storage2 = Storage::with_base_dir(base_path).unwrap();
         let updated_run = storage2.load_run(&run_id).unwrap();
         assert_eq!(updated_run.status, RunStatus::Exited);
-        assert!(updated_run.timeline.started_at.is_some(), "started_at should be set");
-        assert!(updated_run.timeline.ended_at.is_some(), "ended_at should be set");
+        assert!(
+            updated_run.timeline.started_at.is_some(),
+            "started_at should be set"
+        );
+        assert!(
+            updated_run.timeline.ended_at.is_some(),
+            "ended_at should be set"
+        );
     }
 
     #[test]
@@ -793,9 +801,16 @@ mod tests {
         // Verify status stayed Killed but exit_code was set
         let storage3 = Storage::with_base_dir(base_path).unwrap();
         let final_run = storage3.load_run(&run_id).unwrap();
-        assert_eq!(final_run.status, RunStatus::Killed, "status should remain Killed");
+        assert_eq!(
+            final_run.status,
+            RunStatus::Killed,
+            "status should remain Killed"
+        );
         assert!(final_run.exit_code.is_some(), "exit_code should be set");
-        assert!(final_run.timeline.ended_at.is_some(), "ended_at should be set");
+        assert!(
+            final_run.timeline.ended_at.is_some(),
+            "ended_at should be set"
+        );
     }
 
     #[test]
@@ -906,8 +921,14 @@ mod tests {
         let updated = storage2.load_run(&run_id).unwrap();
         assert_eq!(updated.status, RunStatus::Unknown);
         assert!(updated.reconcile_reason.is_some());
-        assert!(updated.timeline.started_at.is_some(), "started_at should be set");
-        assert!(updated.timeline.ended_at.is_some(), "ended_at should be set");
+        assert!(
+            updated.timeline.started_at.is_some(),
+            "started_at should be set"
+        );
+        assert!(
+            updated.timeline.ended_at.is_some(),
+            "ended_at should be set"
+        );
     }
 
     #[test]
@@ -945,7 +966,11 @@ mod tests {
         let storage2 = Storage::with_base_dir(base_path).unwrap();
         let updated = storage2.load_run(&run_id).unwrap();
         assert_eq!(updated.status, RunStatus::Unknown);
-        assert!(updated.reconcile_reason.as_ref().unwrap().contains("no runtime handle"));
+        assert!(updated
+            .reconcile_reason
+            .as_ref()
+            .unwrap()
+            .contains("no runtime handle"));
     }
 
     #[test]
@@ -992,6 +1017,9 @@ mod tests {
         let updated = storage2.load_run(&run_id).unwrap();
         // Note: actual exit_code depends on whether CAS succeeded
         // The important thing is that exit_code is set
-        assert!(updated.exit_code.is_some(), "exit_code should be set for signal exit");
+        assert!(
+            updated.exit_code.is_some(),
+            "exit_code should be set for signal exit"
+        );
     }
 }

@@ -62,7 +62,10 @@ fn test_attach_background_not_supported() {
         .args(["attach", "a1b2c3d4"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("not support").or(predicate::str::contains("only supported for tmux")));
+        .stderr(
+            predicate::str::contains("not support")
+                .or(predicate::str::contains("only supported for tmux")),
+        );
 }
 
 #[test]
@@ -133,7 +136,14 @@ fn test_attach_tmux() {
 
     // Start a tmux session in detached mode
     let session_result = StdCommand::new("tmux")
-        .args(["new-session", "-d", "-s", &session_name, "-n", "test_window"])
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &session_name,
+            "-n",
+            "test_window",
+        ])
         .status();
 
     if session_result.is_err() || !session_result.unwrap().success() {

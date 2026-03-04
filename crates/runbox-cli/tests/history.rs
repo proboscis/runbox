@@ -141,10 +141,7 @@ fn test_history_limit() {
         );
 
         fs::write(
-            runs_dir.join(format!(
-                "run_{:08x}-0000-0000-0000-000000000000.json",
-                i
-            )),
+            runs_dir.join(format!("run_{:08x}-0000-0000-0000-000000000000.json", i)),
             run,
         )
         .unwrap();

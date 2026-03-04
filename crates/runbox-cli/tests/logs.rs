@@ -6,10 +6,7 @@ use tempfile::TempDir;
 /// Create a minimal run JSON for testing
 fn create_run_json(run_id: &str, log_path: Option<&str>) -> String {
     let log_ref = if let Some(path) = log_path {
-        format!(
-            r#""log_ref": {{"path": "{}"}}"#,
-            path
-        )
+        format!(r#""log_ref": {{"path": "{}"}}"#, path)
     } else {
         String::new()
     };

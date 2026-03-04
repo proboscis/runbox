@@ -50,7 +50,9 @@ fn test_show_run_details() {
         .args(["show", "run_test1234-5678-90ab-cdef-111111111111"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("run_test1234-5678-90ab-cdef-111111111111"))
+        .stdout(predicate::str::contains(
+            "run_test1234-5678-90ab-cdef-111111111111",
+        ))
         .stdout(predicate::str::contains("running"));
 }
 
@@ -72,7 +74,9 @@ fn test_show_with_short_id() {
         .args(["show", "abcd12"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("run_abcd1234-5678-90ab-cdef-222222222222"))
+        .stdout(predicate::str::contains(
+            "run_abcd1234-5678-90ab-cdef-222222222222",
+        ))
         .stdout(predicate::str::contains("exited"));
 }
 
@@ -125,7 +129,9 @@ fn test_show_all_fields() {
         .success()
         // Verify run identification
         .stdout(predicate::str::contains("Run ID:"))
-        .stdout(predicate::str::contains("run_fields-test-1234-5678-333333333333"))
+        .stdout(predicate::str::contains(
+            "run_fields-test-1234-5678-333333333333",
+        ))
         .stdout(predicate::str::contains("Short ID:"))
         // Verify status and runtime
         .stdout(predicate::str::contains("Status:"))
@@ -140,7 +146,9 @@ fn test_show_all_fields() {
         .stdout(predicate::str::contains("DEBUG"))
         // Verify code_state fields
         .stdout(predicate::str::contains("Repo:"))
-        .stdout(predicate::str::contains("git@github.com:example/project.git"))
+        .stdout(predicate::str::contains(
+            "git@github.com:example/project.git",
+        ))
         .stdout(predicate::str::contains("Commit:"))
         .stdout(predicate::str::contains("deadbeef"))
         .stdout(predicate::str::contains("Patch:"))
@@ -235,7 +243,9 @@ fn test_show_minimal_run() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Run ID:"))
-        .stdout(predicate::str::contains("run_minimal-1234-5678-9abc-def012345678"))
+        .stdout(predicate::str::contains(
+            "run_minimal-1234-5678-9abc-def012345678",
+        ))
         .stdout(predicate::str::contains("Status:"))
         .stdout(predicate::str::contains("pending")) // default status
         .stdout(predicate::str::contains("Command:"))

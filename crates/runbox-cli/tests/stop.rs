@@ -199,11 +199,7 @@ fn test_stop_force() {
     let temp = TempDir::new().unwrap();
     let run_id = "run_force123-aaaa-bbbb-cccc-ddddeeeeeeee";
 
-    let handle = spawn_running_process(
-        &temp,
-        run_id,
-        &["sh", "-c", "trap '' TERM; sleep 60"],
-    );
+    let handle = spawn_running_process(&temp, run_id, &["sh", "-c", "trap '' TERM; sleep 60"]);
     let _guard = BackgroundProcessGuard::new(handle.clone());
 
     Command::cargo_bin("runbox")

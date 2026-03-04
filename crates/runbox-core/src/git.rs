@@ -43,10 +43,7 @@ impl GitContext {
             anyhow::bail!("Not a git repository");
         }
 
-        let repo_root = String::from_utf8(output.stdout)?
-            .trim()
-            .to_string()
-            .into();
+        let repo_root = String::from_utf8(output.stdout)?.trim().to_string().into();
 
         Ok(Self { repo_root })
     }
@@ -63,10 +60,7 @@ impl GitContext {
             anyhow::bail!("Not a git repository");
         }
 
-        let repo_root = String::from_utf8(output.stdout)?
-            .trim()
-            .to_string()
-            .into();
+        let repo_root = String::from_utf8(output.stdout)?.trim().to_string().into();
 
         Ok(Self { repo_root })
     }
@@ -372,7 +366,10 @@ impl GitContext {
     ) -> Result<Option<WorktreeInfo>> {
         logger.log_vv(
             "worktree",
-            &format!("checking existing worktrees for commit {}...", &base_commit[..8.min(base_commit.len())]),
+            &format!(
+                "checking existing worktrees for commit {}...",
+                &base_commit[..8.min(base_commit.len())]
+            ),
         );
 
         let canonical_base_dir = std::fs::canonicalize(worktree_base_dir)
@@ -422,7 +419,11 @@ impl GitContext {
 
         logger.log_vvv(
             "git",
-            &format!("git worktree add --detach {} {}", worktree_path.display(), commit),
+            &format!(
+                "git worktree add --detach {} {}",
+                worktree_path.display(),
+                commit
+            ),
         );
 
         let output = Command::new("git")
@@ -450,10 +451,7 @@ impl GitContext {
 
     /// Remove a worktree
     pub fn remove_worktree(&self, worktree_path: &Path, logger: &VerboseLogger) -> Result<()> {
-        logger.log_vv(
-            "worktree",
-            &format!("removing {}", worktree_path.display()),
-        );
+        logger.log_vv("worktree", &format!("removing {}", worktree_path.display()));
 
         logger.log_vvv(
             "git",
@@ -493,7 +491,10 @@ impl GitContext {
         // First fetch the patch content from the main repo
         let patch_content = self.get_patch_content(ref_name)?;
 
-        logger.log_vvv("git", &format!("patch content length: {} bytes", patch_content.len()));
+        logger.log_vvv(
+            "git",
+            &format!("patch content length: {} bytes", patch_content.len()),
+        );
 
         let mut child = Command::new("git")
             .current_dir(worktree_path)
@@ -532,11 +533,9 @@ impl GitContext {
 
         // Check for existing worktree with same commit
         if reuse_existing {
-            if let Some(existing) = self.find_worktree_by_commit(
-                &code_state.base_commit,
-                worktree_base_dir,
-                logger,
-            )? {
+            if let Some(existing) =
+                self.find_worktree_by_commit(&code_state.base_commit, worktree_base_dir, logger)?
+            {
                 logger.log_v(
                     "worktree",
                     &format!("reusing existing worktree at {}", existing.path.display()),
@@ -555,7 +554,10 @@ impl GitContext {
         if worktree_path.exists() {
             logger.log_vv(
                 "worktree",
-                &format!("path {} already exists, checking if it's a worktree", worktree_path.display()),
+                &format!(
+                    "path {} already exists, checking if it's a worktree",
+                    worktree_path.display()
+                ),
             );
 
             // Check if it's already registered as a worktree
@@ -567,8 +569,9 @@ impl GitContext {
                 self.remove_worktree(&worktree_path, logger)?;
             } else {
                 // Just a directory, remove it
-                std::fs::remove_dir_all(&worktree_path)
-                    .with_context(|| format!("Failed to remove directory: {}", worktree_path.display()))?;
+                std::fs::remove_dir_all(&worktree_path).with_context(|| {
+                    format!("Failed to remove directory: {}", worktree_path.display())
+                })?;
             }
         }
 
