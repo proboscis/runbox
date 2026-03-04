@@ -1,6 +1,11 @@
-# Runbox repo orch configuration
-# Issues are in docs/issues/ with type: issue frontmatter
-vault: ~/repos/runbox/docs/issues
-agent: claude
-worktree_root: .git-worktrees
+agent: opencode
+worktree_dir: .git-worktrees
 base_branch: main
+
+issues:
+  backend: local
+  path: ~/repos/runbox-issues
+
+github:
+  owner: proboscis
+  repo: runbox
