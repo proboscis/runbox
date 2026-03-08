@@ -1,7 +1,6 @@
 //! Zellij runtime adapter
 //!
-//! Runs processes in zellij sessions for easy monitoring and attachment.
-//! Uses one session per run for reliable stop/attach semantics.
+//! Runs processes in zellij tabs for easy monitoring and attachment.
 
 use super::RuntimeAdapter;
 use crate::run::{Exec, RuntimeHandle};
@@ -10,9 +9,8 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 
-/// Adapter for running processes in zellij sessions (one session per run)
+/// Adapter for running processes in zellij tabs
 pub struct ZellijAdapter {
-    /// Prefix for session names (e.g., "runbox" -> "runbox-550e8400-e29b-...")
     session_prefix: String,
 }
 
@@ -21,70 +19,68 @@ impl ZellijAdapter {
         Self { session_prefix }
     }
 
-    /// Generate session name for a run (uses full UUID to avoid collisions)
     fn session_name(&self, run_id: &str) -> String {
-        // run_id format: "run_{uuid}" - use full UUID portion for uniqueness
-        let uuid_part = run_id.get(4..).unwrap_or(run_id);
-        format!("{}-{}", self.session_prefix, uuid_part)
+        format!("{}-{}", self.session_prefix, Self::tab_name(run_id))
     }
 
-    /// Get short ID from run_id for display purposes only
-    fn short_id(run_id: &str) -> &str {
-        // run_id format: "run_{uuid}" - first 8 chars of UUID for display
-        run_id.get(4..12).unwrap_or(run_id)
+    fn tab_name(run_id: &str) -> String {
+        run_id.get(4..12).unwrap_or(run_id).to_string()
     }
 
-    /// Check if a session exists and is running (not EXITED)
-    fn session_is_running(session_name: &str) -> bool {
+    fn session_is_running(session_name: &str) -> Result<bool> {
         let output = Command::new("zellij")
             .args(["list-sessions", "--no-formatting"])
-            .output();
+            .output()
+            .context("Failed to list zellij sessions")?;
 
-        match output {
-            Ok(out) if out.status.success() => {
-                let sessions = String::from_utf8_lossy(&out.stdout);
-                sessions.lines().any(|line| {
-                    let trimmed = line.trim();
-                    // Session lines: "name" (running) or "name (EXITED)" (dead)
-                    // Only consider running if exact match without EXITED
-                    if trimmed == session_name {
-                        return true;
-                    }
-                    // Check for "name " prefix but NOT "(EXITED)"
-                    if trimmed.starts_with(&format!("{} ", session_name)) {
-                        return !trimmed.contains("(EXITED)");
-                    }
-                    false
-                })
-            }
-            _ => false,
+        if !output.status.success() {
+            return Ok(false);
         }
+
+        let sessions = String::from_utf8_lossy(&output.stdout);
+        Ok(sessions.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed == session_name
+                || (trimmed.starts_with(&format!("{} ", session_name))
+                    && !trimmed.contains("(EXITED)"))
+        }))
     }
 
-    /// Check if a session exists (running or exited)
-    fn session_exists(session_name: &str) -> bool {
+    fn session_exists(session_name: &str) -> Result<bool> {
         let output = Command::new("zellij")
             .args(["list-sessions", "--no-formatting"])
-            .output();
+            .output()
+            .context("Failed to list zellij sessions")?;
 
-        match output {
-            Ok(out) if out.status.success() => {
-                let sessions = String::from_utf8_lossy(&out.stdout);
-                sessions.lines().any(|line| {
-                    let trimmed = line.trim();
-                    trimmed == session_name || trimmed.starts_with(&format!("{} ", session_name))
-                })
-            }
-            _ => false,
+        if !output.status.success() {
+            return Ok(false);
         }
+
+        let sessions = String::from_utf8_lossy(&output.stdout);
+        Ok(sessions.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed == session_name || trimmed.starts_with(&format!("{} ", session_name))
+        }))
     }
 
-    /// Escape a string for shell execution
+    fn tab_exists(session_name: &str, tab_name: &str) -> Result<bool> {
+        let output = Command::new("zellij")
+            .args(["--session", session_name, "action", "query-tab-names"])
+            .output()
+            .context("Failed to query zellij tab names")?;
+
+        if !output.status.success() {
+            return Ok(false);
+        }
+
+        let tabs = String::from_utf8_lossy(&output.stdout);
+        Ok(tabs.lines().any(|line| line.trim() == tab_name))
+    }
+
     fn shell_escape(s: &str) -> String {
         format!("'{}'", s.replace('\'', "'\"'\"'"))
     }
 
-    /// Check if we're currently inside a zellij session
     fn is_inside_zellij() -> bool {
         std::env::var("ZELLIJ").is_ok()
     }
@@ -97,14 +93,12 @@ impl RuntimeAdapter for ZellijAdapter {
 
     fn spawn(&self, exec: &Exec, run_id: &str, log_path: &Path) -> Result<RuntimeHandle> {
         let session_name = self.session_name(run_id);
+        let tab_name = Self::tab_name(run_id);
 
-        // Check if session already exists (collision or leftover)
-        if Self::session_exists(&session_name) {
-            bail!("Zellij session '{}' already exists. This may indicate a collision or leftover session.", session_name);
+        if Self::session_exists(&session_name)? {
+            bail!("Zellij session '{}' already exists", session_name);
         }
 
-        // Build environment using `env` command
-        // Note: env keys should be valid identifiers, values are escaped
         let env_args: Vec<String> = exec
             .env
             .iter()
@@ -117,11 +111,8 @@ impl RuntimeAdapter for ZellijAdapter {
             format!("env {} ", env_args.join(" "))
         };
 
-        // Build command with escaping
         let argv_escaped: Vec<String> = exec.argv.iter().map(|s| Self::shell_escape(s)).collect();
         let cmd_str = argv_escaped.join(" ");
-
-        // Full command with log redirection
         let full_cmd = format!(
             "{}exec {} > {} 2>&1",
             env_prefix,
@@ -129,39 +120,68 @@ impl RuntimeAdapter for ZellijAdapter {
             Self::shell_escape(&log_path.display().to_string())
         );
 
-        // Create a new zellij session running the command
-        let output = Command::new("zellij")
+        let session_output = Command::new("zellij")
+            .args(["attach", &session_name, "--create-background"])
+            .output()
+            .context("Failed to create zellij session")?;
+
+        if !session_output.status.success() {
+            let stderr = String::from_utf8_lossy(&session_output.stderr);
+            bail!(
+                "Failed to create zellij session '{}': {}",
+                session_name,
+                stderr
+            );
+        }
+
+        let tab_output = Command::new("zellij")
+            .args([
+                "--session",
+                &session_name,
+                "action",
+                "new-tab",
+                "--name",
+                &tab_name,
+                "--cwd",
+                &exec.cwd,
+            ])
+            .output()
+            .context("Failed to create zellij tab")?;
+
+        if !tab_output.status.success() {
+            let stderr = String::from_utf8_lossy(&tab_output.stderr);
+            bail!("Failed to create zellij tab: {}", stderr);
+        }
+
+        let run_output = Command::new("zellij")
             .args([
                 "--session",
                 &session_name,
                 "run",
                 "--cwd",
                 &exec.cwd,
+                "--close-on-exit",
                 "--",
                 "bash",
                 "-lc",
                 &full_cmd,
             ])
             .output()
-            .context("Failed to create zellij session. Is zellij installed?")?;
+            .context("Failed to run command in zellij")?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Failed to create zellij session: {}", stderr);
+        if !run_output.status.success() {
+            let stderr = String::from_utf8_lossy(&run_output.stderr);
+            bail!("Failed to run command in zellij: {}", stderr);
         }
 
-        // Verify session was created with bounded retry
-        for _ in 0..5 {
-            if Self::session_exists(&session_name) {
-                return Ok(RuntimeHandle::Zellij {
-                    session: session_name,
-                    tab: Self::short_id(run_id).to_string(),
-                });
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        if !Self::tab_exists(&session_name, &tab_name)? {
+            bail!("Zellij tab '{}:{}' was not created", session_name, tab_name);
         }
 
-        bail!("Zellij session '{}' was not created", session_name);
+        Ok(RuntimeHandle::Zellij {
+            session: session_name,
+            tab: tab_name,
+        })
     }
 
     fn stop(&self, handle: &RuntimeHandle, _force: bool) -> Result<()> {
@@ -171,19 +191,15 @@ impl RuntimeAdapter for ZellijAdapter {
                 .output()
                 .context("Failed to kill zellij session")?;
 
-            // Accept success or "session not found" errors
             if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-                // Ignore various "not found" error messages
-                if !stderr.contains("not found")
-                    && !stderr.contains("no session")
-                    && !stderr.contains("doesn't exist")
-                    && !stderr.is_empty()
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let lower = stderr.to_lowercase();
+                if !lower.contains("not found")
+                    && !lower.contains("no session")
+                    && !lower.contains("doesn't exist")
+                    && !stderr.trim().is_empty()
                 {
-                    bail!(
-                        "Failed to kill zellij session: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
+                    bail!("Failed to kill zellij session '{}': {}", session, stderr);
                 }
             }
 
@@ -194,9 +210,16 @@ impl RuntimeAdapter for ZellijAdapter {
     }
 
     fn attach(&self, handle: &RuntimeHandle) -> Result<()> {
-        if let RuntimeHandle::Zellij { session, .. } = handle {
+        if let RuntimeHandle::Zellij { session, tab } = handle {
+            if !Self::tab_exists(session, tab)? {
+                bail!("Zellij tab '{}:{}' not found", session, tab);
+            }
+
             if Self::is_inside_zellij() {
-                bail!("Cannot attach from inside zellij. Detach first (Ctrl+O, D) then run: zellij attach {}", session);
+                bail!(
+                    "Cannot attach from inside zellij. Detach first (Ctrl+O, D) then run: zellij attach {}",
+                    session
+                );
             }
 
             let err = Command::new("zellij").args(["attach", session]).exec();
@@ -207,9 +230,9 @@ impl RuntimeAdapter for ZellijAdapter {
     }
 
     fn is_alive(&self, handle: &RuntimeHandle) -> bool {
-        if let RuntimeHandle::Zellij { session, .. } = handle {
-            // Only consider running sessions as alive, not EXITED ones
-            Self::session_is_running(session)
+        if let RuntimeHandle::Zellij { session, tab } = handle {
+            Self::session_is_running(session).unwrap_or(false)
+                && Self::tab_exists(session, tab).unwrap_or(false)
         } else {
             false
         }
@@ -221,21 +244,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_short_id() {
+    fn test_tab_name() {
         assert_eq!(
-            ZellijAdapter::short_id("run_550e8400-e29b-41d4-a716-446655440000"),
-            "550e8400"
+            ZellijAdapter::tab_name("run_550e8400-e29b-41d4-a716-446655440000"),
+            "550e8400".to_string()
         );
-        assert_eq!(ZellijAdapter::short_id("short"), "short");
-        assert_eq!(ZellijAdapter::short_id("run"), "run"); // Edge case
+        assert_eq!(ZellijAdapter::tab_name("short"), "short".to_string());
+        assert_eq!(ZellijAdapter::tab_name("run"), "run".to_string());
     }
 
     #[test]
-    fn test_session_name_uses_full_uuid() {
+    fn test_session_name_uses_short_id() {
         let adapter = ZellijAdapter::new("runbox".to_string());
         let session = adapter.session_name("run_550e8400-e29b-41d4-a716-446655440000");
-        // Should use full UUID, not just 8 chars
-        assert_eq!(session, "runbox-550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(session, "runbox-550e8400");
     }
 
     #[test]

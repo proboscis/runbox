@@ -33,7 +33,7 @@ pub use run::{CodeState, Exec, LogRef, Patch, Run, RunStatus, RuntimeHandle, Tim
 pub use runnable::{
     format_ambiguous_matches, ResolveResult, Runnable, RunnableMatch, RunnableType,
 };
-pub use runtime::{BackgroundAdapter, RuntimeAdapter, RuntimeRegistry, TmuxAdapter};
+pub use runtime::{BackgroundAdapter, RuntimeAdapter, RuntimeRegistry, TmuxAdapter, ZellijAdapter};
 pub use skill::{
     find_skill_by_name, find_skills, ExportResult, Platform, Skill, SkillError, SkillMetadata,
 };
