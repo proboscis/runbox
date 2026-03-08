@@ -543,6 +543,8 @@ EXAMPLES:
   runbox replay 550e8400 --cleanup
   # Keep worktree after execution (default)
   runbox replay 550e8400 --keep
+  # Ignore captured patch / diff and replay committed state only
+  runbox replay 550e8400 --ignore-patch
   # Always create fresh worktree (don't reuse existing)
   runbox replay 550e8400 --fresh
   # Reuse existing worktree if commit matches (default)
@@ -575,6 +577,9 @@ RELATED COMMANDS:
         /// Remove worktree after execution
         #[arg(long, conflicts_with = "keep")]
         cleanup: bool,
+        /// Ignore any recorded patch and replay committed state only
+        #[arg(long)]
+        ignore_patch: bool,
         /// Reuse existing worktree if commit matches (default)
         #[arg(long, conflicts_with = "fresh")]
         reuse: bool,
@@ -1127,6 +1132,7 @@ fn main() -> Result<()> {
             worktree_dir,
             keep,
             cleanup,
+            ignore_patch,
             reuse,
             fresh,
             verbose,
@@ -1136,6 +1142,7 @@ fn main() -> Result<()> {
             worktree_dir,
             keep,
             cleanup,
+            ignore_patch,
             reuse,
             fresh,
             verbose,
@@ -3031,11 +3038,16 @@ fn cmd_replay(
     worktree_dir: Option<PathBuf>,
     keep: bool,
     cleanup: bool,
+    ignore_patch: bool,
     reuse: bool,
     fresh: bool,
     verbose: u8,
 ) -> Result<()> {
-    let replay = load_replay_spec(storage, replay_id)?;
+    let mut replay = load_replay_spec(storage, replay_id)?;
+    let had_patch = replay.code_state.patch.is_some();
+    if ignore_patch {
+        replay.code_state.patch = None;
+    }
     // Initialize git context from current directory
     let git = git_context_for_replay(&replay)?;
     // Create config resolver
@@ -3096,7 +3108,9 @@ fn cmd_replay(
     println!("Replaying: {}", replay.id);
     println!("Command: {:?}", replay.argv);
     println!("Commit: {}", replay.code_state.base_commit);
-    if replay.code_state.patch.is_some() {
+    if ignore_patch && had_patch {
+        println!("Patch: ignored");
+    } else if replay.code_state.patch.is_some() {
         println!("Patch: yes");
     }
     // Restore code state in worktree
