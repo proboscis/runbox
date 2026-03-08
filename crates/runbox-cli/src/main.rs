@@ -1661,6 +1661,25 @@ fn replay_created_at(storage: &Storage, replay_id: &str) -> Option<chrono::DateT
     }
 }
 
+fn git_context_for_replay(replay: &ReplaySpec) -> Result<GitContext> {
+    let replay_cwd = Path::new(&replay.cwd);
+    if replay_cwd.is_absolute() {
+        return GitContext::from_path(replay_cwd).with_context(|| {
+            format!(
+                "Recorded replay cwd is not a git repository: {}",
+                replay_cwd.display()
+            )
+        });
+    }
+
+    GitContext::from_current_dir().with_context(|| {
+        format!(
+            "Replay '{}' only stores a relative cwd ('{}'). Run replay from a checkout of {}.",
+            replay.id, replay.cwd, replay.code_state.repo_url
+        )
+    })
+}
+
 /// Unified run command - resolves short ID to any runnable type and executes
 fn cmd_run_unified(
     storage: &Storage,
@@ -3009,7 +3028,7 @@ fn cmd_replay(
 ) -> Result<()> {
     let replay = load_replay_spec(storage, replay_id)?;
     // Initialize git context from current directory
-    let git = GitContext::from_current_dir()?;
+    let git = git_context_for_replay(&replay)?;
     // Create config resolver
     let config_resolver = ConfigResolver::new(Some(git.repo_root().to_path_buf()))?;
     // Resolve verbosity

@@ -712,6 +712,93 @@ fn test_replay_record_full_id() {
 }
 
 #[test]
+fn test_replay_record_uses_record_repo_when_called_elsewhere() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path().join("repo");
+    let other_dir = temp.path().join("elsewhere");
+    fs::create_dir_all(&other_dir).unwrap();
+
+    let commit_hash = setup_git_repo(&temp);
+    setup_storage_dirs(&temp);
+
+    let record_id = "rec_feedface-3456-7890-abcd-ef1234567890";
+    create_record_fixture(
+        &temp,
+        record_id,
+        &commit_hash,
+        repo_path.to_str().unwrap(),
+        &["echo", "record replay from outside repo"],
+        None,
+    );
+
+    let worktree_dir = temp.path().join("worktrees");
+    fs::create_dir_all(&worktree_dir).unwrap();
+
+    Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .current_dir(&other_dir)
+        .args([
+            "replay",
+            record_id,
+            "--worktree-dir",
+            worktree_dir.to_str().unwrap(),
+            "--keep",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(record_id))
+        .stdout(predicate::str::contains("record replay from outside repo"));
+
+    let worktree_path = worktree_dir.join(record_id);
+    assert!(
+        worktree_path.exists(),
+        "Record replay should create a worktree even outside the source repo"
+    );
+}
+
+#[test]
+fn test_replay_record_invalid_recorded_repo_does_not_fallback() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path().join("repo");
+    let invalid_repo_dir = temp.path().join("not_a_repo");
+    fs::create_dir_all(&invalid_repo_dir).unwrap();
+
+    let commit_hash = setup_git_repo(&temp);
+    setup_storage_dirs(&temp);
+
+    let record_id = "rec_deadfeed-3456-7890-abcd-ef1234567890";
+    create_record_fixture(
+        &temp,
+        record_id,
+        &commit_hash,
+        invalid_repo_dir.to_str().unwrap(),
+        &["echo", "should not run"],
+        None,
+    );
+
+    let worktree_dir = temp.path().join("worktrees");
+    fs::create_dir_all(&worktree_dir).unwrap();
+
+    Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .current_dir(&repo_path)
+        .args([
+            "replay",
+            record_id,
+            "--worktree-dir",
+            worktree_dir.to_str().unwrap(),
+            "--keep",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Recorded replay cwd is not a git repository",
+        ));
+}
+
+#[test]
 fn test_replay_record_short_id() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path().join("repo");
