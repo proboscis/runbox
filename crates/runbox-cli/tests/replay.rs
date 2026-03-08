@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
+use std::io::Write;
 use std::process::Command as StdCommand;
 use tempfile::TempDir;
 
@@ -88,9 +89,97 @@ fn create_run_record(temp: &TempDir, run_id: &str, base_commit: &str, cwd: &str)
     fs::write(runs_dir.join(format!("{}.json", run_id)), run).unwrap();
 }
 
+/// Create a record fixture in the storage
+fn create_record_fixture(
+    temp: &TempDir,
+    record_id: &str,
+    base_commit: &str,
+    cwd: &str,
+    argv: &[&str],
+    patch_ref: Option<&str>,
+) {
+    let records_dir = temp.path().join("records");
+    fs::create_dir_all(&records_dir).unwrap();
+
+    let record = serde_json::json!({
+        "record_version": 0,
+        "record_id": record_id,
+        "git_state": {
+            "repo_url": "file:///test/repo",
+            "commit": base_commit,
+            "patch_ref": patch_ref,
+        },
+        "command": {
+            "argv": argv,
+            "cwd": cwd,
+            "env": {},
+        },
+        "created_at": "2024-01-01T00:00:00Z",
+        "source": "doeff",
+    });
+
+    fs::write(
+        records_dir.join(format!("{}.json", record_id)),
+        serde_json::to_string_pretty(&record).unwrap(),
+    )
+    .unwrap();
+}
+
+fn create_patch_ref(repo_path: &std::path::Path, ref_name: &str) {
+    fs::write(
+        repo_path.join("README.md"),
+        "# Test Repo\npatched from record\n",
+    )
+    .unwrap();
+
+    let diff = StdCommand::new("git")
+        .current_dir(repo_path)
+        .args(["diff", "HEAD"])
+        .output()
+        .expect("Failed to produce diff");
+    assert!(diff.status.success(), "git diff should succeed");
+
+    let mut child = StdCommand::new("git")
+        .current_dir(repo_path)
+        .args(["hash-object", "-w", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("Failed to create patch blob");
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&diff.stdout)
+        .expect("Failed to write patch blob");
+
+    let blob_output = child.wait_with_output().expect("Failed to hash patch blob");
+    assert!(blob_output.status.success(), "hash-object should succeed");
+
+    let blob_sha = String::from_utf8(blob_output.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let update = StdCommand::new("git")
+        .current_dir(repo_path)
+        .args(["update-ref", ref_name, &blob_sha])
+        .output()
+        .expect("Failed to create patch ref");
+    assert!(update.status.success(), "update-ref should succeed");
+
+    StdCommand::new("git")
+        .current_dir(repo_path)
+        .args(["checkout", "--", "README.md"])
+        .output()
+        .expect("Failed to restore README");
+}
+
 /// Create required storage directories
 fn setup_storage_dirs(temp: &TempDir) {
     fs::create_dir_all(temp.path().join("runs")).unwrap();
+    fs::create_dir_all(temp.path().join("records")).unwrap();
     fs::create_dir_all(temp.path().join("templates")).unwrap();
     fs::create_dir_all(temp.path().join("playlists")).unwrap();
     fs::create_dir_all(temp.path().join("logs")).unwrap();
@@ -571,6 +660,134 @@ fn test_replay_uses_short_id() {
         .assert()
         .success()
         .stdout(predicate::str::contains(run_id));
+}
+
+#[test]
+fn test_replay_record_full_id() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path().join("repo");
+
+    let commit_hash = setup_git_repo(&temp);
+    setup_storage_dirs(&temp);
+
+    let record_id = "rec_abcdef12-3456-7890-abcd-ef1234567890";
+    create_record_fixture(
+        &temp,
+        record_id,
+        &commit_hash,
+        ".",
+        &["echo", "hello from record replay"],
+        None,
+    );
+
+    let worktree_dir = temp.path().join("worktrees");
+    fs::create_dir_all(&worktree_dir).unwrap();
+
+    Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .current_dir(&repo_path)
+        .args([
+            "replay",
+            record_id,
+            "--worktree-dir",
+            worktree_dir.to_str().unwrap(),
+            "--keep",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "Replaying: {}",
+            record_id
+        )))
+        .stdout(predicate::str::contains("hello from record replay"))
+        .stdout(predicate::str::contains("Replay completed successfully"));
+
+    let worktree_path = worktree_dir.join(record_id);
+    assert!(
+        worktree_path.exists(),
+        "Record replay worktree should exist"
+    );
+    assert!(worktree_path.join("README.md").exists());
+}
+
+#[test]
+fn test_replay_record_short_id() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path().join("repo");
+
+    let commit_hash = setup_git_repo(&temp);
+    setup_storage_dirs(&temp);
+
+    let record_id = "rec_1234abcd-3456-7890-abcd-ef1234567890";
+    create_record_fixture(
+        &temp,
+        record_id,
+        &commit_hash,
+        ".",
+        &["echo", "record short id replay"],
+        None,
+    );
+
+    let worktree_dir = temp.path().join("worktrees");
+    fs::create_dir_all(&worktree_dir).unwrap();
+
+    Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .current_dir(&repo_path)
+        .args([
+            "replay",
+            "1234abcd",
+            "--worktree-dir",
+            worktree_dir.to_str().unwrap(),
+            "--keep",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(record_id))
+        .stdout(predicate::str::contains("record short id replay"));
+}
+
+#[test]
+fn test_replay_record_applies_patch_ref() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path().join("repo");
+
+    let commit_hash = setup_git_repo(&temp);
+    setup_storage_dirs(&temp);
+
+    let patch_ref = "refs/patches/rec_patchref-1234-5678-9999-000000000000";
+    create_patch_ref(&repo_path, patch_ref);
+
+    let record_id = "rec_patchref-1234-5678-9999-000000000000";
+    create_record_fixture(
+        &temp,
+        record_id,
+        &commit_hash,
+        ".",
+        &["cat", "README.md"],
+        Some(patch_ref),
+    );
+
+    let worktree_dir = temp.path().join("worktrees");
+    fs::create_dir_all(&worktree_dir).unwrap();
+
+    Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .current_dir(&repo_path)
+        .args([
+            "replay",
+            record_id,
+            "--worktree-dir",
+            worktree_dir.to_str().unwrap(),
+            "--keep",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Patch: yes"))
+        .stdout(predicate::str::contains("patched from record"));
 }
 
 #[test]

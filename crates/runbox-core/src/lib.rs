@@ -6,6 +6,7 @@ pub mod index;
 pub mod local_storage;
 pub mod playlist;
 pub mod record;
+pub mod replay_spec;
 pub mod result;
 pub mod run;
 pub mod runnable;
@@ -26,6 +27,7 @@ pub use index::{EntityType, Index, IndexedEntity};
 pub use local_storage::{locate_local_runbox_dir, LayeredStorage, Scope};
 pub use playlist::{Playlist, PlaylistItem};
 pub use record::{Record, RecordCommand, RecordGitState, RecordValidationError};
+pub use replay_spec::ReplaySpec;
 pub use result::{Artifact, Execution, Output, RunResult};
 pub use run::{CodeState, Exec, LogRef, Patch, Run, RunStatus, RuntimeHandle, Timeline};
 pub use runnable::{

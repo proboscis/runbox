@@ -368,7 +368,7 @@ impl Index {
                 let started_at_str: Option<String> = row.get(6)?;
                 let ended_at_str: Option<String> = row.get(7)?;
                 let log_path_str: Option<String> = row.get(9)?;
-                
+
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
