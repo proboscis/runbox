@@ -878,6 +878,49 @@ fn test_replay_record_applies_patch_ref() {
 }
 
 #[test]
+fn test_replay_record_ignore_patch_flag_skips_patch_application() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path().join("repo");
+
+    let commit_hash = setup_git_repo(&temp);
+    setup_storage_dirs(&temp);
+
+    let patch_ref = "refs/patches/rec_ignorepatch-1234-5678-9999-000000000000";
+    create_patch_ref(&repo_path, patch_ref);
+
+    let record_id = "rec_ignorepatch-1234-5678-9999-000000000000";
+    create_record_fixture(
+        &temp,
+        record_id,
+        &commit_hash,
+        ".",
+        &["cat", "README.md"],
+        Some(patch_ref),
+    );
+
+    let worktree_dir = temp.path().join("worktrees");
+    fs::create_dir_all(&worktree_dir).unwrap();
+
+    Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .current_dir(&repo_path)
+        .args([
+            "replay",
+            record_id,
+            "--worktree-dir",
+            worktree_dir.to_str().unwrap(),
+            "--ignore-patch",
+            "--keep",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Patch: ignored"))
+        .stdout(predicate::str::contains("# Test Repo"))
+        .stdout(predicate::str::contains("patched from record").not());
+}
+
+#[test]
 fn test_replay_verbose_output() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path().join("repo");
