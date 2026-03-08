@@ -51,7 +51,7 @@ impl std::str::FromStr for RunnableType {
 pub enum Runnable {
     /// A run template (template_id like "tpl_echo")
     Template(String),
-    /// A previous run for replay (run_id like "run_550e8400-...")
+    /// A previous run or record for replay (run_id/record_id like "run_550e..." or "rec_550e...")
     Replay(String),
     /// An item in a playlist
     PlaylistItem {
@@ -94,10 +94,13 @@ impl Runnable {
                 data.extend_from_slice(id.as_bytes());
                 stable_short_id(&data)
             }
-            Runnable::Replay(run_id) => {
-                // run_id format: "run_{uuid}"
-                // Extract hex chars from UUID, removing "run_" prefix and dashes
-                let uuid_part = run_id.trim_start_matches("run_").replace('-', "");
+            Runnable::Replay(id) => {
+                // replay IDs are typically "run_{uuid}" or "rec_{uuid}"
+                // Extract hex chars from the UUID portion, removing the prefix and dashes.
+                let uuid_part = id
+                    .trim_start_matches("run_")
+                    .trim_start_matches("rec_")
+                    .replace('-', "");
 
                 // If it looks like valid UUID hex, extract first 8 chars (lowercase)
                 if is_valid_uuid_hex(&uuid_part) {
@@ -105,7 +108,7 @@ impl Runnable {
                 } else {
                     // Fallback to stable hash for non-UUID run IDs
                     let mut data = b"replay\0".to_vec();
-                    data.extend_from_slice(run_id.as_bytes());
+                    data.extend_from_slice(id.as_bytes());
                     stable_short_id(&data)
                 }
             }
@@ -177,10 +180,12 @@ impl Runnable {
     pub fn source_label(&self) -> String {
         match self {
             Runnable::Template(_) => "-".to_string(),
-            Runnable::Replay(run_id) => {
-                // Return first part of run_id
-                run_id.trim_start_matches("run_").chars().take(10).collect()
-            }
+            Runnable::Replay(id) => id
+                .trim_start_matches("run_")
+                .trim_start_matches("rec_")
+                .chars()
+                .take(10)
+                .collect(),
             Runnable::PlaylistItem {
                 playlist_id, index, ..
             } => {
@@ -267,7 +272,7 @@ pub fn format_ambiguous_matches(matches: &[RunnableMatch]) -> String {
     result.push_str("\nUse more characters or be explicit:\n");
     result.push_str("  runbox run <more_chars>          # if unique\n");
     result.push_str("  runbox run --template <id>       # explicit template\n");
-    result.push_str("  runbox run --replay <run_id>     # explicit replay\n");
+    result.push_str("  runbox run --replay <id>         # explicit replay\n");
 
     result
 }
@@ -318,6 +323,13 @@ mod tests {
         // Different run should have different short ID
         let runnable2 = Runnable::Replay("run_a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string());
         assert_eq!(runnable2.short_id(), "a1b2c3d4");
+    }
+
+    #[test]
+    fn test_replay_short_id_record() {
+        let runnable = Runnable::Replay("rec_550e8400-e29b-41d4-a716-446655440000".to_string());
+        assert_eq!(runnable.short_id(), "550e8400");
+        assert_eq!(runnable.source_label(), "550e8400-e");
     }
 
     #[test]

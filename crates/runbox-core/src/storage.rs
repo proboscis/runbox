@@ -8,11 +8,17 @@ use std::path::PathBuf;
 
 fn normalize_for_match(id: &str) -> String {
     id.trim_start_matches("run_")
+        .trim_start_matches("run-")
         .trim_start_matches("tpl_")
+        .trim_start_matches("tpl-")
         .trim_start_matches("pl_")
+        .trim_start_matches("pl-")
         .trim_start_matches("result_")
+        .trim_start_matches("result-")
         .trim_start_matches("rec_")
+        .trim_start_matches("rec-")
         .trim_start_matches("task_")
+        .trim_start_matches("task-")
         .replace('-', "")
         .to_lowercase()
 }
@@ -732,11 +738,11 @@ impl Storage {
 
     /// Resolve any runnable by short ID prefix or full ID.
     ///
-    /// This searches across all runnable types (templates, runs for replay, playlist items)
+    /// This searches across all runnable types (templates, runs/records for replay, playlist items)
     /// and returns the matching runnable or an error if not found or ambiguous.
     ///
     /// # Arguments
-    /// * `input` - A short ID prefix (hex string) or full ID (tpl_..., run_...)
+    /// * `input` - A short ID prefix (hex string) or full ID (tpl_..., run_..., rec_...)
     /// * `limit` - Maximum number of runs to search (for replay matching)
     ///
     /// # Returns
@@ -745,14 +751,14 @@ impl Storage {
     ///
     /// # Full ID Support
     /// If input starts with `tpl_`, it's treated as a template ID.
-    /// If input starts with `run_`, it's treated as a run ID for replay.
+    /// If input starts with `run_` or `rec_`, it's treated as a replay ID.
     /// Otherwise, it's treated as a short ID prefix to search.
     pub fn resolve_runnable(&self, input: &str, limit: usize) -> Result<crate::Runnable> {
         use crate::runnable::{format_ambiguous_matches, Runnable, RunnableMatch};
 
         // Reject empty input
         if input.is_empty() {
-            bail!("Empty input: please provide a short ID or full ID (tpl_..., run_...)");
+            bail!("Empty input: please provide a short ID or full ID (tpl_..., run_..., rec_...)");
         }
 
         // Handle full template IDs directly
@@ -763,9 +769,15 @@ impl Storage {
         }
 
         // Handle full run IDs directly
-        if input.starts_with("run_") {
+        if input.starts_with("run_") || input.starts_with("run-") {
             // Verify run exists
             let resolved_id = self.resolve_run_id(input)?;
+            return Ok(Runnable::Replay(resolved_id));
+        }
+
+        // Handle full record IDs directly
+        if input.starts_with("rec_") || input.starts_with("rec-") {
+            let resolved_id = self.resolve_record_id(input)?;
             return Ok(Runnable::Replay(resolved_id));
         }
 
@@ -789,7 +801,7 @@ impl Storage {
         let input_lower = input.to_lowercase();
         if !input_lower.chars().all(|c| c.is_ascii_hexdigit()) {
             bail!(
-                "Invalid short ID '{}': must be hexadecimal or a full ID (tpl_..., run_...)",
+                "Invalid short ID '{}': must be hexadecimal or a full ID (tpl_..., run_..., rec_...)",
                 input
             );
         }
@@ -807,6 +819,14 @@ impl Storage {
         // Check runs (for replay)
         for run in self.list_runs(limit)? {
             let runnable = Runnable::Replay(run.run_id.clone());
+            if runnable.short_id().starts_with(&input_lower) {
+                matches.push(RunnableMatch::from_runnable(runnable));
+            }
+        }
+
+        // Check records (for replay)
+        for record in self.list_records(limit)? {
+            let runnable = Runnable::Replay(record.record_id.clone());
             if runnable.short_id().starts_with(&input_lower) {
                 matches.push(RunnableMatch::from_runnable(runnable));
             }
@@ -890,7 +910,11 @@ impl Storage {
             crate::Runnable::Template(id) => {
                 self.load_template(id).ok().map(|t| t.code_state.repo_url)
             }
-            crate::Runnable::Replay(id) => self.load_run(id).ok().map(|r| r.code_state.repo_url),
+            crate::Runnable::Replay(id) => self
+                .load_run(id)
+                .ok()
+                .map(|r| r.code_state.repo_url)
+                .or_else(|| self.load_record(id).ok().map(|r| r.git_state.repo_url)),
             crate::Runnable::PlaylistItem { template_id, .. } => self
                 .load_template(template_id)
                 .ok()
@@ -912,6 +936,7 @@ impl Storage {
             crate::Runnable::Replay(id) => self
                 .load_run(id)
                 .map(|r| r.exec.argv.join(" "))
+                .or_else(|_| self.load_record(id).map(|r| r.command.argv.join(" ")))
                 .unwrap_or_else(|_| id.clone()),
             crate::Runnable::PlaylistItem {
                 label, template_id, ..
@@ -1422,6 +1447,35 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_runnable_record_replay() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        let mut record = crate::Record::new(
+            crate::RecordGitState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch_ref: None,
+            },
+            crate::RecordCommand {
+                argv: vec!["echo".to_string(), "hello".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+            },
+        );
+        record.record_id = "rec_550e8400-e29b-41d4-a716-446655440000".to_string();
+        storage.save_record(&record).unwrap();
+
+        let resolved = storage.resolve_runnable("550e", 100).unwrap();
+        match resolved {
+            crate::Runnable::Replay(id) => {
+                assert_eq!(id, "rec_550e8400-e29b-41d4-a716-446655440000")
+            }
+            _ => panic!("Expected Replay runnable"),
+        }
+    }
+
+    #[test]
     fn test_resolve_runnable_playlist_item() {
         let dir = tempdir().unwrap();
         let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
@@ -1570,6 +1624,37 @@ mod tests {
         match resolved {
             crate::Runnable::Replay(id) => {
                 assert_eq!(id, "run_550e8400-e29b-41d4-a716-446655440000")
+            }
+            _ => panic!("Expected Replay runnable"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_runnable_full_record_id() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        let mut record = crate::Record::new(
+            crate::RecordGitState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+                commit: "a1b2c3d4e5f6789012345678901234567890abcd".to_string(),
+                patch_ref: None,
+            },
+            crate::RecordCommand {
+                argv: vec!["echo".to_string(), "hello".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+            },
+        );
+        record.record_id = "rec_550e8400-e29b-41d4-a716-446655440000".to_string();
+        storage.save_record(&record).unwrap();
+
+        let resolved = storage
+            .resolve_runnable("rec_550e8400-e29b-41d4-a716-446655440000", 100)
+            .unwrap();
+        match resolved {
+            crate::Runnable::Replay(id) => {
+                assert_eq!(id, "rec_550e8400-e29b-41d4-a716-446655440000")
             }
             _ => panic!("Expected Replay runnable"),
         }

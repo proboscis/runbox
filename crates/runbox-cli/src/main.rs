@@ -5,8 +5,9 @@ use dialoguer::{theme::ColorfulTheme, Input};
 use runbox_core::{
     default_pid_path, default_socket_path, find_skill_by_name, find_skills, short_id,
     BindingResolver, CodeState, ConfigResolver, DaemonClient, Exec, GitContext, Index, LogRef,
-    Platform, Playlist, PlaylistItem, Record, RecordCommand, RecordGitState, Run, RunStatus,
-    RunTemplate, Runnable, RuntimeRegistry, Skill, Storage, Timeline, Validator, VerboseLogger,
+    Platform, Playlist, PlaylistItem, Record, RecordCommand, RecordGitState, ReplaySpec, Run,
+    RunStatus, RunTemplate, Runnable, RuntimeRegistry, Skill, Storage, Timeline, Validator,
+    VerboseLogger,
 };
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -33,8 +34,8 @@ QUICK START:
   runbox ps
   # View logs
   runbox logs <run_id>
-  # Replay a previous run with exact code state
-  runbox replay <run_id>
+  # Replay a previous run or record with exact code state
+  runbox replay <id>
 TEMPLATE-BASED EXECUTION:
   # Run from a pre-defined template
   runbox run --template tpl_train_model --binding epochs=100
@@ -102,6 +103,7 @@ EXAMPLES:
 
   # Explicit replay execution
   runbox run --replay run_550e8400-e29b-41d4-a716-446655440000
+  runbox run --replay rec_550e8400-e29b-41d4-a716-446655440000
 
 RELATED COMMANDS:
   runbox log       Alias for direct execution (runbox log -- <cmd>)
@@ -115,7 +117,7 @@ RELATED COMMANDS:
         /// Explicit template ID (for template-based execution)
         #[arg(short, long)]
         template: Option<String>,
-        /// Explicit run ID for replay
+        /// Explicit replay ID (run_... or rec_...)
         #[arg(long)]
         replay: Option<String>,
         /// Variable bindings (key=value) - only for template mode
@@ -1023,7 +1025,7 @@ fn main() -> Result<()> {
                     &storage, command, runtime, dry_run, timeout, env_vars, cwd, no_git,
                 )
             } else {
-                anyhow::bail!("Either a short ID, --template, --replay, or a command (after --) is required.\n\nUsage:\n  runbox run <short_id>                    # unified resolution\n  runbox run --template <id> [--binding key=value]\n  runbox run --replay <run_id>\n  runbox run [OPTIONS] -- <command...>")
+                anyhow::bail!("Either a short ID, --template, --replay, or a command (after --) is required.\n\nUsage:\n  runbox run <short_id>                    # unified resolution\n  runbox run --template <id> [--binding key=value]\n  runbox run --replay <id>\n  runbox run [OPTIONS] -- <command...>")
             }
         }
         Commands::Log {
@@ -1465,7 +1467,8 @@ fn cmd_run_direct(
 fn display_run_info(
     runnable: &Runnable,
     template: Option<&RunTemplate>,
-    run: Option<&runbox_core::Run>,
+    replay: Option<&ReplaySpec>,
+    replay_created_at: Option<chrono::DateTime<Utc>>,
 ) {
     let width = 55;
     let border = "─".repeat(width);
@@ -1485,14 +1488,12 @@ fn display_run_info(
         }
         Runnable::Replay(id) => {
             println!("│ {:<width$}│", format!("REPLAY: {}", id), width = width);
-            if let Some(r) = run {
-                if let Some(created) = r.timeline.created_at {
-                    println!(
-                        "│ {:<width$}│",
-                        format!("Original: {}", created.format("%Y-%m-%d %H:%M:%S")),
-                        width = width
-                    );
-                }
+            if let Some(created) = replay_created_at {
+                println!(
+                    "│ {:<width$}│",
+                    format!("Original: {}", created.format("%Y-%m-%d %H:%M:%S")),
+                    width = width
+                );
             }
         }
         Runnable::PlaylistItem {
@@ -1539,8 +1540,8 @@ fn display_run_info(
             format!("Cwd:     {}", tpl.exec.cwd),
             width = width
         );
-    } else if let Some(r) = run {
-        let cmd = r.exec.argv.join(" ");
+    } else if let Some(replay) = replay {
+        let cmd = replay.argv.join(" ");
         let cmd_display = if cmd.len() > width - 10 {
             format!("{}...", &cmd[..width - 13])
         } else {
@@ -1553,18 +1554,19 @@ fn display_run_info(
         );
         println!(
             "│ {:<width$}│",
-            format!("Cwd:     {}", r.exec.cwd),
+            format!("Cwd:     {}", replay.cwd),
             width = width
         );
-        if !r.code_state.repo_url.is_empty() {
+        if !replay.code_state.repo_url.is_empty() {
             println!(
                 "│ {:<width$}│",
                 format!(
                     "Commit:  {}",
-                    r.code_state
+                    replay
+                        .code_state
                         .base_commit
                         .get(..8)
-                        .unwrap_or(&r.code_state.base_commit)
+                        .unwrap_or(&replay.code_state.base_commit)
                 ),
                 width = width
             );
@@ -1572,6 +1574,110 @@ fn display_run_info(
     }
 
     println!("└{}┘", border);
+}
+
+fn normalize_replay_input(input: &str) -> String {
+    if let Some(rest) = input.strip_prefix("run-") {
+        return format!("run_{}", rest);
+    }
+    if let Some(rest) = input.strip_prefix("rec-") {
+        return format!("rec_{}", rest);
+    }
+    input.to_string()
+}
+
+fn resolve_replay_id(storage: &Storage, input: &str) -> Result<String> {
+    let normalized_input = normalize_replay_input(input);
+
+    if normalized_input.starts_with("run_") {
+        return storage.resolve_run_id(&normalized_input);
+    }
+
+    if normalized_input.starts_with("rec_") {
+        return storage.resolve_record_id(&normalized_input);
+    }
+
+    let short_input = normalized_input.to_lowercase();
+    if short_input.is_empty() {
+        bail!("Empty input: please provide a short ID or full ID (run_..., rec_...)");
+    }
+
+    let mut matches: Vec<String> = storage
+        .list_runs(usize::MAX)?
+        .into_iter()
+        .filter(|run| run.short_id().to_lowercase().starts_with(&short_input))
+        .map(|run| run.run_id)
+        .collect();
+
+    matches.extend(
+        storage
+            .list_records(usize::MAX)?
+            .into_iter()
+            .filter(|record| record.short_id().to_lowercase().starts_with(&short_input))
+            .map(|record| record.record_id),
+    );
+
+    match matches.len() {
+        0 => bail!("No item found matching '{}'", input),
+        1 => Ok(matches.remove(0)),
+        n => {
+            let candidates: Vec<String> = matches
+                .iter()
+                .map(|id| format!("  - {}", short_id(id)))
+                .collect();
+            bail!(
+                "Ambiguous: {} items match '{}'. Use more characters.\n{}",
+                n,
+                input,
+                candidates.join("\n")
+            )
+        }
+    }
+}
+
+fn load_replay_spec(storage: &Storage, input: &str) -> Result<ReplaySpec> {
+    let resolved_id = resolve_replay_id(storage, input)?;
+
+    if resolved_id.starts_with("rec_") {
+        let record = storage.load_record(&resolved_id)?;
+        Ok(ReplaySpec::from(&record))
+    } else {
+        let run = storage.load_run(&resolved_id)?;
+        Ok(ReplaySpec::from(&run))
+    }
+}
+
+fn replay_created_at(storage: &Storage, replay_id: &str) -> Option<chrono::DateTime<Utc>> {
+    if replay_id.starts_with("rec_") {
+        storage
+            .load_record(replay_id)
+            .ok()
+            .map(|record| record.created_at)
+    } else {
+        storage
+            .load_run(replay_id)
+            .ok()
+            .and_then(|run| run.timeline.created_at)
+    }
+}
+
+fn git_context_for_replay(replay: &ReplaySpec) -> Result<GitContext> {
+    let replay_cwd = Path::new(&replay.cwd);
+    if replay_cwd.is_absolute() {
+        return GitContext::from_path(replay_cwd).with_context(|| {
+            format!(
+                "Recorded replay cwd is not a git repository: {}",
+                replay_cwd.display()
+            )
+        });
+    }
+
+    GitContext::from_current_dir().with_context(|| {
+        format!(
+            "Replay '{}' only stores a relative cwd ('{}'). Run replay from a checkout of {}.",
+            replay.id, replay.cwd, replay.code_state.repo_url
+        )
+    })
 }
 
 /// Unified run command - resolves short ID to any runnable type and executes
@@ -1589,16 +1695,20 @@ fn cmd_run_unified(
         Runnable::Template(template_id) => {
             // Load template for display
             let template = storage.load_template(template_id)?;
-            display_run_info(&runnable, Some(&template), None);
+            display_run_info(&runnable, Some(&template), None, None);
             println!();
             cmd_run_template(storage, template_id, bindings, runtime, dry_run)
         }
-        Runnable::Replay(run_id) => {
-            // Load run for display
-            let run = storage.load_run(run_id)?;
-            display_run_info(&runnable, None, Some(&run));
+        Runnable::Replay(replay_id) => {
+            let replay = load_replay_spec(storage, replay_id)?;
+            display_run_info(
+                &runnable,
+                None,
+                Some(&replay),
+                replay_created_at(storage, replay_id),
+            );
             println!();
-            cmd_run_replay(storage, run_id, runtime, dry_run)
+            cmd_run_replay(storage, replay_id, runtime, dry_run)
         }
         Runnable::PlaylistItem {
             template_id,
@@ -1614,31 +1724,29 @@ fn cmd_run_unified(
                 template_id: template_id.clone(),
                 label: label.clone(),
             };
-            display_run_info(&runnable_with_info, Some(&template), None);
+            display_run_info(&runnable_with_info, Some(&template), None, None);
             println!();
             cmd_run_template(storage, template_id, bindings, runtime, dry_run)
         }
     }
 }
 
-/// Run a replay of a previous run
+/// Run a replay of a previous run or record
 fn cmd_run_replay(
     storage: &Storage,
-    run_id: &str,
+    replay_id: &str,
     runtime: RuntimeType,
     dry_run: bool,
 ) -> Result<()> {
-    // Resolve and load the original run
-    let resolved_id = storage.resolve_run_id(run_id)?;
-    let original_run = storage.load_run(&resolved_id)?;
+    let replay = load_replay_spec(storage, replay_id)?;
 
     if dry_run {
         println!("Dry run - would replay:");
-        println!("  Original run: {}", original_run.run_id);
-        println!("  Command: {:?}", original_run.exec.argv);
-        println!("  Cwd: {}", original_run.exec.cwd);
-        println!("  Commit: {}", original_run.code_state.base_commit);
-        if original_run.code_state.patch.is_some() {
+        println!("  Original: {}", replay.id);
+        println!("  Command: {:?}", replay.argv);
+        println!("  Cwd: {}", replay.cwd);
+        println!("  Commit: {}", replay.code_state.base_commit);
+        if replay.code_state.patch.is_some() {
             println!("  Patch: yes");
         }
         return Ok(());
@@ -1647,15 +1755,15 @@ fn cmd_run_replay(
     // Create a new run with the same exec and code_state
     let new_run_id = format!("run_{}", uuid::Uuid::new_v4());
     let exec = Exec {
-        argv: original_run.exec.argv.clone(),
-        cwd: original_run.exec.cwd.clone(),
-        env: original_run.exec.env.clone(),
-        timeout_sec: original_run.exec.timeout_sec,
+        argv: replay.argv.clone(),
+        cwd: replay.cwd.clone(),
+        env: replay.env.clone(),
+        timeout_sec: replay.timeout_sec,
     };
     let code_state = CodeState {
-        repo_url: original_run.code_state.repo_url.clone(),
-        base_commit: original_run.code_state.base_commit.clone(),
-        patch: original_run.code_state.patch.clone(),
+        repo_url: replay.code_state.repo_url.clone(),
+        base_commit: replay.code_state.base_commit.clone(),
+        patch: replay.code_state.patch.clone(),
     };
 
     let mut run = Run::new(exec, code_state);
@@ -1684,7 +1792,7 @@ fn cmd_run_replay(
     storage.save_run(&run)?;
 
     println!("Starting replay: {}", run.run_id);
-    println!("Original run: {}", original_run.run_id);
+    println!("Original source: {}", replay.id);
     println!("Runtime: {}", runtime_name);
     println!("Command: {:?}", run.exec.argv);
 
@@ -2910,7 +3018,7 @@ fn cmd_result_delete(storage: &Storage, result_id: &str) -> Result<()> {
 // === Replay Command ===
 fn cmd_replay(
     storage: &Storage,
-    run_id: &str,
+    replay_id: &str,
     worktree_dir: Option<PathBuf>,
     keep: bool,
     cleanup: bool,
@@ -2918,11 +3026,9 @@ fn cmd_replay(
     fresh: bool,
     verbose: u8,
 ) -> Result<()> {
-    // Resolve short ID to full ID
-    let resolved_id = storage.resolve_run_id(run_id)?;
-    let run = storage.load_run(&resolved_id)?;
+    let replay = load_replay_spec(storage, replay_id)?;
     // Initialize git context from current directory
-    let git = GitContext::from_current_dir()?;
+    let git = git_context_for_replay(&replay)?;
     // Create config resolver
     let config_resolver = ConfigResolver::new(Some(git.repo_root().to_path_buf()))?;
     // Resolve verbosity
@@ -2978,16 +3084,16 @@ fn cmd_replay(
         ),
     );
     // Print run info
-    println!("Replaying: {}", resolved_id);
-    println!("Command: {:?}", run.exec.argv);
-    println!("Commit: {}", run.code_state.base_commit);
-    if run.code_state.patch.is_some() {
+    println!("Replaying: {}", replay.id);
+    println!("Command: {:?}", replay.argv);
+    println!("Commit: {}", replay.code_state.base_commit);
+    if replay.code_state.patch.is_some() {
         println!("Patch: yes");
     }
     // Restore code state in worktree
     let worktree_result = git.restore_code_state_in_worktree(
-        &run.code_state,
-        &resolved_id,
+        &replay.code_state,
+        &replay.id,
         &resolved_worktree_dir.value,
         resolved_reuse.value,
         &logger,
@@ -3004,24 +3110,24 @@ fn cmd_replay(
         );
     }
     // Resolve the execution directory relative to worktree
-    let exec_cwd = if Path::new(&run.exec.cwd).is_absolute() {
+    let exec_cwd = if Path::new(&replay.cwd).is_absolute() {
         // If cwd is absolute, make it relative to worktree
-        PathBuf::from(&run.exec.cwd)
+        PathBuf::from(&replay.cwd)
     } else {
         // Relative path - combine with worktree
-        worktree_result.worktree_path.join(&run.exec.cwd)
+        worktree_result.worktree_path.join(&replay.cwd)
     };
     logger.log_vv("exec", &format!("cwd: {}", exec_cwd.display()));
-    logger.log_vv("exec", &format!("argv: {:?}", run.exec.argv));
-    if !run.exec.env.is_empty() {
-        logger.log_vvv("exec", &format!("env: {:?}", run.exec.env));
+    logger.log_vv("exec", &format!("argv: {:?}", replay.argv));
+    if !replay.env.is_empty() {
+        logger.log_vvv("exec", &format!("env: {:?}", replay.env));
     }
     // Execute
     println!("\nExecuting...");
-    let status = Command::new(&run.exec.argv[0])
-        .args(&run.exec.argv[1..])
+    let status = Command::new(&replay.argv[0])
+        .args(&replay.argv[1..])
         .current_dir(&exec_cwd)
-        .envs(&run.exec.env)
+        .envs(&replay.env)
         .status()
         .context("Failed to execute command")?;
     let exit_code = status.code().unwrap_or(-1);
