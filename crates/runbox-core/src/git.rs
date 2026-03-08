@@ -139,25 +139,24 @@ impl GitContext {
         format!("{:x}", result)
     }
 
-    /// Create a patch and push it to refs/patches/{run_id}
-    pub fn create_and_push_patch(&self, run_id: &str) -> Result<Option<Patch>> {
-        if !self.has_uncommitted_changes()? {
-            return Ok(None);
+    fn normalize_patch_content(diff: &str) -> String {
+        let mut normalized = diff.to_string();
+        if !normalized.is_empty() && !normalized.ends_with('\n') {
+            normalized.push('\n');
+        }
+        normalized
+    }
+
+    /// Create a patch ref from raw diff content.
+    pub fn create_patch_ref_from_diff(&self, patch_id: &str, diff: &str) -> Result<Patch> {
+        if diff.trim().is_empty() {
+            anyhow::bail!("Cannot create patch ref from empty diff");
         }
 
-        let diff = self.get_diff()?;
-        if diff.is_empty() {
-            return Ok(None);
-        }
+        let normalized_diff = Self::normalize_patch_content(diff);
+        let sha256 = Self::sha256_hash(&normalized_diff);
+        let ref_name = format!("refs/patches/{}", patch_id);
 
-        let sha256 = Self::sha256_hash(&diff);
-        let ref_name = format!("refs/patches/{}", run_id);
-
-        // Create a temporary commit with the current changes
-        // First, stash the changes, create a commit, then restore
-        // Actually, we'll use a different approach: create a blob and a ref pointing to it
-
-        // Create a blob with the diff content
         let mut child = Command::new("git")
             .current_dir(&self.repo_root)
             .args(["hash-object", "-w", "--stdin"])
@@ -169,7 +168,7 @@ impl GitContext {
         {
             use std::io::Write;
             let stdin = child.stdin.as_mut().context("Failed to get stdin")?;
-            stdin.write_all(diff.as_bytes())?;
+            stdin.write_all(normalized_diff.as_bytes())?;
         }
 
         let output = child.wait_with_output()?;
@@ -179,7 +178,6 @@ impl GitContext {
 
         let blob_sha = String::from_utf8(output.stdout)?.trim().to_string();
 
-        // Create a ref pointing to the blob
         let output = Command::new("git")
             .current_dir(&self.repo_root)
             .args(["update-ref", &ref_name, &blob_sha])
@@ -193,10 +191,24 @@ impl GitContext {
             );
         }
 
-        Ok(Some(Patch {
+        Ok(Patch {
             ref_: ref_name,
             sha256,
-        }))
+        })
+    }
+
+    /// Create a patch and push it to refs/patches/{run_id}
+    pub fn create_and_push_patch(&self, run_id: &str) -> Result<Option<Patch>> {
+        if !self.has_uncommitted_changes()? {
+            return Ok(None);
+        }
+
+        let diff = self.get_diff()?;
+        if diff.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(self.create_patch_ref_from_diff(run_id, &diff)?))
     }
 
     /// Push patch ref to remote

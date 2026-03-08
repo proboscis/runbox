@@ -4,6 +4,8 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::fs;
+use std::process::Command as StdCommand;
 use tempfile::TempDir;
 
 /// Helper to create a runbox command with RUNBOX_HOME set to temp directory
@@ -11,6 +13,48 @@ fn runbox_cmd(temp_dir: &TempDir) -> Command {
     let mut cmd = Command::cargo_bin("runbox").unwrap();
     cmd.env("RUNBOX_HOME", temp_dir.path());
     cmd
+}
+
+fn setup_git_repo(temp_dir: &TempDir) -> (std::path::PathBuf, String) {
+    let repo_path = temp_dir.path().join("repo");
+    fs::create_dir_all(&repo_path).unwrap();
+
+    StdCommand::new("git")
+        .current_dir(&repo_path)
+        .args(["init"])
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .current_dir(&repo_path)
+        .args(["config", "user.email", "test@test.com"])
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .current_dir(&repo_path)
+        .args(["config", "user.name", "Test User"])
+        .output()
+        .unwrap();
+
+    fs::write(repo_path.join("README.md"), "# Test Repo\n").unwrap();
+    StdCommand::new("git")
+        .current_dir(&repo_path)
+        .args(["add", "."])
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .current_dir(&repo_path)
+        .args(["commit", "-m", "Initial commit"])
+        .output()
+        .unwrap();
+
+    let output = StdCommand::new("git")
+        .current_dir(&repo_path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+
+    let commit = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    (repo_path, commit)
 }
 
 /// Minimal valid record JSON
@@ -259,4 +303,103 @@ fn test_create_record_preserves_env_vars() {
     let json: serde_json::Value = serde_json::from_str(&content).unwrap();
     assert_eq!(json["command"]["env"]["FOO"], "bar");
     assert_eq!(json["command"]["env"]["DEBUG"], "true");
+}
+
+#[test]
+fn test_create_record_materializes_git_diff_into_patch_ref() {
+    let temp = TempDir::new().unwrap();
+    let (repo_path, commit) = setup_git_repo(&temp);
+
+    fs::write(
+        repo_path.join("README.md"),
+        "# Test Repo\npatched from diff\n",
+    )
+    .unwrap();
+    let diff_output = StdCommand::new("git")
+        .current_dir(&repo_path)
+        .args(["diff", "HEAD"])
+        .output()
+        .unwrap();
+    let diff = String::from_utf8(diff_output.stdout)
+        .unwrap()
+        .trim_end_matches('\n')
+        .to_string();
+    StdCommand::new("git")
+        .current_dir(&repo_path)
+        .args(["checkout", "--", "README.md"])
+        .output()
+        .unwrap();
+
+    let input = serde_json::json!({
+        "id": "rec_from-diff",
+        "git_state": {
+            "repo_url": "git@github.com:org/repo.git",
+            "commit": commit,
+            "diff": diff,
+        },
+        "command": {
+            "argv": ["cat", "README.md"],
+            "cwd": ".",
+        },
+        "source": "doeff",
+    });
+
+    runbox_cmd(&temp)
+        .current_dir(&repo_path)
+        .args(["create", "record"])
+        .write_stdin(input.to_string())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Created record: rec_from-diff"));
+
+    let record_path = temp.path().join("records").join("rec_from-diff.json");
+    let saved = fs::read_to_string(&record_path).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(json["record_id"], "rec_from-diff");
+    assert_eq!(json["git_state"]["patch_ref"], "refs/patches/rec_from-diff");
+    assert!(json["git_state"].get("diff").is_none());
+
+    let worktree_dir = temp.path().join("worktrees");
+    fs::create_dir_all(&worktree_dir).unwrap();
+
+    runbox_cmd(&temp)
+        .current_dir(&repo_path)
+        .args([
+            "replay",
+            "rec_from-diff",
+            "--worktree-dir",
+            worktree_dir.to_str().unwrap(),
+            "--keep",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("patched from diff"));
+}
+
+#[test]
+fn test_create_record_diff_fails_when_command_cwd_is_not_git_repo() {
+    let temp = TempDir::new().unwrap();
+    let non_repo_dir = temp.path().join("not_a_repo");
+    fs::create_dir_all(&non_repo_dir).unwrap();
+
+    let input = serde_json::json!({
+        "id": "rec_bad-diff",
+        "git_state": {
+            "commit": "a1b2c3d4e5f6789012345678901234567890abcd",
+            "diff": "diff --git a/README.md b/README.md\n",
+        },
+        "command": {
+            "argv": ["echo", "hello"],
+            "cwd": non_repo_dir,
+        },
+    });
+
+    runbox_cmd(&temp)
+        .args(["create", "record"])
+        .write_stdin(input.to_string())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "git_state.diff requires command.cwd to point at a git repository",
+        ));
 }
