@@ -1680,6 +1680,15 @@ fn git_context_for_replay(replay: &ReplaySpec) -> Result<GitContext> {
     })
 }
 
+fn git_context_for_record_diff(cwd: &str) -> Result<GitContext> {
+    GitContext::from_path(Path::new(cwd)).with_context(|| {
+        format!(
+            "git_state.diff requires command.cwd to point at a git repository: {}",
+            cwd
+        )
+    })
+}
+
 /// Unified run command - resolves short ID to any runnable type and executes
 fn cmd_run_unified(
     storage: &Storage,
@@ -3185,40 +3194,6 @@ fn cmd_create_record(storage: &Storage, from_file: Option<String>) -> Result<()>
         .map(String::from)
         .unwrap_or_else(|| format!("rec_{}", uuid::Uuid::new_v4()));
 
-    // Extract git_state (optional but recommended)
-    let git_state = if let Some(gs) = json.get("git_state") {
-        RecordGitState {
-            repo_url: gs
-                .get("repo_url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string(),
-            commit: gs
-                .get("commit")
-                .and_then(|v| v.as_str())
-                .unwrap_or(&"0".repeat(40))
-                .to_string(),
-            patch_ref: gs
-                .get("patch_ref")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-        }
-    } else {
-        // Try to capture current git context
-        match GitContext::from_current_dir() {
-            Ok(ctx) => RecordGitState {
-                repo_url: ctx.get_remote_url().unwrap_or("unknown".to_string()),
-                commit: ctx.get_head_commit().unwrap_or("0".repeat(40)),
-                patch_ref: None,
-            },
-            Err(_) => RecordGitState {
-                repo_url: "unknown".to_string(),
-                commit: "0".repeat(40),
-                patch_ref: None,
-            },
-        }
-    };
-
     // Extract command (required)
     let command = json.get("command").context("Missing 'command' field")?;
     let argv: Vec<String> = command
@@ -3250,6 +3225,59 @@ fn cmd_create_record(storage: &Storage, from_file: Option<String>) -> Result<()>
         .unwrap_or_default();
 
     let record_command = RecordCommand { argv, cwd, env };
+
+    // Extract git_state (optional but recommended)
+    let git_state = if let Some(gs) = json.get("git_state") {
+        let repo_url = gs
+            .get("repo_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let commit = gs
+            .get("commit")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&"0".repeat(40))
+            .to_string();
+        let patch_ref = gs
+            .get("patch_ref")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let diff = gs.get("diff").and_then(|v| v.as_str());
+
+        if patch_ref.is_some() && diff.is_some() {
+            bail!("git_state.patch_ref and git_state.diff are mutually exclusive");
+        }
+
+        let patch_ref = if let Some(diff) = diff {
+            Some(
+                git_context_for_record_diff(&record_command.cwd)?
+                    .create_patch_ref_from_diff(&record_id, diff)?
+                    .ref_,
+            )
+        } else {
+            patch_ref
+        };
+
+        RecordGitState {
+            repo_url,
+            commit,
+            patch_ref,
+        }
+    } else {
+        // Try to capture current git context
+        match GitContext::from_current_dir() {
+            Ok(ctx) => RecordGitState {
+                repo_url: ctx.get_remote_url().unwrap_or("unknown".to_string()),
+                commit: ctx.get_head_commit().unwrap_or("0".repeat(40)),
+                patch_ref: None,
+            },
+            Err(_) => RecordGitState {
+                repo_url: "unknown".to_string(),
+                commit: "0".repeat(40),
+                patch_ref: None,
+            },
+        }
+    };
 
     // Create the record
     let mut record = Record::with_id(record_id.clone(), git_state, record_command);
