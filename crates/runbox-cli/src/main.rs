@@ -121,7 +121,7 @@ RELATED COMMANDS:
         /// Variable bindings (key=value) - only for template mode
         #[arg(short, long)]
         binding: Vec<String>,
-        /// Runtime environment (bg, background, tmux)
+        /// Runtime environment (bg, background, tmux, zellij)
         #[arg(long, default_value = "bg")]
         runtime: RuntimeType,
         /// Skip execution (dry run)
@@ -163,7 +163,7 @@ RELATED COMMANDS:
   runbox ps        List runs to check status
   runbox logs      View stdout/stderr from a run")]
     Log {
-        /// Runtime environment (bg, background, tmux)
+        /// Runtime environment (bg, background, tmux, zellij)
         #[arg(long, default_value = "bg")]
         runtime: RuntimeType,
         /// Skip execution (dry run)
@@ -364,7 +364,7 @@ NOTES:
 RELATED COMMANDS:
   runbox ps        List runs to find run IDs
   runbox show      Show run metadata including log file path
-  runbox attach    Attach to tmux session (for tmux runtime)")]
+  runbox attach    Attach to tmux/zellij session (interactive runtime)")]
     Logs {
         /// Run ID (or short ID prefix, e.g., '550e8400')
         run_id: String,
@@ -375,21 +375,22 @@ RELATED COMMANDS:
         #[arg(short, long)]
         lines: Option<usize>,
     },
-    /// Attach to a running tmux session for interactive access
+    /// Attach to a running tmux/zellij session for interactive access
     #[command(after_help = "\
 EXAMPLES:
-  # Attach to a tmux-based run
+  # Attach to a tmux/zellij-based run
   runbox attach 550e8400
   # Using full run ID
   runbox attach run_550e8400-e29b-41d4-a716-446655440000
 NOTES:
   - Only works for runs started with --runtime tmux or --runtime zellij
-  - Use Ctrl+B, D to detach from the tmux session
+  - Detach from tmux with Ctrl+B, D or from zellij with Ctrl+O, D
   - The process continues running after detaching
 RELATED COMMANDS:
   runbox ps               List runs to find run IDs
   runbox logs <id>        View logs (for background runs)
-  runbox run --runtime tmux  Start a new run in tmux")]
+  runbox run --runtime tmux    Start a new run in tmux
+  runbox run --runtime zellij Start a new run in zellij")]
     Attach {
         /// Run ID (or short ID prefix, e.g., '550e8400')
         run_id: String,
@@ -926,7 +927,7 @@ NOTES:
         /// Variable bindings (key=value) for template
         #[arg(short, long)]
         binding: Vec<String>,
-        /// Runtime environment (bg, background, tmux)
+        /// Runtime environment (bg, background, tmux, zellij)
         #[arg(short, long, default_value = "bg")]
         runtime: RuntimeType,
         /// Show what would be executed without running
@@ -1713,7 +1714,7 @@ fn cmd_run_replay(
     println!("Short ID: {}", run.short_id());
     println!("Logs: {}", log_path.display());
 
-    if matches!(runtime, RuntimeType::Tmux) {
+    if matches!(runtime, RuntimeType::Tmux | RuntimeType::Zellij) {
         println!("Attach with: runbox attach {}", run.short_id());
     }
 
