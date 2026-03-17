@@ -51,6 +51,7 @@ impl std::fmt::Display for EntityType {
 pub struct IndexedEntity {
     pub id: String,
     pub entity_type: EntityType,
+    pub scope: String,
     pub name: Option<String>,
     pub file_path: PathBuf,
     pub mtime: i64,
@@ -92,25 +93,9 @@ impl Index {
 
     /// Initialize the database schema
     fn init_schema(&self) -> Result<()> {
+        self.ensure_file_index_schema()?;
         self.conn.execute_batch(
             r#"
-            CREATE TABLE IF NOT EXISTS file_index (
-                id TEXT PRIMARY KEY,
-                type TEXT NOT NULL,
-                name TEXT,
-                file_path TEXT NOT NULL UNIQUE,
-                mtime INTEGER NOT NULL,
-                created_at TEXT,
-                exit_code INTEGER,
-                tags TEXT,
-                json_data TEXT NOT NULL
-            );
-            
-            CREATE INDEX IF NOT EXISTS idx_type ON file_index(type);
-            CREATE INDEX IF NOT EXISTS idx_created_at ON file_index(created_at);
-            CREATE INDEX IF NOT EXISTS idx_exit_code ON file_index(exit_code);
-            
-            -- Tasks table for live process tracking
             CREATE TABLE IF NOT EXISTS tasks (
                 task_id TEXT PRIMARY KEY,
                 record_id TEXT NOT NULL,
@@ -132,8 +117,120 @@ impl Index {
         Ok(())
     }
 
+    fn ensure_file_index_schema(&self) -> Result<()> {
+        let table_exists: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'file_index'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        if table_exists.is_none() {
+            self.create_file_index_table()?;
+            return Ok(());
+        }
+
+        let columns = self.file_index_columns()?;
+        let has_scope_column = columns.iter().any(|column| column.name == "scope");
+        let pk_columns: Vec<_> = columns.iter().filter(|column| column.pk > 0).collect();
+        let has_composite_primary_key = pk_columns.len() == 2
+            && pk_columns.iter().any(|column| column.name == "id")
+            && pk_columns.iter().any(|column| column.name == "scope");
+
+        if !has_scope_column || !has_composite_primary_key {
+            self.rebuild_file_index_table(has_scope_column)?;
+        } else {
+            self.create_file_index_indexes()?;
+        }
+
+        Ok(())
+    }
+
+    fn create_file_index_table(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE file_index (
+                id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                scope TEXT NOT NULL DEFAULT 'global',
+                name TEXT,
+                file_path TEXT NOT NULL UNIQUE,
+                mtime INTEGER NOT NULL,
+                created_at TEXT,
+                exit_code INTEGER,
+                tags TEXT,
+                json_data TEXT NOT NULL,
+                PRIMARY KEY (id, scope)
+            );
+            "#,
+        )?;
+        self.create_file_index_indexes()
+    }
+
+    fn create_file_index_indexes(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_type ON file_index(type);
+            CREATE INDEX IF NOT EXISTS idx_scope ON file_index(scope);
+            CREATE INDEX IF NOT EXISTS idx_created_at ON file_index(created_at);
+            CREATE INDEX IF NOT EXISTS idx_exit_code ON file_index(exit_code);
+            "#,
+        )?;
+        Ok(())
+    }
+
+    fn rebuild_file_index_table(&self, old_has_scope_column: bool) -> Result<()> {
+        self.conn
+            .execute("ALTER TABLE file_index RENAME TO file_index_old", [])?;
+        self.create_file_index_table()?;
+
+        let insert_sql = if old_has_scope_column {
+            r#"
+            INSERT INTO file_index (id, type, scope, name, file_path, mtime, created_at, exit_code, tags, json_data)
+            SELECT id, type, COALESCE(scope, 'global'), name, file_path, mtime, created_at, exit_code, tags, json_data
+            FROM file_index_old
+            "#
+        } else {
+            r#"
+            INSERT INTO file_index (id, type, scope, name, file_path, mtime, created_at, exit_code, tags, json_data)
+            SELECT id, type, 'global', name, file_path, mtime, created_at, exit_code, tags, json_data
+            FROM file_index_old
+            "#
+        };
+
+        self.conn.execute(insert_sql, [])?;
+        self.conn.execute("DROP TABLE file_index_old", [])?;
+
+        Ok(())
+    }
+
+    fn file_index_columns(&self) -> Result<Vec<TableColumnInfo>> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(file_index)")?;
+        let columns = stmt.query_map([], |row| {
+            Ok(TableColumnInfo {
+                name: row.get(1)?,
+                pk: row.get(5)?,
+            })
+        })?;
+        columns
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     /// Index a file from the filesystem
     pub fn index_file(&self, file_path: &Path, entity_type: EntityType) -> Result<()> {
+        self.index_file_with_scope(file_path, entity_type, "global")
+    }
+
+    /// Index a file from the filesystem with an explicit scope label.
+    pub fn index_file_with_scope(
+        &self,
+        file_path: &Path,
+        entity_type: EntityType,
+        scope: &str,
+    ) -> Result<()> {
         let metadata = fs::metadata(file_path)?;
         let mtime = metadata
             .modified()?
@@ -169,12 +266,13 @@ impl Index {
         self.conn.execute(
             r#"
             INSERT OR REPLACE INTO file_index 
-            (id, type, name, file_path, mtime, created_at, exit_code, tags, json_data)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            (id, type, scope, name, file_path, mtime, created_at, exit_code, tags, json_data)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             "#,
             params![
                 id,
                 entity_type.as_str(),
+                scope,
                 name,
                 file_path.to_string_lossy(),
                 mtime,
@@ -185,6 +283,12 @@ impl Index {
             ],
         )?;
 
+        Ok(())
+    }
+
+    /// Remove all indexed file rows prior to a full rebuild.
+    pub fn clear_file_index(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM file_index", [])?;
         Ok(())
     }
 
@@ -241,16 +345,24 @@ impl Index {
     pub fn query(
         &self,
         entity_types: Option<&[EntityType]>,
+        scopes: Option<&[&str]>,
         where_clause: Option<&str>,
         limit: usize,
     ) -> Result<Vec<IndexedEntity>> {
-        let mut sql = String::from("SELECT id, type, name, file_path, mtime, created_at, exit_code, tags, json_data FROM file_index");
+        let mut sql = String::from(
+            "SELECT id, type, scope, name, file_path, mtime, created_at, exit_code, tags, json_data FROM file_index",
+        );
         let mut conditions = Vec::new();
 
         // Filter by type
         if let Some(types) = entity_types {
             let type_list: Vec<_> = types.iter().map(|t| format!("'{}'", t.as_str())).collect();
             conditions.push(format!("type IN ({})", type_list.join(",")));
+        }
+
+        if let Some(scopes) = scopes {
+            let scope_list: Vec<_> = scopes.iter().map(|scope| format!("'{}'", scope)).collect();
+            conditions.push(format!("scope IN ({})", scope_list.join(",")));
         }
 
         // Custom WHERE clause
@@ -269,25 +381,26 @@ impl Index {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], |row| {
             let type_str: String = row.get(1)?;
-            let tags_str: String = row.get(7)?;
+            let tags_str: String = row.get(8)?;
 
             Ok(IndexedEntity {
                 id: row.get(0)?,
                 entity_type: EntityType::from_str(&type_str).unwrap_or(EntityType::Run),
-                name: row.get(2)?,
-                file_path: PathBuf::from(row.get::<_, String>(3)?),
-                mtime: row.get(4)?,
+                scope: row.get(2)?,
+                name: row.get(3)?,
+                file_path: PathBuf::from(row.get::<_, String>(4)?),
+                mtime: row.get(5)?,
                 created_at: row
-                    .get::<_, Option<String>>(5)?
+                    .get::<_, Option<String>>(6)?
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
-                exit_code: row.get(6)?,
+                exit_code: row.get(7)?,
                 tags: if tags_str.is_empty() {
                     Vec::new()
                 } else {
                     tags_str.split(',').map(String::from).collect()
                 },
-                json_data: row.get(8)?,
+                json_data: row.get(9)?,
             })
         })?;
 
@@ -474,6 +587,11 @@ impl Index {
     }
 }
 
+struct TableColumnInfo {
+    name: String,
+    pk: i32,
+}
+
 fn base64_encode(data: &[u8]) -> String {
     // Simple hex encoding for blob data
     data.iter().map(|b| format!("{:02x}", b)).collect()
@@ -488,7 +606,7 @@ mod tests {
     fn test_index_creation() {
         let index = Index::open_in_memory().unwrap();
         // Should not panic
-        assert!(index.query(None, None, 10).unwrap().is_empty());
+        assert!(index.query(None, None, None, 10).unwrap().is_empty());
     }
 
     #[test]
@@ -518,7 +636,7 @@ mod tests {
 
         // Query
         let results = index
-            .query(Some(&[EntityType::Template]), None, 10)
+            .query(Some(&[EntityType::Template]), None, None, 10)
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "tpl_test");
@@ -610,17 +728,116 @@ mod tests {
 
         // Query only templates
         let templates = index
-            .query(Some(&[EntityType::Template]), None, 10)
+            .query(Some(&[EntityType::Template]), None, None, 10)
             .unwrap();
         assert_eq!(templates.len(), 3);
 
         // Query only records
-        let records = index.query(Some(&[EntityType::Record]), None, 10).unwrap();
+        let records = index
+            .query(Some(&[EntityType::Record]), None, None, 10)
+            .unwrap();
         assert_eq!(records.len(), 1);
 
         // Query with custom WHERE
-        let filtered = index.query(None, Some("exit_code = 0"), 10).unwrap();
+        let filtered = index.query(None, None, Some("exit_code = 0"), 10).unwrap();
         assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn test_index_migrates_legacy_schema_without_scope_column() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("runbox.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE file_index (
+                id TEXT PRIMARY KEY,
+                type TEXT NOT NULL,
+                name TEXT,
+                file_path TEXT NOT NULL UNIQUE,
+                mtime INTEGER NOT NULL,
+                created_at TEXT,
+                exit_code INTEGER,
+                tags TEXT,
+                json_data TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_index (id, type, name, file_path, mtime, created_at, exit_code, tags, json_data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                "tpl_legacy",
+                "template",
+                "Legacy Template",
+                "/tmp/legacy-template.json",
+                123_i64,
+                Option::<String>::None,
+                Option::<i32>::None,
+                "",
+                r#"{"template_id":"tpl_legacy","name":"Legacy Template"}"#
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let index = Index::open(&db_path).unwrap();
+        let results = index
+            .query(Some(&[EntityType::Template]), Some(&["global"]), None, 10)
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "tpl_legacy");
+        assert_eq!(results[0].scope, "global");
+    }
+
+    #[test]
+    fn test_index_can_store_same_id_in_multiple_scopes() {
+        let temp = tempdir().unwrap();
+        let index = Index::open_in_memory().unwrap();
+
+        let global_template = serde_json::json!({
+            "template_version": 0,
+            "template_id": "tpl_shadowed",
+            "name": "Global Shadowed",
+            "exec": {"argv": ["echo"], "cwd": "."},
+            "code_state": {"repo_url": "git@github.com:test/global.git"}
+        });
+        let local_template = serde_json::json!({
+            "template_version": 0,
+            "template_id": "tpl_shadowed",
+            "name": "Local Shadowed",
+            "exec": {"argv": ["echo"], "cwd": "."},
+            "code_state": {"repo_url": "git@github.com:test/local.git"}
+        });
+
+        let global_path = temp.path().join("global.json");
+        let local_path = temp.path().join("local.json");
+        fs::write(
+            &global_path,
+            serde_json::to_string_pretty(&global_template).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &local_path,
+            serde_json::to_string_pretty(&local_template).unwrap(),
+        )
+        .unwrap();
+
+        index
+            .index_file_with_scope(&global_path, EntityType::Template, "global")
+            .unwrap();
+        index
+            .index_file_with_scope(&local_path, EntityType::Template, "local")
+            .unwrap();
+
+        let results = index
+            .query(Some(&[EntityType::Template]), None, None, 10)
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|result| result.scope == "global"));
+        assert!(results.iter().any(|result| result.scope == "local"));
     }
 
     #[test]

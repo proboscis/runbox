@@ -217,6 +217,40 @@ fn test_list_json_output() {
 }
 
 #[test]
+fn test_list_where_playlist_type_expands_playlist_items() {
+    let home = setup_home();
+    create_template(home.path(), "tpl_echo", "Echo Command");
+    create_playlist(
+        home.path(),
+        "pl_daily",
+        "Daily Tasks",
+        &[
+            ("tpl_echo", Some("Morning Echo")),
+            ("tpl_echo", Some("Evening Echo")),
+        ],
+    );
+
+    let output = runbox(
+        &[
+            "list",
+            "--type",
+            "playlist",
+            "--where-clause",
+            "name = 'Daily Tasks'",
+            "--all-repos",
+        ],
+        home.path(),
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("daily[0]"));
+    assert!(stdout.contains("daily[1]"));
+    assert!(stdout.contains("Morning Echo"));
+    assert!(stdout.contains("Evening Echo"));
+}
+
+#[test]
 fn test_list_short_output() {
     let home = setup_home();
     create_template(home.path(), "tpl_echo", "Echo Command");

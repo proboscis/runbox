@@ -128,6 +128,26 @@ impl LayeredStorage {
     pub fn with_paths(local_dir: Option<PathBuf>, global_dir: PathBuf) -> Result<Self> {
         let global_storage = crate::Storage::with_base_dir(global_dir)?;
 
+        Self::with_global_storage(local_dir, global_storage)
+    }
+
+    /// Create with explicit data/state directories.
+    pub fn with_data_and_state_dirs(
+        local_dir: Option<PathBuf>,
+        global_data_dir: PathBuf,
+        global_state_dir: PathBuf,
+    ) -> Result<Self> {
+        let global_storage =
+            crate::Storage::with_data_and_state_dirs(global_data_dir, global_state_dir)?;
+
+        Self::with_global_storage(local_dir, global_storage)
+    }
+
+    /// Create with a prepared global storage instance.
+    pub fn with_global_storage(
+        local_dir: Option<PathBuf>,
+        global_storage: crate::Storage,
+    ) -> Result<Self> {
         if let Some(ref dir) = local_dir {
             fs::create_dir_all(dir.join("templates"))?;
             fs::create_dir_all(dir.join("playlists"))?;
@@ -154,6 +174,63 @@ impl LayeredStorage {
         self.local_dir.is_some()
     }
 
+    fn list_local_templates(&self) -> Result<Vec<crate::RunTemplate>> {
+        let mut templates = Vec::new();
+
+        if let Some(ref local_dir) = self.local_dir {
+            let templates_dir = local_dir.join("templates");
+            if templates_dir.is_dir() {
+                for entry in fs::read_dir(&templates_dir)? {
+                    let entry = entry?;
+                    if entry
+                        .path()
+                        .extension()
+                        .map(|extension| extension == "json")
+                        .unwrap_or(false)
+                    {
+                        if let Ok(content) = fs::read_to_string(entry.path()) {
+                            if let Ok(template) =
+                                serde_json::from_str::<crate::RunTemplate>(&content)
+                            {
+                                templates.push(template);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(templates)
+    }
+
+    fn list_local_playlists(&self) -> Result<Vec<crate::Playlist>> {
+        let mut playlists = Vec::new();
+
+        if let Some(ref local_dir) = self.local_dir {
+            let playlists_dir = local_dir.join("playlists");
+            if playlists_dir.is_dir() {
+                for entry in fs::read_dir(&playlists_dir)? {
+                    let entry = entry?;
+                    if entry
+                        .path()
+                        .extension()
+                        .map(|extension| extension == "json")
+                        .unwrap_or(false)
+                    {
+                        if let Ok(content) = fs::read_to_string(entry.path()) {
+                            if let Ok(playlist) = serde_json::from_str::<crate::Playlist>(&content)
+                            {
+                                playlists.push(playlist);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(playlists)
+    }
+
     // === Template operations with scope ===
 
     /// List all templates with their scope.
@@ -165,28 +242,9 @@ impl LayeredStorage {
         let mut seen_ids = std::collections::HashSet::new();
 
         // First, add local templates
-        if let Some(ref local_dir) = self.local_dir {
-            let templates_dir = local_dir.join("templates");
-            if templates_dir.is_dir() {
-                for entry in fs::read_dir(&templates_dir)? {
-                    let entry = entry?;
-                    if entry
-                        .path()
-                        .extension()
-                        .map(|e| e == "json")
-                        .unwrap_or(false)
-                    {
-                        if let Ok(content) = fs::read_to_string(entry.path()) {
-                            if let Ok(template) =
-                                serde_json::from_str::<crate::RunTemplate>(&content)
-                            {
-                                seen_ids.insert(template.template_id.clone());
-                                result.push((template, Scope::Local));
-                            }
-                        }
-                    }
-                }
-            }
+        for template in self.list_local_templates()? {
+            seen_ids.insert(template.template_id.clone());
+            result.push((template, Scope::Local));
         }
 
         // Then, add global templates (skip if same ID exists locally)
@@ -197,6 +255,30 @@ impl LayeredStorage {
         }
 
         Ok(result)
+    }
+
+    /// List all templates with local overrides already applied.
+    pub fn list_templates(&self) -> Result<Vec<crate::RunTemplate>> {
+        Ok(self
+            .list_templates_with_scope()?
+            .into_iter()
+            .map(|(template, _)| template)
+            .collect())
+    }
+
+    /// Resolve a template ID from a full ID or short prefix.
+    pub fn resolve_template_id(&self, input: &str) -> Result<String> {
+        let templates = self.list_templates()?;
+        crate::storage::resolve_id_from_items(&templates, input, |template| &template.template_id)
+    }
+
+    /// Resolve a template ID from a full ID or short prefix in a specific scope.
+    pub fn resolve_template_id_in_scope(&self, input: &str, scope: Scope) -> Result<String> {
+        let templates = match scope {
+            Scope::Local => self.list_local_templates()?,
+            Scope::Global => self.global_storage.list_templates()?,
+        };
+        crate::storage::resolve_id_from_items(&templates, input, |template| &template.template_id)
     }
 
     /// Load a template by ID (local overrides global).
@@ -217,6 +299,29 @@ impl LayeredStorage {
         // Fall back to global
         let template = self.global_storage.load_template(template_id)?;
         Ok((template, Scope::Global))
+    }
+
+    /// Load a template in a specific scope without fallback.
+    pub fn load_template_in_scope(
+        &self,
+        template_id: &str,
+        scope: Scope,
+    ) -> Result<crate::RunTemplate> {
+        match scope {
+            Scope::Local => {
+                let local_dir = self
+                    .local_dir
+                    .as_ref()
+                    .context("No local .runbox/ directory available")?;
+                let path = local_dir
+                    .join("templates")
+                    .join(format!("{}.json", template_id));
+                let content = fs::read_to_string(&path)
+                    .with_context(|| format!("Template not found: {}", template_id))?;
+                Ok(serde_json::from_str(&content)?)
+            }
+            Scope::Global => self.global_storage.load_template(template_id),
+        }
     }
 
     /// Save a template to the specified scope.
@@ -241,6 +346,25 @@ impl LayeredStorage {
         }
     }
 
+    /// Delete a template in a specific scope.
+    pub fn delete_template_in_scope(&self, template_id: &str, scope: Scope) -> Result<()> {
+        match scope {
+            Scope::Local => {
+                let local_dir = self
+                    .local_dir
+                    .as_ref()
+                    .context("No local .runbox/ directory available")?;
+                let local_path = local_dir
+                    .join("templates")
+                    .join(format!("{}.json", template_id));
+                fs::remove_file(&local_path)
+                    .with_context(|| format!("Template not found: {}", template_id))?;
+                Ok(())
+            }
+            Scope::Global => self.global_storage.delete_template(template_id),
+        }
+    }
+
     // === Playlist operations with scope ===
 
     /// List all playlists with their scope.
@@ -249,27 +373,9 @@ impl LayeredStorage {
         let mut seen_ids = std::collections::HashSet::new();
 
         // First, add local playlists
-        if let Some(ref local_dir) = self.local_dir {
-            let playlists_dir = local_dir.join("playlists");
-            if playlists_dir.is_dir() {
-                for entry in fs::read_dir(&playlists_dir)? {
-                    let entry = entry?;
-                    if entry
-                        .path()
-                        .extension()
-                        .map(|e| e == "json")
-                        .unwrap_or(false)
-                    {
-                        if let Ok(content) = fs::read_to_string(entry.path()) {
-                            if let Ok(playlist) = serde_json::from_str::<crate::Playlist>(&content)
-                            {
-                                seen_ids.insert(playlist.playlist_id.clone());
-                                result.push((playlist, Scope::Local));
-                            }
-                        }
-                    }
-                }
-            }
+        for playlist in self.list_local_playlists()? {
+            seen_ids.insert(playlist.playlist_id.clone());
+            result.push((playlist, Scope::Local));
         }
 
         // Then, add global playlists (skip if same ID exists locally)
@@ -280,6 +386,30 @@ impl LayeredStorage {
         }
 
         Ok(result)
+    }
+
+    /// List all playlists with local overrides already applied.
+    pub fn list_playlists(&self) -> Result<Vec<crate::Playlist>> {
+        Ok(self
+            .list_playlists_with_scope()?
+            .into_iter()
+            .map(|(playlist, _)| playlist)
+            .collect())
+    }
+
+    /// Resolve a playlist ID from a full ID or short prefix.
+    pub fn resolve_playlist_id(&self, input: &str) -> Result<String> {
+        let playlists = self.list_playlists()?;
+        crate::storage::resolve_id_from_items(&playlists, input, |playlist| &playlist.playlist_id)
+    }
+
+    /// Resolve a playlist ID from a full ID or short prefix in a specific scope.
+    pub fn resolve_playlist_id_in_scope(&self, input: &str, scope: Scope) -> Result<String> {
+        let playlists = match scope {
+            Scope::Local => self.list_local_playlists()?,
+            Scope::Global => self.global_storage.list_playlists()?,
+        };
+        crate::storage::resolve_id_from_items(&playlists, input, |playlist| &playlist.playlist_id)
     }
 
     /// Load a playlist by ID (local overrides global).
@@ -302,6 +432,29 @@ impl LayeredStorage {
         Ok((playlist, Scope::Global))
     }
 
+    /// Load a playlist in a specific scope without fallback.
+    pub fn load_playlist_in_scope(
+        &self,
+        playlist_id: &str,
+        scope: Scope,
+    ) -> Result<crate::Playlist> {
+        match scope {
+            Scope::Local => {
+                let local_dir = self
+                    .local_dir
+                    .as_ref()
+                    .context("No local .runbox/ directory available")?;
+                let path = local_dir
+                    .join("playlists")
+                    .join(format!("{}.json", playlist_id));
+                let content = fs::read_to_string(&path)
+                    .with_context(|| format!("Playlist not found: {}", playlist_id))?;
+                Ok(serde_json::from_str(&content)?)
+            }
+            Scope::Global => self.global_storage.load_playlist(playlist_id),
+        }
+    }
+
     /// Save a playlist to the specified scope.
     pub fn save_playlist(&self, playlist: &crate::Playlist, scope: Scope) -> Result<PathBuf> {
         match scope {
@@ -318,6 +471,25 @@ impl LayeredStorage {
                 Ok(path)
             }
             Scope::Global => self.global_storage.save_playlist(playlist),
+        }
+    }
+
+    /// Delete a playlist in a specific scope.
+    pub fn delete_playlist_in_scope(&self, playlist_id: &str, scope: Scope) -> Result<()> {
+        match scope {
+            Scope::Local => {
+                let local_dir = self
+                    .local_dir
+                    .as_ref()
+                    .context("No local .runbox/ directory available")?;
+                let local_path = local_dir
+                    .join("playlists")
+                    .join(format!("{}.json", playlist_id));
+                fs::remove_file(&local_path)
+                    .with_context(|| format!("Playlist not found: {}", playlist_id))?;
+                Ok(())
+            }
+            Scope::Global => self.global_storage.delete_playlist(playlist_id),
         }
     }
 
@@ -338,6 +510,67 @@ impl LayeredStorage {
 
     pub fn log_path(&self, run_id: &str) -> PathBuf {
         self.global_storage.log_path(run_id)
+    }
+
+    /// List all runnables with their scope.
+    pub fn list_all_runnables_with_scope(
+        &self,
+        replay_limit: usize,
+    ) -> Result<Vec<(crate::Runnable, Scope)>> {
+        let mut runnables = Vec::new();
+
+        for (template, scope) in self.list_templates_with_scope()? {
+            runnables.push((crate::Runnable::Template(template.template_id), scope));
+        }
+
+        for run in self.list_runs(replay_limit)? {
+            runnables.push((crate::Runnable::Replay(run.run_id), Scope::Global));
+        }
+
+        for (playlist, scope) in self.list_playlists_with_scope()? {
+            for (index, item) in playlist.items.iter().enumerate() {
+                runnables.push((
+                    crate::Runnable::PlaylistItem {
+                        playlist_id: playlist.playlist_id.clone(),
+                        index,
+                        template_id: item.template_id.clone(),
+                        label: item.label.clone(),
+                    },
+                    scope,
+                ));
+            }
+        }
+
+        Ok(runnables)
+    }
+
+    /// Resolve any runnable by short ID prefix or full ID across local and global storage.
+    pub fn resolve_runnable(&self, input: &str, limit: usize) -> Result<crate::Runnable> {
+        let templates = self.list_templates()?;
+        let runs = self.list_runs(limit)?;
+        let records = self.global_storage.list_records(limit)?;
+        let playlists = self.list_playlists()?;
+        crate::storage::resolve_runnable_from_items(input, &templates, &runs, &records, &playlists)
+    }
+
+    /// Get the repo URL for a runnable using local overrides when applicable.
+    pub fn get_runnable_repo_url(&self, runnable: &crate::Runnable) -> Option<String> {
+        crate::storage::runnable_repo_url_with(
+            runnable,
+            |id| self.load_template(id).map(|(template, _)| template),
+            |id| self.global_storage.load_run(id),
+            |id| self.global_storage.load_record(id),
+        )
+    }
+
+    /// Get a display-friendly name for a runnable using local overrides when applicable.
+    pub fn get_runnable_display_name(&self, runnable: &crate::Runnable) -> String {
+        crate::storage::runnable_display_name_with(
+            runnable,
+            |id| self.load_template(id).map(|(template, _)| template),
+            |id| self.global_storage.load_run(id),
+            |id| self.global_storage.load_record(id),
+        )
     }
 }
 

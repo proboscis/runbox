@@ -6,7 +6,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 
-fn normalize_for_match(id: &str) -> String {
+pub(crate) fn normalize_for_match(id: &str) -> String {
     id.trim_start_matches("run_")
         .trim_start_matches("run-")
         .trim_start_matches("tpl_")
@@ -754,111 +754,11 @@ impl Storage {
     /// If input starts with `run_` or `rec_`, it's treated as a replay ID.
     /// Otherwise, it's treated as a short ID prefix to search.
     pub fn resolve_runnable(&self, input: &str, limit: usize) -> Result<crate::Runnable> {
-        use crate::runnable::{format_ambiguous_matches, Runnable, RunnableMatch};
-
-        // Reject empty input
-        if input.is_empty() {
-            bail!("Empty input: please provide a short ID or full ID (tpl_..., run_..., rec_...)");
-        }
-
-        // Handle full template IDs directly
-        if input.starts_with("tpl_") {
-            // Verify template exists
-            let resolved_id = self.resolve_template_id(input)?;
-            return Ok(Runnable::Template(resolved_id));
-        }
-
-        // Handle full run IDs directly
-        if input.starts_with("run_") || input.starts_with("run-") {
-            // Verify run exists
-            let resolved_id = self.resolve_run_id(input)?;
-            return Ok(Runnable::Replay(resolved_id));
-        }
-
-        // Handle full record IDs directly
-        if input.starts_with("rec_") || input.starts_with("rec-") {
-            let resolved_id = self.resolve_record_id(input)?;
-            return Ok(Runnable::Replay(resolved_id));
-        }
-
-        // Handle full playlist IDs - resolve to first item if exists
-        if input.starts_with("pl_") {
-            let resolved_id = self.resolve_playlist_id(input)?;
-            let playlist = self.load_playlist(&resolved_id)?;
-            if playlist.items.is_empty() {
-                bail!("Playlist '{}' has no items", resolved_id);
-            }
-            let item = &playlist.items[0];
-            return Ok(Runnable::PlaylistItem {
-                playlist_id: resolved_id,
-                index: 0,
-                template_id: item.template_id.clone(),
-                label: item.label.clone(),
-            });
-        }
-
-        // For short ID prefix matching, validate it looks like hex
-        let input_lower = input.to_lowercase();
-        if !input_lower.chars().all(|c| c.is_ascii_hexdigit()) {
-            bail!(
-                "Invalid short ID '{}': must be hexadecimal or a full ID (tpl_..., run_..., rec_...)",
-                input
-            );
-        }
-
-        let mut matches: Vec<RunnableMatch> = Vec::new();
-
-        // Check templates
-        for tpl in self.list_templates()? {
-            let runnable = Runnable::Template(tpl.template_id.clone());
-            if runnable.short_id().starts_with(&input_lower) {
-                matches.push(RunnableMatch::from_runnable(runnable));
-            }
-        }
-
-        // Check runs (for replay)
-        for run in self.list_runs(limit)? {
-            let runnable = Runnable::Replay(run.run_id.clone());
-            if runnable.short_id().starts_with(&input_lower) {
-                matches.push(RunnableMatch::from_runnable(runnable));
-            }
-        }
-
-        // Check records (for replay)
-        for record in self.list_records(limit)? {
-            let runnable = Runnable::Replay(record.record_id.clone());
-            if runnable.short_id().starts_with(&input_lower) {
-                matches.push(RunnableMatch::from_runnable(runnable));
-            }
-        }
-
-        // Check playlist items
-        for playlist in self.list_playlists()? {
-            for (idx, item) in playlist.items.iter().enumerate() {
-                let runnable = Runnable::PlaylistItem {
-                    playlist_id: playlist.playlist_id.clone(),
-                    index: idx,
-                    template_id: item.template_id.clone(),
-                    label: item.label.clone(),
-                };
-                if runnable.short_id().starts_with(&input_lower) {
-                    matches.push(RunnableMatch::from_runnable(runnable));
-                }
-            }
-        }
-
-        match matches.len() {
-            0 => bail!("No runnable found matching '{}'", input),
-            1 => Ok(matches.remove(0).runnable),
-            n => {
-                bail!(
-                    "Ambiguous short ID \"{}\" matches {} items:{}",
-                    input,
-                    n,
-                    format_ambiguous_matches(&matches)
-                )
-            }
-        }
+        let templates = self.list_templates()?;
+        let runs = self.list_runs(limit)?;
+        let records = self.list_records(limit)?;
+        let playlists = self.list_playlists()?;
+        resolve_runnable_from_items(input, &templates, &runs, &records, &playlists)
     }
 
     // === List All Runnables ===
@@ -871,33 +771,10 @@ impl Storage {
     /// # Returns
     /// A vector of all Runnables: templates first, then replays, then playlist items
     pub fn list_all_runnables(&self, replay_limit: usize) -> Result<Vec<crate::Runnable>> {
-        use crate::Runnable;
-
-        let mut runnables = Vec::new();
-
-        // Collect templates
-        for tpl in self.list_templates()? {
-            runnables.push(Runnable::Template(tpl.template_id));
-        }
-
-        // Collect replays (recent runs)
-        for run in self.list_runs(replay_limit)? {
-            runnables.push(Runnable::Replay(run.run_id));
-        }
-
-        // Collect playlist items
-        for playlist in self.list_playlists()? {
-            for (idx, item) in playlist.items.iter().enumerate() {
-                runnables.push(Runnable::PlaylistItem {
-                    playlist_id: playlist.playlist_id.clone(),
-                    index: idx,
-                    template_id: item.template_id.clone(),
-                    label: item.label.clone(),
-                });
-            }
-        }
-
-        Ok(runnables)
+        let templates = self.list_templates()?;
+        let runs = self.list_runs(replay_limit)?;
+        let playlists = self.list_playlists()?;
+        Ok(runnables_from_items(&templates, &runs, &playlists))
     }
 
     /// Get the repo URL for a runnable.
@@ -906,20 +783,12 @@ impl Storage {
     /// - For Replay: returns the run's code_state.repo_url
     /// - For PlaylistItem: returns the referenced template's code_state.repo_url
     pub fn get_runnable_repo_url(&self, runnable: &crate::Runnable) -> Option<String> {
-        match runnable {
-            crate::Runnable::Template(id) => {
-                self.load_template(id).ok().map(|t| t.code_state.repo_url)
-            }
-            crate::Runnable::Replay(id) => self
-                .load_run(id)
-                .ok()
-                .map(|r| r.code_state.repo_url)
-                .or_else(|| self.load_record(id).ok().map(|r| r.git_state.repo_url)),
-            crate::Runnable::PlaylistItem { template_id, .. } => self
-                .load_template(template_id)
-                .ok()
-                .map(|t| t.code_state.repo_url),
-        }
+        runnable_repo_url_with(
+            runnable,
+            |id| self.load_template(id),
+            |id| self.load_run(id),
+            |id| self.load_record(id),
+        )
     }
 
     /// Get a display-friendly name for a runnable.
@@ -928,33 +797,211 @@ impl Storage {
     /// - For Replay: returns the command (first part of argv)
     /// - For PlaylistItem: returns the label or template name
     pub fn get_runnable_display_name(&self, runnable: &crate::Runnable) -> String {
-        match runnable {
-            crate::Runnable::Template(id) => self
-                .load_template(id)
-                .map(|t| t.name)
-                .unwrap_or_else(|_| id.clone()),
-            crate::Runnable::Replay(id) => self
-                .load_run(id)
-                .map(|r| r.exec.argv.join(" "))
-                .or_else(|_| self.load_record(id).map(|r| r.command.argv.join(" ")))
-                .unwrap_or_else(|_| id.clone()),
-            crate::Runnable::PlaylistItem {
-                label, template_id, ..
-            } => {
-                if let Some(lbl) = label {
-                    lbl.clone()
-                } else {
-                    self.load_template(template_id)
-                        .map(|t| t.name)
-                        .unwrap_or_else(|_| template_id.clone())
-                }
+        runnable_display_name_with(
+            runnable,
+            |id| self.load_template(id),
+            |id| self.load_run(id),
+            |id| self.load_record(id),
+        )
+    }
+}
+
+pub(crate) fn runnables_from_items(
+    templates: &[RunTemplate],
+    runs: &[Run],
+    playlists: &[Playlist],
+) -> Vec<crate::Runnable> {
+    use crate::Runnable;
+
+    let mut runnables = Vec::new();
+
+    for template in templates {
+        runnables.push(Runnable::Template(template.template_id.clone()));
+    }
+
+    for run in runs {
+        runnables.push(Runnable::Replay(run.run_id.clone()));
+    }
+
+    for playlist in playlists {
+        for (index, item) in playlist.items.iter().enumerate() {
+            runnables.push(Runnable::PlaylistItem {
+                playlist_id: playlist.playlist_id.clone(),
+                index,
+                template_id: item.template_id.clone(),
+                label: item.label.clone(),
+            });
+        }
+    }
+
+    runnables
+}
+
+pub(crate) fn resolve_runnable_from_items(
+    input: &str,
+    templates: &[RunTemplate],
+    runs: &[Run],
+    records: &[crate::Record],
+    playlists: &[Playlist],
+) -> Result<crate::Runnable> {
+    use crate::runnable::{format_ambiguous_matches, Runnable, RunnableMatch};
+
+    if input.is_empty() {
+        bail!("Empty input: please provide a short ID or full ID (tpl_..., run_..., rec_...)");
+    }
+
+    if input.starts_with("tpl_") {
+        let resolved_id =
+            resolve_id_from_items(templates, input, |template| &template.template_id)?;
+        return Ok(Runnable::Template(resolved_id));
+    }
+
+    if input.starts_with("run_") || input.starts_with("run-") {
+        let resolved_id = resolve_id_from_items(runs, input, |run| &run.run_id)?;
+        return Ok(Runnable::Replay(resolved_id));
+    }
+
+    if input.starts_with("rec_") || input.starts_with("rec-") {
+        let resolved_id = resolve_id_from_items(records, input, |record| &record.record_id)?;
+        return Ok(Runnable::Replay(resolved_id));
+    }
+
+    if input.starts_with("pl_") {
+        let resolved_id =
+            resolve_id_from_items(playlists, input, |playlist| &playlist.playlist_id)?;
+        let playlist = playlists
+            .iter()
+            .find(|playlist| playlist.playlist_id == resolved_id)
+            .expect("resolved playlist should exist");
+        if playlist.items.is_empty() {
+            bail!("Playlist '{}' has no items", resolved_id);
+        }
+        let item = &playlist.items[0];
+        return Ok(Runnable::PlaylistItem {
+            playlist_id: resolved_id,
+            index: 0,
+            template_id: item.template_id.clone(),
+            label: item.label.clone(),
+        });
+    }
+
+    let input_lower = input.to_lowercase();
+    if !input_lower.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!(
+            "Invalid short ID '{}': must be hexadecimal or a full ID (tpl_..., run_..., rec_...)",
+            input
+        );
+    }
+
+    let mut matches: Vec<RunnableMatch> = Vec::new();
+
+    for template in templates {
+        let runnable = Runnable::Template(template.template_id.clone());
+        if runnable.short_id().starts_with(&input_lower) {
+            matches.push(RunnableMatch::from_runnable(runnable));
+        }
+    }
+
+    for run in runs {
+        let runnable = Runnable::Replay(run.run_id.clone());
+        if runnable.short_id().starts_with(&input_lower) {
+            matches.push(RunnableMatch::from_runnable(runnable));
+        }
+    }
+
+    for record in records {
+        let runnable = Runnable::Replay(record.record_id.clone());
+        if runnable.short_id().starts_with(&input_lower) {
+            matches.push(RunnableMatch::from_runnable(runnable));
+        }
+    }
+
+    for playlist in playlists {
+        for (index, item) in playlist.items.iter().enumerate() {
+            let runnable = Runnable::PlaylistItem {
+                playlist_id: playlist.playlist_id.clone(),
+                index,
+                template_id: item.template_id.clone(),
+                label: item.label.clone(),
+            };
+            if runnable.short_id().starts_with(&input_lower) {
+                matches.push(RunnableMatch::from_runnable(runnable));
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => bail!("No runnable found matching '{}'", input),
+        1 => Ok(matches.remove(0).runnable),
+        n => bail!(
+            "Ambiguous short ID \"{}\" matches {} items:{}",
+            input,
+            n,
+            format_ambiguous_matches(&matches)
+        ),
+    }
+}
+
+pub(crate) fn runnable_repo_url_with<LoadTemplate, LoadRun, LoadRecord>(
+    runnable: &crate::Runnable,
+    load_template: LoadTemplate,
+    load_run: LoadRun,
+    load_record: LoadRecord,
+) -> Option<String>
+where
+    LoadTemplate: Fn(&str) -> Result<RunTemplate>,
+    LoadRun: Fn(&str) -> Result<Run>,
+    LoadRecord: Fn(&str) -> Result<crate::Record>,
+{
+    match runnable {
+        crate::Runnable::Template(id) => load_template(id)
+            .ok()
+            .map(|template| template.code_state.repo_url),
+        crate::Runnable::Replay(id) => load_run(id)
+            .ok()
+            .map(|run| run.code_state.repo_url)
+            .or_else(|| load_record(id).ok().map(|record| record.git_state.repo_url)),
+        crate::Runnable::PlaylistItem { template_id, .. } => load_template(template_id)
+            .ok()
+            .map(|template| template.code_state.repo_url),
+    }
+}
+
+pub(crate) fn runnable_display_name_with<LoadTemplate, LoadRun, LoadRecord>(
+    runnable: &crate::Runnable,
+    load_template: LoadTemplate,
+    load_run: LoadRun,
+    load_record: LoadRecord,
+) -> String
+where
+    LoadTemplate: Fn(&str) -> Result<RunTemplate>,
+    LoadRun: Fn(&str) -> Result<Run>,
+    LoadRecord: Fn(&str) -> Result<crate::Record>,
+{
+    match runnable {
+        crate::Runnable::Template(id) => load_template(id)
+            .map(|template| template.name)
+            .unwrap_or_else(|_| id.clone()),
+        crate::Runnable::Replay(id) => load_run(id)
+            .map(|run| run.exec.argv.join(" "))
+            .or_else(|_| load_record(id).map(|record| record.command.argv.join(" ")))
+            .unwrap_or_else(|_| id.clone()),
+        crate::Runnable::PlaylistItem {
+            label, template_id, ..
+        } => {
+            if let Some(label) = label {
+                label.clone()
+            } else {
+                load_template(template_id)
+                    .map(|template| template.name)
+                    .unwrap_or_else(|_| template_id.clone())
             }
         }
     }
 }
 
 /// Generic ID resolution from a list of items
-fn resolve_id_from_items<T, F>(items: &[T], input: &str, get_id: F) -> Result<String>
+pub(crate) fn resolve_id_from_items<T, F>(items: &[T], input: &str, get_id: F) -> Result<String>
 where
     F: Fn(&T) -> &str,
 {

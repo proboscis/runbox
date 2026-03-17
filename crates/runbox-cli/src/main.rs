@@ -4,10 +4,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use dialoguer::{theme::ColorfulTheme, Input};
 use runbox_core::{
     default_pid_path, default_socket_path, find_skill_by_name, find_skills, short_id,
-    BindingResolver, CodeState, ConfigResolver, DaemonClient, Exec, GitContext, Index, LogRef,
-    Platform, Playlist, PlaylistItem, Record, RecordCommand, RecordGitState, ReplaySpec, Run,
-    RunStatus, RunTemplate, Runnable, RuntimeRegistry, Skill, Storage, Timeline, Validator,
-    VerboseLogger,
+    BindingResolver, CodeState, ConfigResolver, DaemonClient, EntityType, Exec, GitContext, Index,
+    IndexedEntity, LayeredStorage, LogRef, Platform, Playlist, PlaylistItem, Record, RecordCommand,
+    RecordGitState, ReplaySpec, Run, RunStatus, RunTemplate, Runnable, RuntimeRegistry, Scope,
+    Skill, Storage, Timeline, Validator, VerboseLogger,
 };
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -794,19 +794,33 @@ EXAMPLES:
     #[command(after_help = "\
 EXAMPLES:
   runbox template create my_template.json
+  runbox template create my_template.json --local
 NOTE: Use 'runbox validate' to check the JSON before creating.")]
     Create {
         /// Path to template JSON file
         path: String,
+        /// Save in project-local .runbox storage
+        #[arg(long, conflicts_with = "global")]
+        local: bool,
+        /// Save in global storage (default)
+        #[arg(long, conflicts_with = "local")]
+        global: bool,
     },
     /// Delete a registered template
     #[command(after_help = "\
 EXAMPLES:
   runbox template delete tpl_hello
+  runbox template delete tpl_hello --local
   runbox template delete hello    # short ID prefix works")]
     Delete {
         /// Template ID (or short ID prefix)
         template_id: String,
+        /// Delete from project-local .runbox storage
+        #[arg(long, conflicts_with = "global")]
+        local: bool,
+        /// Delete from global storage (default)
+        #[arg(long, conflicts_with = "local")]
+        global: bool,
     },
 }
 #[derive(Subcommand)]
@@ -862,11 +876,18 @@ OUTPUT (specific playlist):
     #[command(after_help = "\
 EXAMPLES:
   runbox playlist create my_playlist.json
+  runbox playlist create my_playlist.json --local
 
 NOTE: Use 'runbox validate' to check the JSON before creating.")]
     Create {
         /// Path to playlist JSON file
         path: String,
+        /// Save in project-local .runbox storage
+        #[arg(long, conflicts_with = "global")]
+        local: bool,
+        /// Save in global storage (default)
+        #[arg(long, conflicts_with = "local")]
+        global: bool,
     },
 
     /// Add a template to a playlist
@@ -876,7 +897,10 @@ EXAMPLES:
   runbox playlist add pl_daily tpl_backup
 
   # Add with custom label
-  runbox playlist add pl_daily tpl_backup --label 'Backup Data'")]
+  runbox playlist add pl_daily tpl_backup --label 'Backup Data'
+
+  # Modify a local playlist
+  runbox playlist add pl_daily tpl_backup --local")]
     Add {
         /// Playlist ID (or short ID prefix)
         playlist_id: String,
@@ -885,6 +909,12 @@ EXAMPLES:
         /// Display label for this item in the playlist
         #[arg(short, long)]
         label: Option<String>,
+        /// Modify a project-local playlist in .runbox
+        #[arg(long, conflicts_with = "global")]
+        local: bool,
+        /// Modify a global playlist (default)
+        #[arg(long, conflicts_with = "local")]
+        global: bool,
     },
 
     /// Remove a template from a playlist by ID or index
@@ -895,12 +925,21 @@ EXAMPLES:
 
   # Remove by index (0-based)
   runbox playlist remove pl_daily 0    # remove first item
-  runbox playlist remove pl_daily 2    # remove third item")]
+  runbox playlist remove pl_daily 2    # remove third item
+
+  # Modify a local playlist
+  runbox playlist remove pl_daily tpl_backup --local")]
     Remove {
         /// Playlist ID (or short ID prefix)
         playlist_id: String,
         /// Template ID or index (0-based) to remove
         template_or_index: String,
+        /// Modify a project-local playlist in .runbox
+        #[arg(long, conflicts_with = "global")]
+        local: bool,
+        /// Modify a global playlist (default)
+        #[arg(long, conflicts_with = "local")]
+        global: bool,
     },
 
     /// Run a template from a playlist by global short ID or playlist + index/short ID
@@ -1084,24 +1123,51 @@ fn main() -> Result<()> {
         Commands::Template { command } => match command {
             TemplateCommands::List => cmd_template_list(&storage),
             TemplateCommands::Show { template_id } => cmd_template_show(&storage, &template_id),
-            TemplateCommands::Create { path } => cmd_template_create(&storage, &path),
-            TemplateCommands::Delete { template_id } => cmd_template_delete(&storage, &template_id),
+            TemplateCommands::Create {
+                path,
+                local,
+                global,
+            } => cmd_template_create(&storage, &path, mutation_scope(local, global)),
+            TemplateCommands::Delete {
+                template_id,
+                local,
+                global,
+            } => cmd_template_delete(&storage, &template_id, mutation_scope(local, global)),
         },
         Commands::Playlist { command } => match command {
             PlaylistCommands::List => cmd_playlist_list(&storage),
             PlaylistCommands::Show { playlist_id, json } => {
                 cmd_playlist_show(&storage, playlist_id.as_deref(), json)
             }
-            PlaylistCommands::Create { path } => cmd_playlist_create(&storage, &path),
+            PlaylistCommands::Create {
+                path,
+                local,
+                global,
+            } => cmd_playlist_create(&storage, &path, mutation_scope(local, global)),
             PlaylistCommands::Add {
                 playlist_id,
                 template_id,
                 label,
-            } => cmd_playlist_add(&storage, &playlist_id, &template_id, label),
+                local,
+                global,
+            } => cmd_playlist_add(
+                &storage,
+                &playlist_id,
+                &template_id,
+                label,
+                mutation_scope(local, global),
+            ),
             PlaylistCommands::Remove {
                 playlist_id,
                 template_or_index,
-            } => cmd_playlist_remove(&storage, &playlist_id, &template_or_index),
+                local,
+                global,
+            } => cmd_playlist_remove(
+                &storage,
+                &playlist_id,
+                &template_or_index,
+                mutation_scope(local, global),
+            ),
             PlaylistCommands::Run {
                 selector,
                 item,
@@ -1278,8 +1344,9 @@ fn cmd_run_template(
     runtime: RuntimeType,
     dry_run: bool,
 ) -> Result<()> {
-    let resolved_template_id = storage.resolve_template_id(template_id)?;
-    let template = storage.load_template(&resolved_template_id)?;
+    let layered = layered_storage(storage)?;
+    let resolved_template_id = layered.resolve_template_id(template_id)?;
+    let (template, _) = layered.load_template(&resolved_template_id)?;
     // Create interactive callback
     let interactive_callback: Box<dyn Fn(&str, Option<&serde_json::Value>) -> Result<String>> =
         Box::new(|var, default| {
@@ -1704,13 +1771,14 @@ fn cmd_run_unified(
     runtime: RuntimeType,
     dry_run: bool,
 ) -> Result<()> {
+    let layered = layered_storage(storage)?;
     // Resolve the short ID to a Runnable
-    let runnable = storage.resolve_runnable(short_id, 100)?;
+    let runnable = layered.resolve_runnable(short_id, 100)?;
 
     match &runnable {
         Runnable::Template(template_id) => {
             // Load template for display
-            let template = storage.load_template(template_id)?;
+            let (template, _) = layered.load_template(template_id)?;
             display_run_info(&runnable, Some(&template), None, None);
             println!();
             cmd_run_template(storage, template_id, bindings, runtime, dry_run)
@@ -1733,7 +1801,7 @@ fn cmd_run_unified(
             label,
         } => {
             // Load template for display
-            let template = storage.load_template(template_id)?;
+            let (template, _) = layered.load_template(template_id)?;
             let runnable_with_info = Runnable::PlaylistItem {
                 playlist_id: playlist_id.clone(),
                 index: *index,
@@ -1993,6 +2061,307 @@ fn truncate_string(s: &str, max_chars: usize) -> String {
     }
 }
 
+fn layered_storage(storage: &Storage) -> Result<LayeredStorage> {
+    LayeredStorage::with_data_and_state_dirs(
+        runbox_core::locate_local_runbox_dir(),
+        storage.data_dir().clone(),
+        storage.state_dir().clone(),
+    )
+}
+
+fn mutation_scope(local: bool, _global: bool) -> Scope {
+    if local {
+        Scope::Local
+    } else {
+        Scope::Global
+    }
+}
+
+fn scope_name(scope: Scope) -> &'static str {
+    match scope {
+        Scope::Local => "local",
+        Scope::Global => "global",
+    }
+}
+
+fn index_scope_filter(local: bool, global: bool) -> Option<Vec<&'static str>> {
+    if local {
+        Some(vec!["local"])
+    } else if global {
+        Some(vec!["global"])
+    } else {
+        None
+    }
+}
+
+fn index_entity_types(type_filter: Option<&runbox_core::RunnableType>) -> Option<Vec<EntityType>> {
+    match type_filter {
+        Some(runbox_core::RunnableType::Template) => Some(vec![EntityType::Template]),
+        Some(runbox_core::RunnableType::Playlist) => Some(vec![EntityType::Playlist]),
+        Some(runbox_core::RunnableType::Replay) => Some(vec![EntityType::Run, EntityType::Record]),
+        None => None,
+    }
+}
+
+fn sync_index(storage: &Storage) -> Result<Index> {
+    let layered = layered_storage(storage)?;
+    let db_path = storage.state_dir().join("runbox.db");
+    let index = Index::open(&db_path)
+        .with_context(|| format!("Failed to open index database: {}", db_path.display()))?;
+
+    index.clear_file_index()?;
+
+    index_json_dir(
+        &index,
+        &storage.data_dir().join("templates"),
+        EntityType::Template,
+        "global",
+    )?;
+    index_json_dir(
+        &index,
+        &storage.data_dir().join("playlists"),
+        EntityType::Playlist,
+        "global",
+    )?;
+    index_json_dir(
+        &index,
+        &storage.data_dir().join("records"),
+        EntityType::Record,
+        "global",
+    )?;
+    index_json_dir(
+        &index,
+        &storage.data_dir().join("runs"),
+        EntityType::Run,
+        "global",
+    )?;
+
+    if let Some(local_dir) = layered.local_dir() {
+        index_json_dir(
+            &index,
+            &local_dir.join("templates"),
+            EntityType::Template,
+            "local",
+        )?;
+        index_json_dir(
+            &index,
+            &local_dir.join("playlists"),
+            EntityType::Playlist,
+            "local",
+        )?;
+    }
+
+    Ok(index)
+}
+
+fn index_json_dir(index: &Index, dir: &Path, entity_type: EntityType, scope: &str) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    let mut entries: Vec<_> = std::fs::read_dir(dir)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .map(|extension| extension == "json")
+                .unwrap_or(false)
+        })
+        .collect();
+
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        index.index_file_with_scope(&entry.path(), entity_type, scope)?;
+    }
+
+    Ok(())
+}
+
+fn indexed_entity_scope(entity: &IndexedEntity) -> Scope {
+    if entity.scope == "local" {
+        Scope::Local
+    } else {
+        Scope::Global
+    }
+}
+
+fn indexed_entities_to_runnables(entities: &[IndexedEntity]) -> Result<Vec<(Runnable, Scope)>> {
+    let mut runnables = Vec::new();
+
+    for entity in entities {
+        let scope = indexed_entity_scope(entity);
+        match entity.entity_type {
+            EntityType::Template => {
+                runnables.push((Runnable::Template(entity.id.clone()), scope));
+            }
+            EntityType::Run | EntityType::Record => {
+                runnables.push((Runnable::Replay(entity.id.clone()), scope));
+            }
+            EntityType::Playlist => {
+                let playlist: Playlist = serde_json::from_str(&entity.json_data)
+                    .with_context(|| format!("Failed to parse indexed playlist '{}'", entity.id))?;
+
+                for (index, item) in playlist.items.iter().enumerate() {
+                    runnables.push((
+                        Runnable::PlaylistItem {
+                            playlist_id: playlist.playlist_id.clone(),
+                            index,
+                            template_id: item.template_id.clone(),
+                            label: item.label.clone(),
+                        },
+                        scope,
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(runnables)
+}
+
+fn filter_runnables(
+    layered: &LayeredStorage,
+    runnables: Vec<(Runnable, Scope)>,
+    type_filter: Option<&runbox_core::RunnableType>,
+    playlist_filter: Option<&str>,
+    repo_filter: Option<&str>,
+    limit: usize,
+) -> Vec<(Runnable, Scope)> {
+    runnables
+        .into_iter()
+        .filter(|(r, _)| {
+            if let Some(t) = type_filter {
+                if &r.runnable_type() != t {
+                    return false;
+                }
+            }
+
+            if let Some(pl) = playlist_filter {
+                match r.playlist_id() {
+                    Some(pid) => {
+                        let pl_name = pid.trim_start_matches("pl_");
+                        if !pl_name.starts_with(pl) && !pid.starts_with(pl) {
+                            return false;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+
+            if let Some(repo) = repo_filter {
+                let runnable_repo = layered.get_runnable_repo_url(r);
+                if !repo_matches(&runnable_repo, repo) {
+                    return false;
+                }
+            }
+
+            true
+        })
+        .take(limit)
+        .collect()
+}
+
+fn emit_runnable_output(
+    layered: &LayeredStorage,
+    filtered: &[(Runnable, Scope)],
+    json_output: bool,
+    short_output: bool,
+    verbose: bool,
+) -> Result<()> {
+    if filtered.is_empty() {
+        if json_output {
+            println!("[]");
+        } else if !short_output {
+            println!("No runnables found.");
+        }
+        return Ok(());
+    }
+
+    let infos: Vec<RunnableInfo> = filtered
+        .iter()
+        .map(|(r, _)| {
+            let repo_url = if verbose {
+                layered.get_runnable_repo_url(r)
+            } else {
+                None
+            };
+            RunnableInfo {
+                short_id: r.short_id(),
+                runnable_type: r.type_label().to_string(),
+                source: r.source_label(),
+                name: layered.get_runnable_display_name(r),
+                tags: r.tags_label(),
+                repo_url,
+            }
+        })
+        .collect();
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&infos)?);
+    } else if short_output {
+        for info in &infos {
+            println!("{}", info.short_id);
+        }
+    } else {
+        if verbose {
+            println!(
+                "{:<10} {:<10} {:<16} {:<24} {:<6} {}",
+                "SHORT", "TYPE", "SOURCE", "NAME", "TAGS", "REPO"
+            );
+        } else {
+            println!(
+                "{:<10} {:<10} {:<16} {:<24} {}",
+                "SHORT", "TYPE", "SOURCE", "NAME", "TAGS"
+            );
+        }
+        println!("{}", "─".repeat(if verbose { 90 } else { 70 }));
+
+        for info in &infos {
+            let name_truncated = truncate_string(&info.name, 24);
+
+            if verbose {
+                let repo_display = info.repo_url.as_deref().unwrap_or("-");
+                let repo_truncated = truncate_string(repo_display, 20);
+                println!(
+                    "{:<10} {:<10} {:<16} {:<24} {:<6} {}",
+                    info.short_id,
+                    info.runnable_type,
+                    info.source,
+                    name_truncated,
+                    info.tags,
+                    repo_truncated
+                );
+            } else {
+                println!(
+                    "{:<10} {:<10} {:<16} {:<24} {}",
+                    info.short_id, info.runnable_type, info.source, name_truncated, info.tags
+                );
+            }
+        }
+
+        let mut type_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (r, _) in filtered {
+            *type_counts.entry(r.type_label()).or_insert(0) += 1;
+        }
+
+        let summary_parts: Vec<String> = type_counts
+            .iter()
+            .map(|(t, c)| format!("{} {}s", c, t))
+            .collect();
+
+        println!(
+            "\n{} runnables ({})",
+            filtered.len(),
+            summary_parts.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
 fn cmd_list(
     storage: &Storage,
     type_filter: Option<String>,
@@ -2047,16 +2416,29 @@ fn cmd_list(
         }
     }
 
+    let layered = layered_storage(storage)?;
+
     // Handle --where-clause: use Index query mode
     if let Some(ref where_cond) = where_clause {
-        let db_path = storage.state_dir().join("runbox.db");
-        let index = Index::open(&db_path).with_context(|| {
-            "Failed to open index database. Run 'runbox list' first to build the index."
-        })?;
+        let index = sync_index(storage)?;
+        let entity_types = index_entity_types(type_filter.as_ref());
+        let scope_filter = index_scope_filter(local, global);
+        let results = index.query(
+            entity_types.as_deref(),
+            scope_filter.as_deref(),
+            Some(where_cond),
+            limit.saturating_mul(4).max(limit),
+        )?;
+        let filtered = filter_runnables(
+            &layered,
+            indexed_entities_to_runnables(&results)?,
+            type_filter.as_ref(),
+            playlist_filter.as_deref(),
+            repo_filter.as_deref(),
+            limit,
+        );
 
-        let results = index.query(None, Some(where_cond), limit)?;
-
-        if results.is_empty() {
+        if filtered.is_empty() {
             if json_output {
                 println!("[]");
             } else if !short_output {
@@ -2065,208 +2447,34 @@ fn cmd_list(
             return Ok(());
         }
 
-        // Output indexed entities
-        if json_output {
-            let items: Vec<_> = results
-                .iter()
-                .map(|e| {
-                    serde_json::json!({
-                        "short_id": &e.id[..std::cmp::min(8, e.id.len())],
-                        "type": e.entity_type.to_string(),
-                        "name": e.name,
-                        "exit_code": e.exit_code,
-                        "tags": e.tags,
-                    })
-                })
-                .collect();
-            println!("{}", serde_json::to_string_pretty(&items)?);
-        } else if short_output {
-            for e in &results {
-                println!("{}", &e.id[..std::cmp::min(8, e.id.len())]);
-            }
-        } else {
-            println!(
-                "{:<10} {:<10} {:<24} {:<8} {}",
-                "SHORT", "TYPE", "NAME", "EXIT", "TAGS"
-            );
-            println!("{}", "-".repeat(70));
-            for e in &results {
-                let short = &e.id[..std::cmp::min(8, e.id.len())];
-                let name = e.name.as_deref().unwrap_or("-");
-                let name_trunc = truncate_string(name, 24);
-                let exit = e
-                    .exit_code
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "-".to_string());
-                let tags = if e.tags.is_empty() {
-                    "-".to_string()
-                } else {
-                    e.tags.join(",")
-                };
-                println!(
-                    "{:<10} {:<10} {:<24} {:<8} {}",
-                    short,
-                    e.entity_type,
-                    name_trunc,
-                    exit,
-                    truncate_string(&tags, 20)
-                );
-            }
-        }
-
-        return Ok(());
-    }
-
-    // Handle --local/--global scope filtering (placeholder - not yet implemented)
-    if local || global {
-        eprintln!("Warning: --local and --global filters are not yet fully implemented");
+        return emit_runnable_output(&layered, &filtered, json_output, short_output, verbose);
     }
 
     // Get all runnables
-    let all_runnables = storage.list_all_runnables(limit * 2)?; // Get more to account for filtering
+    let all_runnables = layered.list_all_runnables_with_scope(limit * 2)?; // Get more to account for filtering
 
     // Apply filters
     let filtered: Vec<_> = all_runnables
         .into_iter()
-        .filter(|r| {
-            // Type filter
-            if let Some(ref t) = type_filter {
-                if &r.runnable_type() != t {
-                    return false;
-                }
-            }
-
-            // Playlist filter
-            if let Some(ref pl) = playlist_filter {
-                match r.playlist_id() {
-                    Some(pid) => {
-                        let pl_name = pid.trim_start_matches("pl_");
-                        if !pl_name.starts_with(pl) && !pid.starts_with(pl) {
-                            return false;
-                        }
-                    }
-                    None => return false,
-                }
-            }
-
-            // Repo filter
-            if let Some(ref repo) = repo_filter {
-                let runnable_repo = storage.get_runnable_repo_url(r);
-                if !repo_matches(&runnable_repo, repo) {
-                    return false;
-                }
-            }
-
-            true
-        })
-        .take(limit)
-        .collect();
-
-    if filtered.is_empty() {
-        if json_output {
-            println!("[]");
-        } else if !short_output {
-            println!("No runnables found.");
-        }
-        return Ok(());
-    }
-
-    // Collect info for output
-    let infos: Vec<RunnableInfo> = filtered
-        .iter()
-        .map(|r| {
-            let repo_url = if verbose {
-                storage.get_runnable_repo_url(r)
-            } else {
-                None
-            };
-            RunnableInfo {
-                short_id: r.short_id(),
-                runnable_type: r.type_label().to_string(),
-                source: r.source_label(),
-                name: storage.get_runnable_display_name(r),
-                tags: r.tags_label(),
-                repo_url,
-            }
+        .filter(|(_, scope)| {
+            (!local || *scope == Scope::Local) && (!global || *scope == Scope::Global)
         })
         .collect();
+    let filtered = filter_runnables(
+        &layered,
+        filtered,
+        type_filter.as_ref(),
+        playlist_filter.as_deref(),
+        repo_filter.as_deref(),
+        limit,
+    );
 
-    // Output
-    if json_output {
-        println!("{}", serde_json::to_string_pretty(&infos)?);
-    } else if short_output {
-        for info in &infos {
-            println!("{}", info.short_id);
-        }
-    } else {
-        // Table output
-        if verbose {
-            println!(
-                "{:<10} {:<10} {:<16} {:<24} {:<6} {}",
-                "SHORT", "TYPE", "SOURCE", "NAME", "TAGS", "REPO"
-            );
-        } else {
-            println!(
-                "{:<10} {:<10} {:<16} {:<24} {}",
-                "SHORT", "TYPE", "SOURCE", "NAME", "TAGS"
-            );
-        }
-        println!("{}", "─".repeat(if verbose { 90 } else { 70 }));
-
-        for info in &infos {
-            let name_truncated = truncate_string(&info.name, 24);
-
-            if verbose {
-                let repo_display = info.repo_url.as_deref().unwrap_or("-");
-                let repo_truncated = truncate_string(repo_display, 20);
-                println!(
-                    "{:<10} {:<10} {:<16} {:<24} {:<6} {}",
-                    info.short_id,
-                    info.runnable_type,
-                    info.source,
-                    name_truncated,
-                    info.tags,
-                    repo_truncated
-                );
-            } else {
-                println!(
-                    "{:<10} {:<10} {:<16} {:<24} {}",
-                    info.short_id, info.runnable_type, info.source, name_truncated, info.tags
-                );
-            }
-        }
-
-        // Summary line
-        let mut type_counts: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-        for r in &filtered {
-            *type_counts.entry(r.type_label()).or_insert(0) += 1;
-        }
-
-        let summary_parts: Vec<String> = type_counts
-            .iter()
-            .map(|(t, c)| format!("{} {}s", c, t))
-            .collect();
-
-        println!(
-            "\n{} runnables ({})",
-            filtered.len(),
-            summary_parts.join(", ")
-        );
-    }
-
-    Ok(())
+    emit_runnable_output(&layered, &filtered, json_output, short_output, verbose)
 }
 
 // === Query Command ===
 fn cmd_query(storage: &Storage, sql: &str, json_output: bool) -> Result<()> {
-    use runbox_core::Index;
-
-    // Open the index database
-    let db_path = storage.state_dir().join("runbox.db");
-    let index = Index::open(&db_path).with_context(|| {
-        "Failed to open index database. Run 'runbox list' first to build the index."
-    })?;
+    let index = sync_index(storage)?;
 
     // Execute the query
     let results = index
@@ -2527,7 +2735,8 @@ fn reconcile_runs(storage: &Storage) -> Result<()> {
 }
 // === Template Commands ===
 fn cmd_template_list(storage: &Storage) -> Result<()> {
-    let templates = storage.list_templates()?;
+    let layered = layered_storage(storage)?;
+    let templates = layered.list_templates()?;
     if templates.is_empty() {
         println!("No templates found.");
         return Ok(());
@@ -2540,12 +2749,14 @@ fn cmd_template_list(storage: &Storage) -> Result<()> {
     Ok(())
 }
 fn cmd_template_show(storage: &Storage, template_id: &str) -> Result<()> {
-    let resolved_id = storage.resolve_template_id(template_id)?;
-    let template = storage.load_template(&resolved_id)?;
+    let layered = layered_storage(storage)?;
+    let resolved_id = layered.resolve_template_id(template_id)?;
+    let (template, _) = layered.load_template(&resolved_id)?;
     println!("{}", serde_json::to_string_pretty(&template)?);
     Ok(())
 }
-fn cmd_template_create(storage: &Storage, path: &str) -> Result<()> {
+fn cmd_template_create(storage: &Storage, path: &str, scope: Scope) -> Result<()> {
+    let layered = layered_storage(storage)?;
     let content =
         std::fs::read_to_string(path).with_context(|| format!("Failed to read file: {}", path))?;
     // Validate first
@@ -2553,19 +2764,29 @@ fn cmd_template_create(storage: &Storage, path: &str) -> Result<()> {
     let value: serde_json::Value = serde_json::from_str(&content)?;
     validator.validate_template(&value)?;
     let template: RunTemplate = serde_json::from_str(&content)?;
-    let saved_path = storage.save_template(&template)?;
-    println!("Template created: {}", saved_path.display());
+    let saved_path = layered.save_template(&template, scope)?;
+    println!(
+        "Template created in {} scope: {}",
+        scope_name(scope),
+        saved_path.display()
+    );
     Ok(())
 }
-fn cmd_template_delete(storage: &Storage, template_id: &str) -> Result<()> {
-    let resolved_id = storage.resolve_template_id(template_id)?;
-    storage.delete_template(&resolved_id)?;
-    println!("Template deleted: {}", short_id(&resolved_id));
+fn cmd_template_delete(storage: &Storage, template_id: &str, scope: Scope) -> Result<()> {
+    let layered = layered_storage(storage)?;
+    let resolved_id = layered.resolve_template_id_in_scope(template_id, scope)?;
+    layered.delete_template_in_scope(&resolved_id, scope)?;
+    println!(
+        "Template deleted from {} scope: {}",
+        scope_name(scope),
+        short_id(&resolved_id)
+    );
     Ok(())
 }
 // === Playlist Commands ===
 fn cmd_playlist_list(storage: &Storage) -> Result<()> {
-    let playlists = storage.list_playlists()?;
+    let layered = layered_storage(storage)?;
+    let playlists = layered.list_playlists()?;
     if playlists.is_empty() {
         println!("No playlists found.");
         return Ok(());
@@ -2587,11 +2808,12 @@ fn cmd_playlist_show(
     playlist_id: Option<&str>,
     json_output: bool,
 ) -> Result<()> {
+    let layered = layered_storage(storage)?;
     match playlist_id {
         Some(id) => {
             // Show specific playlist
-            let resolved_id = storage.resolve_playlist_id(id)?;
-            let playlist = storage.load_playlist(&resolved_id)?;
+            let resolved_id = layered.resolve_playlist_id(id)?;
+            let (playlist, _) = layered.load_playlist(&resolved_id)?;
 
             if json_output {
                 // JSON output (original behavior)
@@ -2627,7 +2849,7 @@ fn cmd_playlist_show(
         }
         None => {
             // Show flattened view of all playlists
-            let playlists = storage.list_playlists()?;
+            let playlists = layered.list_playlists()?;
 
             if playlists.is_empty() {
                 println!("No playlists found.");
@@ -2673,7 +2895,8 @@ fn cmd_playlist_show(
     Ok(())
 }
 
-fn cmd_playlist_create(storage: &Storage, path: &str) -> Result<()> {
+fn cmd_playlist_create(storage: &Storage, path: &str, scope: Scope) -> Result<()> {
+    let layered = layered_storage(storage)?;
     let content =
         std::fs::read_to_string(path).with_context(|| format!("Failed to read file: {}", path))?;
     // Validate first
@@ -2681,8 +2904,12 @@ fn cmd_playlist_create(storage: &Storage, path: &str) -> Result<()> {
     let value: serde_json::Value = serde_json::from_str(&content)?;
     validator.validate_playlist(&value)?;
     let playlist: Playlist = serde_json::from_str(&content)?;
-    let saved_path = storage.save_playlist(&playlist)?;
-    println!("Playlist created: {}", saved_path.display());
+    let saved_path = layered.save_playlist(&playlist, scope)?;
+    println!(
+        "Playlist created in {} scope: {}",
+        scope_name(scope),
+        saved_path.display()
+    );
     Ok(())
 }
 fn cmd_playlist_add(
@@ -2690,25 +2917,37 @@ fn cmd_playlist_add(
     playlist_id: &str,
     template_id: &str,
     label: Option<String>,
+    scope: Scope,
 ) -> Result<()> {
-    let resolved_playlist_id = storage.resolve_playlist_id(playlist_id)?;
-    let resolved_template_id = storage.resolve_template_id(template_id)?;
-    let mut playlist = storage.load_playlist(&resolved_playlist_id)?;
+    let layered = layered_storage(storage)?;
+    let resolved_playlist_id = layered.resolve_playlist_id_in_scope(playlist_id, scope)?;
+    let resolved_template_id = match scope {
+        Scope::Local => layered.resolve_template_id(template_id)?,
+        Scope::Global => layered.resolve_template_id_in_scope(template_id, Scope::Global)?,
+    };
+    let mut playlist = layered.load_playlist_in_scope(&resolved_playlist_id, scope)?;
     playlist.items.push(PlaylistItem {
         template_id: resolved_template_id.clone(),
         label,
     });
-    storage.save_playlist(&playlist)?;
+    layered.save_playlist(&playlist, scope)?;
     println!(
-        "Added {} to {}",
+        "Added {} to {} in {} scope",
         short_id(&resolved_template_id),
-        short_id(&resolved_playlist_id)
+        short_id(&resolved_playlist_id),
+        scope_name(scope)
     );
     Ok(())
 }
-fn cmd_playlist_remove(storage: &Storage, playlist_id: &str, selector: &str) -> Result<()> {
-    let resolved_playlist_id = storage.resolve_playlist_id(playlist_id)?;
-    let mut playlist = storage.load_playlist(&resolved_playlist_id)?;
+fn cmd_playlist_remove(
+    storage: &Storage,
+    playlist_id: &str,
+    selector: &str,
+    scope: Scope,
+) -> Result<()> {
+    let layered = layered_storage(storage)?;
+    let resolved_playlist_id = layered.resolve_playlist_id_in_scope(playlist_id, scope)?;
+    let mut playlist = layered.load_playlist_in_scope(&resolved_playlist_id, scope)?;
     if selector.chars().all(|c| c.is_ascii_digit()) {
         let index: usize = selector
             .parse()
@@ -2721,15 +2960,19 @@ fn cmd_playlist_remove(storage: &Storage, playlist_id: &str, selector: &str) -> 
             );
         }
         let removed = playlist.items.remove(index);
-        storage.save_playlist(&playlist)?;
+        layered.save_playlist(&playlist, scope)?;
         println!(
-            "Removed {} from {}",
+            "Removed {} from {} in {} scope",
             short_id(&removed.template_id),
-            short_id(&resolved_playlist_id)
+            short_id(&resolved_playlist_id),
+            scope_name(scope)
         );
         return Ok(());
     }
-    let resolved_template_id = storage.resolve_template_id(selector)?;
+    let resolved_template_id = match scope {
+        Scope::Local => layered.resolve_template_id(selector)?,
+        Scope::Global => layered.resolve_template_id_in_scope(selector, Scope::Global)?,
+    };
     let initial_len = playlist.items.len();
     playlist
         .items
@@ -2740,11 +2983,12 @@ fn cmd_playlist_remove(storage: &Storage, playlist_id: &str, selector: &str) -> 
             short_id(&resolved_template_id)
         );
     }
-    storage.save_playlist(&playlist)?;
+    layered.save_playlist(&playlist, scope)?;
     println!(
-        "Removed {} from {}",
+        "Removed {} from {} in {} scope",
         short_id(&resolved_template_id),
-        short_id(&resolved_playlist_id)
+        short_id(&resolved_playlist_id),
+        scope_name(scope)
     );
     Ok(())
 }
@@ -2757,12 +3001,13 @@ fn cmd_playlist_run(
     runtime: RuntimeType,
     dry_run: bool,
 ) -> Result<()> {
+    let layered = layered_storage(storage)?;
     // Determine if we're using global short ID or playlist + item
     let (playlist, item_idx, item) = match item_selector {
         Some(item_sel) => {
             // Two arguments: selector is playlist_id, item_sel is index/short ID
-            let resolved_playlist_id = storage.resolve_playlist_id(selector)?;
-            let playlist = storage.load_playlist(&resolved_playlist_id)?;
+            let resolved_playlist_id = layered.resolve_playlist_id(selector)?;
+            let (playlist, _) = layered.load_playlist(&resolved_playlist_id)?;
 
             let (idx, found_item) = playlist.resolve_item(item_sel).with_context(|| {
                 format!(
@@ -2778,7 +3023,7 @@ fn cmd_playlist_run(
         None => {
             // One argument: selector is a global short ID
             // Search across all playlists
-            let playlists = storage.list_playlists()?;
+            let playlists = layered.list_playlists()?;
             let selector_lower = selector.to_lowercase();
 
             let mut matches: Vec<(Playlist, usize, PlaylistItem)> = Vec::new();
@@ -2822,7 +3067,7 @@ fn cmd_playlist_run(
     let item_short = item.short_id(&playlist.playlist_id, item_idx);
 
     // Load the template
-    let template = storage.load_template(&item.template_id)?;
+    let (template, _) = layered.load_template(&item.template_id)?;
 
     if dry_run {
         println!("Would run template: {}", item.template_id);
