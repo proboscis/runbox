@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
+use terminal_size::{terminal_size, Width};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 /// Tutorial content embedded at compile time
 const TUTORIAL: &str = include_str!("../../../docs/tutorial.md");
 #[derive(Parser)]
@@ -1934,31 +1937,34 @@ fn cmd_ps(
     } else {
         runs
     };
-    println!(
-        "{:<12} {:<10} {:<10} {:<30}",
-        "SHORT ID", "STATUS", "RUNTIME", "COMMAND"
+
+    let rows: Vec<Vec<String>> = runs
+        .into_iter()
+        .map(|run| {
+            let short_id = run.short_id().to_string();
+            let runtime_display = if run.runtime.is_empty() {
+                "-".to_string()
+            } else {
+                run.runtime
+            };
+            vec![
+                short_id,
+                run.status.to_string(),
+                runtime_display,
+                run.exec.argv.join(" "),
+            ]
+        })
+        .collect();
+
+    print_table(
+        &[
+            TableColumn::left_with_max("SHORT ID", 8, 12),
+            TableColumn::left_with_max("STATUS", 7, 10),
+            TableColumn::left_with_max("RUNTIME", 8, 10),
+            TableColumn::expanded("COMMAND", 12),
+        ],
+        &rows,
     );
-    println!("{}", "-".repeat(70));
-    for run in runs {
-        let cmd = run.exec.argv.join(" ");
-        let cmd_truncated = if cmd.len() > 30 {
-            format!("{}...", &cmd[..27])
-        } else {
-            cmd
-        };
-        let runtime_display = if run.runtime.is_empty() {
-            "-"
-        } else {
-            &run.runtime
-        };
-        println!(
-            "{:<12} {:<10} {:<10} {:<30}",
-            run.short_id(),
-            run.status,
-            runtime_display,
-            cmd_truncated
-        );
-    }
     Ok(())
 }
 
@@ -2049,16 +2055,301 @@ struct RunnableInfo {
     repo_url: Option<String>,
 }
 
-/// Safely truncate a string to max_chars characters, adding "..." if truncated.
-/// This is UTF-8 safe and won't panic on multi-byte characters.
-fn truncate_string(s: &str, max_chars: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count <= max_chars {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_chars.saturating_sub(3)).collect();
-        format!("{}...", truncated)
+#[derive(Clone, Copy)]
+enum TableAlignment {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy)]
+struct TableColumn<'a> {
+    header: &'a str,
+    // Soft target width used for initial layout; columns may shrink below this on narrow terminals.
+    preferred_width: usize,
+    max_width: Option<usize>,
+    expand: bool,
+    alignment: TableAlignment,
+}
+
+impl<'a> TableColumn<'a> {
+    fn left_with_max(header: &'a str, preferred_width: usize, max_width: usize) -> Self {
+        Self {
+            header,
+            preferred_width,
+            max_width: Some(max_width),
+            expand: false,
+            alignment: TableAlignment::Left,
+        }
     }
+
+    fn expanded(header: &'a str, preferred_width: usize) -> Self {
+        Self {
+            header,
+            preferred_width,
+            max_width: None,
+            expand: true,
+            alignment: TableAlignment::Left,
+        }
+    }
+
+    fn right(header: &'a str, preferred_width: usize) -> Self {
+        Self {
+            header,
+            preferred_width,
+            max_width: None,
+            expand: false,
+            alignment: TableAlignment::Right,
+        }
+    }
+}
+
+fn display_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+fn terminal_width() -> usize {
+    const DEFAULT_WIDTH: usize = 100;
+
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|width| *width > 0)
+        .or_else(|| {
+            terminal_size()
+                .map(|(Width(width), _)| width as usize)
+                .filter(|width| *width > 0)
+        })
+        .unwrap_or(DEFAULT_WIDTH)
+}
+
+fn table_separator_width(column_count: usize, terminal_width: usize) -> usize {
+    if column_count > 1 && terminal_width > column_count.saturating_sub(1) {
+        1
+    } else {
+        0
+    }
+}
+
+fn print_table(columns: &[TableColumn<'_>], rows: &[Vec<String>]) {
+    if columns.is_empty() {
+        return;
+    }
+
+    let terminal_width = terminal_width();
+    let separator_width = table_separator_width(columns.len(), terminal_width);
+    let separator = if separator_width == 0 { "" } else { " " };
+    let widths = compute_table_widths(columns, rows, terminal_width, separator_width);
+    println!("{}", format_table_row(columns, &widths, None, separator));
+    println!(
+        "{}",
+        "-".repeat(
+            widths.iter().sum::<usize>() + separator_width * columns.len().saturating_sub(1)
+        )
+    );
+
+    for row in rows {
+        println!(
+            "{}",
+            format_table_row(columns, &widths, Some(row), separator)
+        );
+    }
+}
+
+fn compute_table_widths(
+    columns: &[TableColumn<'_>],
+    rows: &[Vec<String>],
+    terminal_width: usize,
+    separator_width: usize,
+) -> Vec<usize> {
+    let spacing = separator_width * columns.len().saturating_sub(1);
+    let available = terminal_width.saturating_sub(spacing);
+
+    let mut widths: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .map(|(idx, column)| {
+            let mut width = rows
+                .iter()
+                .filter_map(|row| row.get(idx))
+                .map(|cell| display_width(cell))
+                .max()
+                .unwrap_or(0)
+                .max(display_width(column.header))
+                .max(column.preferred_width)
+                .max(1);
+
+            if let Some(max_width) = column.max_width {
+                width = width.min(max_width);
+            }
+
+            width
+        })
+        .collect();
+
+    let total: usize = widths.iter().sum();
+    if total < available {
+        distribute_extra_width(columns, &mut widths, available - total);
+    } else if total > available {
+        shrink_table_widths(columns, &mut widths, total - available);
+    }
+
+    widths
+}
+
+fn distribute_extra_width(columns: &[TableColumn<'_>], widths: &mut [usize], mut extra: usize) {
+    if extra == 0 || widths.is_empty() {
+        return;
+    }
+
+    let mut preferred: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, column)| column.expand.then_some(idx))
+        .collect();
+
+    if preferred.is_empty() {
+        preferred.push(widths.len() - 1);
+    }
+
+    let all_columns: Vec<usize> = (0..widths.len()).collect();
+    let groups = [preferred.as_slice(), all_columns.as_slice()];
+
+    for group in groups {
+        while extra > 0 {
+            let mut changed = false;
+
+            for &idx in group {
+                if let Some(max_width) = columns[idx].max_width {
+                    if widths[idx] >= max_width {
+                        continue;
+                    }
+                }
+
+                widths[idx] += 1;
+                extra -= 1;
+                changed = true;
+
+                if extra == 0 {
+                    return;
+                }
+            }
+
+            if !changed {
+                break;
+            }
+        }
+    }
+}
+
+fn shrink_table_widths(columns: &[TableColumn<'_>], widths: &mut [usize], mut overflow: usize) {
+    if overflow == 0 || widths.is_empty() {
+        return;
+    }
+
+    let mut preferred: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, column)| column.expand.then_some(idx))
+        .collect();
+    preferred.extend(
+        columns
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, column)| (!column.expand).then_some(idx)),
+    );
+
+    for floor in [
+        columns
+            .iter()
+            .map(|column| column.preferred_width.max(1))
+            .collect::<Vec<_>>(),
+        vec![0; columns.len()],
+    ] {
+        while overflow > 0 {
+            let mut changed = false;
+
+            for &idx in &preferred {
+                if widths[idx] > floor[idx] {
+                    widths[idx] -= 1;
+                    overflow -= 1;
+                    changed = true;
+
+                    if overflow == 0 {
+                        return;
+                    }
+                }
+            }
+
+            if !changed {
+                break;
+            }
+        }
+    }
+}
+
+fn format_table_row(
+    columns: &[TableColumn<'_>],
+    widths: &[usize],
+    row: Option<&[String]>,
+    separator: &str,
+) -> String {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(idx, column)| {
+            let value = row
+                .and_then(|row| row.get(idx))
+                .map(|value| value.as_str())
+                .unwrap_or(column.header);
+            format_table_cell(value, widths[idx], column.alignment)
+        })
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+fn format_table_cell(value: &str, width: usize, alignment: TableAlignment) -> String {
+    let truncated = truncate_string(value, width);
+    let padding = width.saturating_sub(display_width(&truncated));
+
+    match alignment {
+        TableAlignment::Left => format!("{}{}", truncated, " ".repeat(padding)),
+        TableAlignment::Right => format!("{}{}", " ".repeat(padding), truncated),
+    }
+}
+
+/// Safely truncate a string to fit within max_width display cells, adding "..." if truncated.
+/// Truncation happens at grapheme-cluster boundaries so combined glyphs stay intact.
+fn truncate_string(s: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let current_width = display_width(s);
+    if current_width <= max_width {
+        return s.to_string();
+    }
+
+    let ellipsis = if max_width <= 3 {
+        return ".".repeat(max_width);
+    } else {
+        "..."
+    };
+    let target_width = max_width - display_width(ellipsis);
+
+    let mut truncated = String::new();
+    let mut used_width = 0;
+
+    for grapheme in UnicodeSegmentation::graphemes(s, true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if used_width + grapheme_width > target_width {
+            break;
+        }
+        truncated.push_str(grapheme);
+        used_width += grapheme_width;
+    }
+
+    truncated.push_str(ellipsis);
+    truncated
 }
 
 fn layered_storage(storage: &Storage) -> Result<LayeredStorage> {
@@ -2305,40 +2596,48 @@ fn emit_runnable_output(
             println!("{}", info.short_id);
         }
     } else {
+        let rows: Vec<Vec<String>> = infos
+            .iter()
+            .map(|info| {
+                let mut row = vec![
+                    info.short_id.clone(),
+                    info.runnable_type.clone(),
+                    info.source.clone(),
+                    info.name.clone(),
+                    info.tags.clone(),
+                ];
+
+                if verbose {
+                    row.push(info.repo_url.clone().unwrap_or_else(|| "-".to_string()));
+                }
+
+                row
+            })
+            .collect();
+
         if verbose {
-            println!(
-                "{:<10} {:<10} {:<16} {:<24} {:<6} {}",
-                "SHORT", "TYPE", "SOURCE", "NAME", "TAGS", "REPO"
+            print_table(
+                &[
+                    TableColumn::left_with_max("SHORT", 8, 10),
+                    TableColumn::left_with_max("TYPE", 8, 10),
+                    TableColumn::left_with_max("SOURCE", 10, 16),
+                    TableColumn::expanded("NAME", 12),
+                    TableColumn::left_with_max("TAGS", 6, 14),
+                    TableColumn::expanded("REPO", 14),
+                ],
+                &rows,
             );
         } else {
-            println!(
-                "{:<10} {:<10} {:<16} {:<24} {}",
-                "SHORT", "TYPE", "SOURCE", "NAME", "TAGS"
+            print_table(
+                &[
+                    TableColumn::left_with_max("SHORT", 8, 10),
+                    TableColumn::left_with_max("TYPE", 8, 10),
+                    TableColumn::left_with_max("SOURCE", 10, 16),
+                    TableColumn::expanded("NAME", 14),
+                    TableColumn::expanded("TAGS", 8),
+                ],
+                &rows,
             );
-        }
-        println!("{}", "─".repeat(if verbose { 90 } else { 70 }));
-
-        for info in &infos {
-            let name_truncated = truncate_string(&info.name, 24);
-
-            if verbose {
-                let repo_display = info.repo_url.as_deref().unwrap_or("-");
-                let repo_truncated = truncate_string(repo_display, 20);
-                println!(
-                    "{:<10} {:<10} {:<16} {:<24} {:<6} {}",
-                    info.short_id,
-                    info.runnable_type,
-                    info.source,
-                    name_truncated,
-                    info.tags,
-                    repo_truncated
-                );
-            } else {
-                println!(
-                    "{:<10} {:<10} {:<16} {:<24} {}",
-                    info.short_id, info.runnable_type, info.source, name_truncated, info.tags
-                );
-            }
         }
 
         let mut type_counts: std::collections::HashMap<&str, usize> =
@@ -2497,30 +2796,30 @@ fn cmd_query(storage: &Storage, sql: &str, json_output: bool) -> Result<()> {
         if let Some(first) = results.first() {
             if let serde_json::Value::Object(obj) = first {
                 let cols: Vec<_> = obj.keys().collect();
+                let columns: Vec<_> = cols
+                    .iter()
+                    .map(|col| TableColumn::expanded(col, 8))
+                    .collect();
+                let rows: Vec<Vec<String>> = results
+                    .iter()
+                    .filter_map(|row| match row {
+                        serde_json::Value::Object(obj) => Some(
+                            cols.iter()
+                                .map(|col| {
+                                    let value = obj.get(*col).unwrap_or(&serde_json::Value::Null);
+                                    match value {
+                                        serde_json::Value::String(text) => text.clone(),
+                                        serde_json::Value::Null => "NULL".to_string(),
+                                        _ => value.to_string(),
+                                    }
+                                })
+                                .collect(),
+                        ),
+                        _ => None,
+                    })
+                    .collect();
 
-                // Print header
-                let header: Vec<_> = cols.iter().map(|c| format!("{:<20}", c)).collect();
-                println!("{}", header.join(" "));
-                println!("{}", "-".repeat(cols.len() * 21));
-
-                // Print rows
-                for row in &results {
-                    if let serde_json::Value::Object(obj) = row {
-                        let values: Vec<_> = cols
-                            .iter()
-                            .map(|c| {
-                                let v = obj.get(*c).unwrap_or(&serde_json::Value::Null);
-                                let s = match v {
-                                    serde_json::Value::String(s) => s.clone(),
-                                    serde_json::Value::Null => "NULL".to_string(),
-                                    _ => v.to_string(),
-                                };
-                                format!("{:<20}", truncate_string(&s, 20))
-                            })
-                            .collect();
-                        println!("{}", values.join(" "));
-                    }
-                }
+                print_table(&columns, &rows);
             }
         }
     }
@@ -2741,11 +3040,19 @@ fn cmd_template_list(storage: &Storage) -> Result<()> {
         println!("No templates found.");
         return Ok(());
     }
-    println!("{:<10} {:<40}", "ID", "NAME");
-    println!("{}", "-".repeat(50));
-    for t in templates {
-        println!("{:<10} {:<40}", short_id(&t.template_id), t.name);
-    }
+
+    let rows: Vec<Vec<String>> = templates
+        .into_iter()
+        .map(|template| vec![short_id(&template.template_id), template.name])
+        .collect();
+
+    print_table(
+        &[
+            TableColumn::left_with_max("ID", 8, 10),
+            TableColumn::expanded("NAME", 12),
+        ],
+        &rows,
+    );
     Ok(())
 }
 fn cmd_template_show(storage: &Storage, template_id: &str) -> Result<()> {
@@ -2791,16 +3098,26 @@ fn cmd_playlist_list(storage: &Storage) -> Result<()> {
         println!("No playlists found.");
         return Ok(());
     }
-    println!("{:<10} {:<30} {:<10}", "ID", "NAME", "ITEMS");
-    println!("{}", "-".repeat(50));
-    for p in playlists {
-        println!(
-            "{:<10} {:<30} {:<10}",
-            short_id(&p.playlist_id),
-            p.name,
-            p.items.len()
-        );
-    }
+
+    let rows: Vec<Vec<String>> = playlists
+        .into_iter()
+        .map(|playlist| {
+            vec![
+                short_id(&playlist.playlist_id),
+                playlist.name,
+                playlist.items.len().to_string(),
+            ]
+        })
+        .collect();
+
+    print_table(
+        &[
+            TableColumn::left_with_max("ID", 8, 10),
+            TableColumn::expanded("NAME", 12),
+            TableColumn::right("ITEMS", 5),
+        ],
+        &rows,
+    );
     Ok(())
 }
 fn cmd_playlist_show(
@@ -2822,21 +3139,29 @@ fn cmd_playlist_show(
                 // Table view with short IDs
                 println!("Playlist: {} ({})", playlist.playlist_id, playlist.name);
                 println!();
-                println!(
-                    "{:<5} {:<10} {:<15} {}",
-                    "IDX", "SHORT", "TEMPLATE", "LABEL"
-                );
-                println!("{}", "-".repeat(60));
+                let rows: Vec<Vec<String>> = playlist
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, item)| {
+                        vec![
+                            idx.to_string(),
+                            item.short_id(&playlist.playlist_id, idx),
+                            short_id(&item.template_id),
+                            item.label.as_deref().unwrap_or("-").to_string(),
+                        ]
+                    })
+                    .collect();
 
-                for (idx, item) in playlist.items.iter().enumerate() {
-                    let item_short = item.short_id(&playlist.playlist_id, idx);
-                    let label = item.label.as_deref().unwrap_or("-");
-                    let template_short = short_id(&item.template_id);
-                    println!(
-                        "{:<5} {:<10} {:<15} {}",
-                        idx, item_short, template_short, label
-                    );
-                }
+                print_table(
+                    &[
+                        TableColumn::right("IDX", 3),
+                        TableColumn::left_with_max("SHORT", 8, 10),
+                        TableColumn::left_with_max("TEMPLATE", 8, 15),
+                        TableColumn::expanded("LABEL", 12),
+                    ],
+                    &rows,
+                );
 
                 if !playlist.items.is_empty() {
                     println!();
@@ -2861,26 +3186,32 @@ fn cmd_playlist_show(
                 println!("{}", serde_json::to_string_pretty(&playlists)?);
             } else {
                 // Flattened table view
-                println!(
-                    "{:<10} {:<5} {:<10} {:<15} {}",
-                    "PLAYLIST", "IDX", "SHORT", "TEMPLATE", "LABEL"
-                );
-                println!("{}", "-".repeat(70));
-
                 let mut has_items = false;
+                let mut rows = Vec::new();
                 for playlist in &playlists {
                     let playlist_short = short_id(&playlist.playlist_id);
                     for (idx, item) in playlist.items.iter().enumerate() {
                         has_items = true;
-                        let item_short = item.short_id(&playlist.playlist_id, idx);
-                        let label = item.label.as_deref().unwrap_or("-");
-                        let template_short = short_id(&item.template_id);
-                        println!(
-                            "{:<10} {:<5} {:<10} {:<15} {}",
-                            playlist_short, idx, item_short, template_short, label
-                        );
+                        rows.push(vec![
+                            playlist_short.clone(),
+                            idx.to_string(),
+                            item.short_id(&playlist.playlist_id, idx),
+                            short_id(&item.template_id),
+                            item.label.as_deref().unwrap_or("-").to_string(),
+                        ]);
                     }
                 }
+
+                print_table(
+                    &[
+                        TableColumn::left_with_max("PLAYLIST", 8, 10),
+                        TableColumn::right("IDX", 3),
+                        TableColumn::left_with_max("SHORT", 8, 10),
+                        TableColumn::left_with_max("TEMPLATE", 8, 15),
+                        TableColumn::expanded("LABEL", 12),
+                    ],
+                    &rows,
+                );
 
                 if has_items {
                     println!();
@@ -3102,17 +3433,19 @@ fn cmd_history(storage: &Storage, limit: usize) -> Result<()> {
         println!("No runs found.");
         return Ok(());
     }
-    println!("{:<10} {:<50}", "ID", "COMMAND");
-    println!("{}", "-".repeat(60));
-    for run in runs {
-        let cmd = run.exec.argv.join(" ");
-        let cmd_truncated = if cmd.len() > 50 {
-            format!("{}...", &cmd[..47])
-        } else {
-            cmd
-        };
-        println!("{:<10} {:<50}", short_id(&run.run_id), cmd_truncated);
-    }
+
+    let rows: Vec<Vec<String>> = runs
+        .into_iter()
+        .map(|run| vec![short_id(&run.run_id), run.exec.argv.join(" ")])
+        .collect();
+
+    print_table(
+        &[
+            TableColumn::left_with_max("ID", 8, 10),
+            TableColumn::expanded("COMMAND", 12),
+        ],
+        &rows,
+    );
     Ok(())
 }
 fn cmd_show(storage: &Storage, run_id: &str) -> Result<()> {
@@ -3170,22 +3503,30 @@ fn cmd_result_list(storage: &Storage, limit: usize) -> Result<()> {
         println!("No results found.");
         return Ok(());
     }
-    println!(
-        "{:<12} {:<12} {:<10} {:<12} {:<8}",
-        "RESULT ID", "RUN ID", "EXIT", "DURATION", "ARTIFACTS"
+
+    let rows: Vec<Vec<String>> = results
+        .into_iter()
+        .map(|result| {
+            vec![
+                result.short_id().to_string(),
+                short_id(&result.run_id),
+                result.execution.exit_code.to_string(),
+                format!("{}ms", result.execution.duration_ms),
+                result.artifacts.len().to_string(),
+            ]
+        })
+        .collect();
+
+    print_table(
+        &[
+            TableColumn::left_with_max("RESULT ID", 8, 12),
+            TableColumn::left_with_max("RUN ID", 8, 12),
+            TableColumn::right("EXIT", 4),
+            TableColumn::right("DURATION", 8),
+            TableColumn::right("ARTIFACTS", 9),
+        ],
+        &rows,
     );
-    println!("{}", "-".repeat(60));
-    for result in results {
-        let duration = format!("{}ms", result.execution.duration_ms);
-        println!(
-            "{:<12} {:<12} {:<10} {:<12} {:<8}",
-            result.short_id(),
-            short_id(&result.run_id),
-            result.execution.exit_code,
-            duration,
-            result.artifacts.len()
-        );
-    }
     Ok(())
 }
 fn cmd_result_show(storage: &Storage, result_id: &str) -> Result<()> {
@@ -3229,21 +3570,32 @@ fn cmd_result_for_run(storage: &Storage, run_id: &str) -> Result<()> {
     }
     println!("Results for run: {}", short_id(&resolved_run_id));
     println!();
-    println!(
-        "{:<12} {:<10} {:<12} {:<20}",
-        "RESULT ID", "EXIT", "DURATION", "FINISHED"
+
+    let rows: Vec<Vec<String>> = results
+        .into_iter()
+        .map(|result| {
+            vec![
+                result.short_id().to_string(),
+                result.execution.exit_code.to_string(),
+                format!("{}ms", result.execution.duration_ms),
+                result
+                    .execution
+                    .finished_at
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string(),
+            ]
+        })
+        .collect();
+
+    print_table(
+        &[
+            TableColumn::left_with_max("RESULT ID", 8, 12),
+            TableColumn::right("EXIT", 4),
+            TableColumn::right("DURATION", 8),
+            TableColumn::expanded("FINISHED", 19),
+        ],
+        &rows,
     );
-    println!("{}", "-".repeat(60));
-    for result in results {
-        let duration = format!("{}ms", result.execution.duration_ms);
-        println!(
-            "{:<12} {:<10} {:<12} {:<20}",
-            result.short_id(),
-            result.execution.exit_code,
-            duration,
-            result.execution.finished_at.format("%Y-%m-%d %H:%M:%S")
-        );
-    }
     Ok(())
 }
 fn cmd_result_stdout(storage: &Storage, result_id: &str) -> Result<()> {
@@ -3601,18 +3953,25 @@ fn cmd_skill_list() -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<25} {:<15} {}", "NAME", "PLATFORM", "PATH");
-    println!("{}", "─".repeat(80));
+    let rows: Vec<Vec<String>> = skills
+        .iter()
+        .map(|(platform, path, name)| {
+            vec![
+                name.clone(),
+                platform.name().to_string(),
+                path.to_string_lossy().to_string(),
+            ]
+        })
+        .collect();
 
-    for (platform, path, name) in &skills {
-        let path_str = path.to_string_lossy();
-        let short_path = if path_str.len() > 40 {
-            format!("...{}", &path_str[path_str.len() - 37..])
-        } else {
-            path_str.to_string()
-        };
-        println!("{:<25} {:<15} {}", name, platform.name(), short_path);
-    }
+    print_table(
+        &[
+            TableColumn::left_with_max("NAME", 10, 25),
+            TableColumn::left_with_max("PLATFORM", 8, 15),
+            TableColumn::expanded("PATH", 16),
+        ],
+        &rows,
+    );
 
     println!();
     println!("{} skill(s) found", skills.len());
@@ -3708,4 +4067,48 @@ fn cmd_skill_export(skill_name: &str, output: Option<PathBuf>) -> Result<()> {
     println!("  cd {} && ./install.sh", output_dir.display());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_string_respects_full_width_display_cells() {
+        let truncated = truncate_string("日本語の幅を確認する", 11);
+        assert_eq!(display_width(&truncated), 11);
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_string_preserves_grapheme_clusters() {
+        let truncated = truncate_string("👩‍💻👩‍💻abc", 6);
+        assert_eq!(truncated, "👩‍💻...");
+        assert!(display_width(&truncated) <= 6);
+    }
+
+    #[test]
+    fn compute_table_widths_can_shrink_below_preferred_widths() {
+        let columns = [
+            TableColumn::left_with_max("SHORT ID", 8, 12),
+            TableColumn::left_with_max("STATUS", 7, 10),
+            TableColumn::left_with_max("RUNTIME", 8, 10),
+            TableColumn::expanded("COMMAND", 12),
+        ];
+        let rows = vec![vec![
+            "deadbeef".to_string(),
+            "exited".to_string(),
+            "background".to_string(),
+            "python -m very.long.module".to_string(),
+        ]];
+
+        let widths = compute_table_widths(&columns, &rows, 12, 1);
+        assert_eq!(widths.iter().sum::<usize>() + columns.len() - 1, 12);
+    }
+
+    #[test]
+    fn table_separator_width_drops_spacing_when_terminal_is_too_narrow() {
+        assert_eq!(table_separator_width(4, 2), 0);
+        assert_eq!(table_separator_width(4, 4), 1);
+    }
 }

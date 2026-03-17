@@ -5,11 +5,11 @@ all: build
 
 # Build release binaries
 build:
-	cargo build --release -p runbox-cli -p runbox-daemon
+	cargo build --locked --release -p runbox-cli -p runbox-daemon
 
 # Build only CLI (faster, skips daemon)
 build-cli:
-	cargo build --release -p runbox-cli
+	cargo build --locked --release -p runbox-cli
 
 # Install to ~/.cargo/bin
 install: build
@@ -24,11 +24,11 @@ install-cli: build-cli
 
 # Run all tests
 test:
-	cargo test --workspace
+	cargo test --locked --workspace
 
 # Run tests with output
 test-verbose:
-	cargo test --workspace -- --nocapture
+	cargo test --locked --workspace -- --nocapture
 
 # Format code
 fmt:
@@ -40,11 +40,11 @@ fmt-check:
 
 # Run clippy
 lint:
-	cargo clippy --workspace -- -D warnings
+	cargo clippy --locked --workspace -- -D warnings
 
 # Check (compile without codegen)
 check:
-	cargo check --workspace
+	cargo check --locked --workspace
 
 # Clean build artifacts
 clean:

@@ -330,12 +330,123 @@ fn test_ps_command_truncation() {
     Command::cargo_bin("runbox")
         .unwrap()
         .env("RUNBOX_HOME", temp.path())
+        .env("COLUMNS", "48")
         .args(["ps"])
         .assert()
         .success()
         // Command should be truncated with "..."
         .stdout(predicate::str::contains("..."))
         .stdout(predicate::str::contains("abcd0000"));
+}
+
+#[test]
+fn test_ps_uses_available_terminal_width() {
+    let temp = TempDir::new().unwrap();
+
+    create_run_file(
+        &temp,
+        "run_face0000-e29b-41d4-a716-446655440000",
+        "exited",
+        &[
+            "python",
+            "-m",
+            "module.with.a.command.long.enough.to.need.the.extra.width",
+        ],
+        "background",
+    );
+
+    let output = Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .env("COLUMNS", "72")
+        .args(["ps"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines[0].chars().count(),
+        72,
+        "header should fill terminal width"
+    );
+    assert_eq!(
+        lines[1].chars().count(),
+        72,
+        "separator should fill terminal width"
+    );
+    assert_eq!(
+        lines[2].chars().count(),
+        72,
+        "row should fill terminal width"
+    );
+}
+
+#[test]
+fn test_ps_respects_very_narrow_terminal_width() {
+    let temp = TempDir::new().unwrap();
+
+    create_run_file(
+        &temp,
+        "run_ab120000-e29b-41d4-a716-446655440000",
+        "exited",
+        &["python", "-m", "very.long.module.name"],
+        "background",
+    );
+
+    let output = Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .env("COLUMNS", "12")
+        .args(["ps"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines[0].chars().count(),
+        12,
+        "header should shrink to the narrow terminal width"
+    );
+    assert_eq!(
+        lines[1].chars().count(),
+        12,
+        "separator should shrink to the narrow terminal width"
+    );
+    assert_eq!(
+        lines[2].chars().count(),
+        12,
+        "row should shrink to the narrow terminal width"
+    );
+}
+
+#[test]
+fn test_ps_respects_tiny_terminal_width() {
+    let temp = TempDir::new().unwrap();
+
+    create_run_file(
+        &temp,
+        "run_cd340000-e29b-41d4-a716-446655440000",
+        "exited",
+        &["echo", "hello"],
+        "background",
+    );
+
+    let output = Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .env("COLUMNS", "2")
+        .args(["ps"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        lines.iter().all(|line| line.chars().count() <= 2),
+        "all lines should fit within the tiny terminal width: {stdout}"
+    );
 }
 
 #[test]

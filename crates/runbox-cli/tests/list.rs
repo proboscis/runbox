@@ -3,11 +3,25 @@
 use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
+use unicode_width::UnicodeWidthStr;
 
 fn runbox(args: &[&str], home: &std::path::Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_runbox"))
         .args(args)
         .env("RUNBOX_HOME", home)
+        .output()
+        .expect("failed to execute runbox")
+}
+
+fn runbox_with_columns(
+    args: &[&str],
+    home: &std::path::Path,
+    columns: &str,
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_runbox"))
+        .args(args)
+        .env("RUNBOX_HOME", home)
+        .env("COLUMNS", columns)
         .output()
         .expect("failed to execute runbox")
 }
@@ -295,6 +309,78 @@ fn test_list_verbose_shows_repo() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("REPO"));
     assert!(stdout.contains("test/repo.git") || stdout.contains("..."));
+}
+
+#[test]
+fn test_list_table_fills_terminal_width() {
+    let home = setup_home();
+    create_template(
+        home.path(),
+        "tpl_echo",
+        "Template name long enough to verify the expanded column uses extra width",
+    );
+
+    let output = runbox_with_columns(
+        &["list", "--type", "template", "--all-repos"],
+        home.path(),
+        "96",
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    assert_eq!(
+        lines[0].chars().count(),
+        96,
+        "header should fill terminal width"
+    );
+    assert_eq!(
+        lines[1].chars().count(),
+        96,
+        "separator should fill terminal width"
+    );
+    assert_eq!(
+        lines[2].chars().count(),
+        96,
+        "row should fill terminal width"
+    );
+}
+
+#[test]
+fn test_list_table_respects_full_width_cells() {
+    let home = setup_home();
+    create_template(
+        home.path(),
+        "tpl_wide",
+        "日本語のテンプレート名が幅計算を壊さないことを確認する",
+    );
+
+    let output = runbox_with_columns(
+        &["list", "--type", "template", "--all-repos"],
+        home.path(),
+        "48",
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    assert_eq!(
+        UnicodeWidthStr::width(lines[0]),
+        48,
+        "header should respect terminal display width"
+    );
+    assert_eq!(
+        UnicodeWidthStr::width(lines[1]),
+        48,
+        "separator should respect terminal display width"
+    );
+    assert_eq!(
+        UnicodeWidthStr::width(lines[2]),
+        48,
+        "row should respect terminal display width"
+    );
 }
 
 #[test]
