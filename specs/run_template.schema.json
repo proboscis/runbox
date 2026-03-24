@@ -58,6 +58,12 @@
         "name": {
             "type": "string"
         },
+        "tags": {
+            "type": "array",
+            "items": {
+                "type": "string"
+            }
+        },
         "template_id": {
             "type": "string",
             "pattern": "^tpl_"

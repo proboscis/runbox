@@ -10,6 +10,8 @@ pub struct RunTemplate {
     pub exec: TemplateExec,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bindings: Option<Bindings>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     pub code_state: TemplateCodeState,
 }
 
@@ -118,6 +120,7 @@ mod tests {
                 timeout_sec: 0,
             },
             bindings: None,
+            tags: Vec::new(),
             code_state: TemplateCodeState {
                 repo_url: "git@github.com:org/repo.git".to_string(),
             },
@@ -125,5 +128,60 @@ mod tests {
 
         let vars = template.extract_variables();
         assert_eq!(vars, vec!["i", "output_dir", "seed"]);
+    }
+
+    #[test]
+    fn test_tags_default_to_empty_and_serialize_omit_empty() {
+        let json = serde_json::json!({
+            "template_version": 0,
+            "template_id": "tpl_test",
+            "name": "Test",
+            "exec": {
+                "argv": ["echo"],
+                "cwd": "."
+            },
+            "code_state": {
+                "repo_url": "git@github.com:org/repo.git"
+            }
+        });
+
+        let template: RunTemplate = serde_json::from_value(json).unwrap();
+        assert!(template.tags.is_empty());
+
+        let serialized = serde_json::to_value(&template).unwrap();
+        assert!(serialized.get("tags").is_none());
+    }
+
+    #[test]
+    fn test_tags_round_trip() {
+        let template = RunTemplate {
+            template_version: 0,
+            template_id: "tpl_test".to_string(),
+            name: "Test".to_string(),
+            exec: TemplateExec {
+                argv: vec!["echo".to_string()],
+                cwd: ".".to_string(),
+                env: HashMap::new(),
+                timeout_sec: 0,
+            },
+            bindings: None,
+            tags: vec![
+                "311".to_string(),
+                "sekihan".to_string(),
+                "style".to_string(),
+            ],
+            code_state: TemplateCodeState {
+                repo_url: "git@github.com:org/repo.git".to_string(),
+            },
+        };
+
+        let serialized = serde_json::to_value(&template).unwrap();
+        assert_eq!(
+            serialized["tags"],
+            serde_json::json!(["311", "sekihan", "style"])
+        );
+
+        let parsed: RunTemplate = serde_json::from_value(serialized).unwrap();
+        assert_eq!(parsed.tags, vec!["311", "sekihan", "style"]);
     }
 }

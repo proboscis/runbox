@@ -804,6 +804,20 @@ impl Storage {
             |id| self.load_record(id),
         )
     }
+
+    /// Get tags for a runnable.
+    ///
+    /// - For Template: returns the template tags
+    /// - For Replay: returns record tags when replaying a record, otherwise []
+    /// - For PlaylistItem: returns the referenced template tags
+    pub fn get_runnable_tags(&self, runnable: &crate::Runnable) -> Vec<String> {
+        runnable_tags_with(
+            runnable,
+            |id| self.load_template(id),
+            |id| self.load_run(id),
+            |id| self.load_record(id),
+        )
+    }
 }
 
 pub(crate) fn runnables_from_items(
@@ -997,6 +1011,31 @@ where
                     .unwrap_or_else(|_| template_id.clone())
             }
         }
+    }
+}
+
+pub(crate) fn runnable_tags_with<LoadTemplate, LoadRun, LoadRecord>(
+    runnable: &crate::Runnable,
+    load_template: LoadTemplate,
+    load_run: LoadRun,
+    load_record: LoadRecord,
+) -> Vec<String>
+where
+    LoadTemplate: Fn(&str) -> Result<RunTemplate>,
+    LoadRun: Fn(&str) -> Result<Run>,
+    LoadRecord: Fn(&str) -> Result<crate::Record>,
+{
+    match runnable {
+        crate::Runnable::Template(id) => load_template(id)
+            .map(|template| template.tags)
+            .unwrap_or_default(),
+        crate::Runnable::Replay(id) => load_run(id)
+            .map(|_| Vec::new())
+            .or_else(|_| load_record(id).map(|record| record.tags))
+            .unwrap_or_default(),
+        crate::Runnable::PlaylistItem { template_id, .. } => load_template(template_id)
+            .map(|template| template.tags)
+            .unwrap_or_default(),
     }
 }
 
@@ -1443,6 +1482,7 @@ mod tests {
                 timeout_sec: 0,
             },
             bindings: None,
+            tags: Vec::new(),
             code_state: crate::TemplateCodeState {
                 repo_url: "git@github.com:org/repo.git".to_string(),
             },
@@ -1539,6 +1579,7 @@ mod tests {
                 timeout_sec: 0,
             },
             bindings: None,
+            tags: Vec::new(),
             code_state: crate::TemplateCodeState {
                 repo_url: "git@github.com:org/repo.git".to_string(),
             },
@@ -1628,6 +1669,7 @@ mod tests {
                 timeout_sec: 0,
             },
             bindings: None,
+            tags: Vec::new(),
             code_state: crate::TemplateCodeState {
                 repo_url: "git@github.com:org/repo.git".to_string(),
             },
@@ -1725,6 +1767,7 @@ mod tests {
                 timeout_sec: 0,
             },
             bindings: None,
+            tags: Vec::new(),
             code_state: crate::TemplateCodeState {
                 repo_url: "git@github.com:org/repo.git".to_string(),
             },
@@ -1740,6 +1783,7 @@ mod tests {
                 timeout_sec: 0,
             },
             bindings: None,
+            tags: Vec::new(),
             code_state: crate::TemplateCodeState {
                 repo_url: "git@github.com:org/repo.git".to_string(),
             },

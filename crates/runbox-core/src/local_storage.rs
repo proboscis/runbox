@@ -572,6 +572,16 @@ impl LayeredStorage {
             |id| self.global_storage.load_record(id),
         )
     }
+
+    /// Get tags for a runnable using local overrides when applicable.
+    pub fn get_runnable_tags(&self, runnable: &crate::Runnable) -> Vec<String> {
+        crate::storage::runnable_tags_with(
+            runnable,
+            |id| self.load_template(id).map(|(template, _)| template),
+            |id| self.global_storage.load_run(id),
+            |id| self.global_storage.load_record(id),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -635,6 +645,7 @@ mod tests {
                 timeout_sec: 0,
             },
             bindings: None,
+            tags: Vec::new(),
             code_state: crate::TemplateCodeState {
                 repo_url: "git@github.com:org/repo.git".to_string(),
             },
@@ -656,6 +667,7 @@ mod tests {
                 timeout_sec: 0,
             },
             bindings: None,
+            tags: Vec::new(),
             code_state: crate::TemplateCodeState {
                 repo_url: "git@github.com:org/repo.git".to_string(),
             },
@@ -702,6 +714,7 @@ mod tests {
                 timeout_sec: 0,
             },
             bindings: None,
+            tags: Vec::new(),
             code_state: crate::TemplateCodeState {
                 repo_url: "git@github.com:org/repo.git".to_string(),
             },
@@ -734,6 +747,7 @@ mod tests {
                 timeout_sec: 0,
             },
             bindings: None,
+            tags: Vec::new(),
             code_state: crate::TemplateCodeState {
                 repo_url: "git@github.com:org/repo.git".to_string(),
             },

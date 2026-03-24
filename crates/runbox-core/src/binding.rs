@@ -174,6 +174,7 @@ mod tests {
                 defaults: HashMap::from([("msg".to_string(), serde_json::json!("hello"))]),
                 interactive: vec![],
             }),
+            tags: Vec::new(),
             code_state: TemplateCodeState {
                 repo_url: "git@github.com:org/repo.git".to_string(),
             },
@@ -201,6 +202,7 @@ mod tests {
                 defaults: HashMap::from([("msg".to_string(), serde_json::json!("hello"))]),
                 interactive: vec![],
             }),
+            tags: Vec::new(),
             code_state: TemplateCodeState {
                 repo_url: "git@github.com:org/repo.git".to_string(),
             },
