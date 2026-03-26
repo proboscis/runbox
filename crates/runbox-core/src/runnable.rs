@@ -196,12 +196,6 @@ impl Runnable {
         }
     }
 
-    /// Returns the tags label for display (placeholder for future tags feature).
-    pub fn tags_label(&self) -> String {
-        // Tags are not yet implemented, return "-"
-        "-".to_string()
-    }
-
     /// Returns the underlying ID for resolution.
     ///
     /// - For Template: the template_id

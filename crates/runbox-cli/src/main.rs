@@ -243,6 +243,10 @@ EXAMPLES:
   runbox list --repo proboscis/runbox
   runbox list --repo .          # current repo (auto-detect)
 
+  # Filter by tag
+  runbox list --tag 311
+  runbox list --tag 311 --tag style
+
   # Show all repos (disable auto-filter)
   runbox list --all-repos
 
@@ -257,7 +261,9 @@ EXAMPLES:
 
   # Combined filters
   runbox list --type template --repo runbox
+  runbox list --type template --tag 311 --tag style
   runbox list --repo . --type replay --limit 5
+  runbox list --where-clause \"(',' || tags || ',') LIKE '%,311,%'\"
 
 OUTPUT:
   SHORT     TYPE        SOURCE          NAME                    TAGS
@@ -287,7 +293,7 @@ RELATED COMMANDS:
         /// Show runnables from ALL repos (disable auto-filter)
         #[arg(long)]
         all_repos: bool,
-        /// Filter by tag (can be repeated) - placeholder for future
+        /// Filter by tag (can be repeated; matches all requested tags)
         #[arg(long, value_name = "TAG")]
         tag: Vec<String>,
         /// Max items to show (default: 50)
@@ -2050,9 +2056,17 @@ struct RunnableInfo {
     runnable_type: String,
     source: String,
     name: String,
-    tags: String,
+    tags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     repo_url: Option<String>,
+}
+
+fn format_tags(tags: &[String]) -> String {
+    if tags.is_empty() {
+        "-".to_string()
+    } else {
+        tags.join(",")
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2518,6 +2532,7 @@ fn filter_runnables(
     type_filter: Option<&runbox_core::RunnableType>,
     playlist_filter: Option<&str>,
     repo_filter: Option<&str>,
+    tag_filter: &[String],
     limit: usize,
 ) -> Vec<(Runnable, Scope)> {
     runnables
@@ -2544,6 +2559,16 @@ fn filter_runnables(
             if let Some(repo) = repo_filter {
                 let runnable_repo = layered.get_runnable_repo_url(r);
                 if !repo_matches(&runnable_repo, repo) {
+                    return false;
+                }
+            }
+
+            if !tag_filter.is_empty() {
+                let runnable_tags = layered.get_runnable_tags(r);
+                if !tag_filter
+                    .iter()
+                    .all(|tag| runnable_tags.iter().any(|runnable_tag| runnable_tag == tag))
+                {
                     return false;
                 }
             }
@@ -2578,12 +2603,13 @@ fn emit_runnable_output(
             } else {
                 None
             };
+            let tags = layered.get_runnable_tags(r);
             RunnableInfo {
                 short_id: r.short_id(),
                 runnable_type: r.type_label().to_string(),
                 source: r.source_label(),
                 name: layered.get_runnable_display_name(r),
-                tags: r.tags_label(),
+                tags,
                 repo_url,
             }
         })
@@ -2604,7 +2630,7 @@ fn emit_runnable_output(
                     info.runnable_type.clone(),
                     info.source.clone(),
                     info.name.clone(),
-                    info.tags.clone(),
+                    format_tags(&info.tags),
                 ];
 
                 if verbose {
@@ -2667,7 +2693,7 @@ fn cmd_list(
     playlist_filter: Option<String>,
     repo_arg: Option<String>,
     all_repos: bool,
-    _tag_filter: Vec<String>,
+    tag_filter: Vec<String>,
     limit: usize,
     json_output: bool,
     short_output: bool,
@@ -2734,6 +2760,7 @@ fn cmd_list(
             type_filter.as_ref(),
             playlist_filter.as_deref(),
             repo_filter.as_deref(),
+            &tag_filter,
             limit,
         );
 
@@ -2765,6 +2792,7 @@ fn cmd_list(
         type_filter.as_ref(),
         playlist_filter.as_deref(),
         repo_filter.as_deref(),
+        &tag_filter,
         limit,
     );
 

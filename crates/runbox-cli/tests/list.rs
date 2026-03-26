@@ -35,7 +35,11 @@ fn setup_home() -> tempfile::TempDir {
 }
 
 fn create_template(home: &std::path::Path, id: &str, name: &str) {
-    let template = serde_json::json!({
+    create_template_with_tags(home, id, name, &[]);
+}
+
+fn create_template_with_tags(home: &std::path::Path, id: &str, name: &str, tags: &[&str]) {
+    let mut template = serde_json::json!({
         "template_version": 0,
         "template_id": id,
         "name": name,
@@ -49,6 +53,12 @@ fn create_template(home: &std::path::Path, id: &str, name: &str) {
             "repo_url": "git@github.com:test/repo.git"
         }
     });
+    if !tags.is_empty() {
+        template
+            .as_object_mut()
+            .unwrap()
+            .insert("tags".to_string(), serde_json::json!(tags));
+    }
     let path = home.join("templates").join(format!("{}.json", id));
     fs::write(&path, serde_json::to_string_pretty(&template).unwrap()).unwrap();
 }
@@ -228,6 +238,119 @@ fn test_list_json_output() {
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["type"], "template");
     assert_eq!(arr[0]["name"], "Echo Command");
+    assert_eq!(arr[0]["tags"], serde_json::json!([]));
+}
+
+#[test]
+fn test_list_template_tags_show_in_table() {
+    let home = setup_home();
+    create_template_with_tags(
+        home.path(),
+        "tpl_echo",
+        "Echo Command",
+        &["311", "sekihan", "style"],
+    );
+
+    let output = runbox_with_columns(
+        &["list", "--type", "template", "--all-repos"],
+        home.path(),
+        "160",
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("311,sekihan,style"));
+}
+
+#[test]
+fn test_list_json_output_includes_template_tags_array() {
+    let home = setup_home();
+    create_template_with_tags(home.path(), "tpl_echo", "Echo Command", &["311", "style"]);
+
+    let output = runbox(&["list", "--json", "--all-repos"], home.path());
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
+    let arr = json.as_array().unwrap();
+    assert_eq!(arr[0]["tags"], serde_json::json!(["311", "style"]));
+}
+
+#[test]
+fn test_list_playlist_items_show_template_tags() {
+    let home = setup_home();
+    create_template_with_tags(home.path(), "tpl_echo", "Echo Command", &["311", "style"]);
+    create_playlist(
+        home.path(),
+        "pl_daily",
+        "Daily Tasks",
+        &[("tpl_echo", Some("Morning Echo"))],
+    );
+
+    let output = runbox_with_columns(
+        &["list", "--type", "playlist", "--all-repos"],
+        home.path(),
+        "160",
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Morning Echo"));
+    assert!(stdout.contains("311,style"));
+}
+
+#[test]
+fn test_list_tag_filter_requires_all_requested_tags() {
+    let home = setup_home();
+    create_template_with_tags(home.path(), "tpl_match", "Tagged Match", &["311", "style"]);
+    create_template_with_tags(home.path(), "tpl_partial", "Tagged Partial", &["311"]);
+    create_template_with_tags(home.path(), "tpl_other", "Tagged Other", &["style"]);
+
+    let output = runbox(
+        &[
+            "list",
+            "--type",
+            "template",
+            "--tag",
+            "311",
+            "--tag",
+            "style",
+            "--all-repos",
+        ],
+        home.path(),
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Tagged Match"));
+    assert!(!stdout.contains("Tagged Partial"));
+    assert!(!stdout.contains("Tagged Other"));
+    assert!(stdout.contains("1 runnables"));
+}
+
+#[test]
+fn test_list_where_clause_can_filter_template_tags() {
+    let home = setup_home();
+    create_template_with_tags(home.path(), "tpl_match", "Tagged Match", &["311", "style"]);
+    create_template_with_tags(home.path(), "tpl_other", "Tagged Other", &["sekihan"]);
+
+    let output = runbox(
+        &[
+            "list",
+            "--type",
+            "template",
+            "--where-clause",
+            "(',' || tags || ',') LIKE '%,311,%'",
+            "--all-repos",
+        ],
+        home.path(),
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Tagged Match"));
+    assert!(!stdout.contains("Tagged Other"));
+    assert!(stdout.contains("1 runnables"));
 }
 
 #[test]

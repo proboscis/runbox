@@ -619,6 +619,7 @@ mod tests {
             "template_version": 0,
             "template_id": "tpl_test",
             "name": "Test Template",
+            "tags": ["311", "sekihan", "style"],
             "exec": {
                 "argv": ["echo", "hello"],
                 "cwd": "."
@@ -641,6 +642,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "tpl_test");
         assert_eq!(results[0].name, Some("Test Template".to_string()));
+        assert_eq!(results[0].tags, vec!["311", "sekihan", "style"]);
     }
 
     #[test]

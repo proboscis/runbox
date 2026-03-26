@@ -207,3 +207,38 @@ fn test_template_create_with_bindings() {
     assert!(saved["bindings"].is_object());
     assert_eq!(saved["bindings"]["defaults"]["message"], "hello");
 }
+
+#[test]
+fn test_template_create_with_tags() {
+    let temp = TempDir::new().unwrap();
+    let template_file = temp.path().join("template_tags.json");
+
+    let json = r#"{
+        "template_version": 0,
+        "template_id": "tpl_with_tags",
+        "name": "Template with Tags",
+        "tags": ["311", "sekihan", "style"],
+        "exec": {
+            "argv": ["echo", "hello"],
+            "cwd": "."
+        },
+        "code_state": {
+            "repo_url": "git@github.com:org/repo.git"
+        }
+    }"#;
+    std::fs::write(&template_file, json).unwrap();
+
+    runbox_cmd(&temp)
+        .args(["template", "create", template_file.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let template_path = temp.path().join("templates").join("tpl_with_tags.json");
+    let saved_content = std::fs::read_to_string(&template_path).unwrap();
+    let saved: serde_json::Value = serde_json::from_str(&saved_content).unwrap();
+
+    assert_eq!(
+        saved["tags"],
+        serde_json::json!(["311", "sekihan", "style"])
+    );
+}
