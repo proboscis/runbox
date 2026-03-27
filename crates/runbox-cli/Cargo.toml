@@ -24,6 +24,13 @@ terminal_size = "0.4"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 
+# TUI dependencies
+ratatui = "0.28"
+crossterm = "0.28"
+tokio = { version = "1", features = ["full", "sync", "time"] }
+futures = "0.3"
+libc = "0.2"
+
 [features]
 # Enable tests that require tmux to be installed
 tmux-tests = []

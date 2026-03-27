@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+mod tui;
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use dialoguer::{theme::ColorfulTheme, Input};
@@ -744,6 +745,40 @@ CONTENTS:
   - Troubleshooting
   - Examples")]
     Tutorial,
+    /// Interactive process monitor with real-time updates
+    #[command(after_help = "\
+EXAMPLES:
+  # Launch the interactive monitor
+  runbox monitor
+
+  # Specify tick rate for refresh (default: 2 seconds)
+  runbox monitor --tick-rate 1
+
+FEATURES:
+  - Real-time process list with auto-refresh
+  - Keyboard navigation (j/k or arrows)
+  - Press Enter to view logs for selected process
+  - Press 's' to stop a running process
+  - Press 'a' to attach to tmux/zellij session
+  - Press 'q' to quit
+
+KEYBINDINGS:
+  ↑/k        Move selection up
+  ↓/j        Move selection down
+  Enter      View logs for selected process
+  s          Stop selected process (if running)
+  a          Attach to tmux/zellij session
+  r          Refresh process list
+  q          Quit
+
+RELATED COMMANDS:
+  runbox ps     Static process list (non-interactive)
+  runbox logs   View logs for a specific run")]
+    Monitor {
+        /// Tick rate in seconds for auto-refresh (default: 2)
+        #[arg(long, default_value = "2")]
+        tick_rate: u64,
+    },
 }
 #[derive(Subcommand)]
 enum DaemonCommands {
@@ -1238,10 +1273,44 @@ fn main() -> Result<()> {
             SkillCommands::Export { skill_name, output } => cmd_skill_export(&skill_name, output),
         },
         Commands::Tutorial => cmd_tutorial(),
+        Commands::Monitor { tick_rate } => cmd_monitor(&storage, tick_rate),
     }
 }
 fn cmd_tutorial() -> Result<()> {
     println!("{}", TUTORIAL);
+    Ok(())
+}
+
+// === Monitor Command ===
+fn cmd_monitor(_storage: &Storage, tick_rate: u64) -> Result<()> {
+    use std::time::Duration;
+    use crate::tui::{run_app, app::execute_post_exit_action};
+
+    let tick = Duration::from_secs(tick_rate);
+    
+    // Create a new storage instance for the TUI
+    let tui_storage = if let Ok(home) = std::env::var("RUNBOX_HOME") {
+        Storage::with_base_dir(PathBuf::from(home))?
+    } else {
+        Storage::new()?
+    };
+    
+    // Run the TUI
+    match run_app(tui_storage, tick) {
+        Ok(Some(action)) => {
+            // Execute post-exit action (e.g., attach to tmux)
+            execute_post_exit_action(action)?;
+        }
+        Ok(None) => {
+            // Normal exit
+        }
+        Err(e) => {
+            // TUI failed, show error
+            eprintln!("TUI error: {}", e);
+            return Err(e);
+        }
+    }
+
     Ok(())
 }
 // === Daemon Commands ===
