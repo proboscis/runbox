@@ -27,6 +27,8 @@ unicode-width = "0.2"
 [features]
 # Enable tests that require tmux to be installed
 tmux-tests = []
+# Enable tests that require zellij to be installed
+zellij-tests = []
 
 [dev-dependencies]
 assert_cmd = "2"

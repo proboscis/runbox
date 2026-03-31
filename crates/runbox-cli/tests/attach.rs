@@ -64,7 +64,7 @@ fn test_attach_background_not_supported() {
         .failure()
         .stderr(
             predicate::str::contains("not support")
-                .or(predicate::str::contains("only supported for tmux")),
+                .or(predicate::str::contains("only supported for tmux/zellij")),
         );
 }
 
@@ -107,7 +107,7 @@ fn test_attach_no_runtime_not_supported() {
         .args(["attach", "b2c3d4e5"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("only supported for tmux"));
+        .stderr(predicate::str::contains("only supported for tmux/zellij"));
 }
 
 /// Feature-gated test for tmux attach functionality.
@@ -197,5 +197,99 @@ fn test_attach_tmux() {
     // Clean up tmux session
     let _ = StdCommand::new("tmux")
         .args(["kill-session", "-t", &session_name])
+        .status();
+}
+
+/// Feature-gated test for zellij attach functionality.
+/// This test requires zellij to be installed and available.
+/// Run with: cargo test --features zellij-tests
+#[cfg(feature = "zellij-tests")]
+#[test]
+fn test_attach_zellij() {
+    use std::process::Command as StdCommand;
+
+    let zellij_check = StdCommand::new("zellij").arg("--version").output();
+    if zellij_check.is_err() || !zellij_check.unwrap().status.success() {
+        eprintln!("Skipping zellij test: zellij not available");
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let runs_dir = temp.path().join("runs");
+    fs::create_dir_all(&runs_dir).unwrap();
+
+    let session_name = format!("runbox_test_{}", std::process::id());
+    let tab_name = "test_tab";
+
+    let session_result = StdCommand::new("zellij")
+        .args(["attach", &session_name, "--create-background"])
+        .status();
+
+    if session_result.is_err() || !session_result.unwrap().success() {
+        eprintln!("Failed to create zellij session");
+        return;
+    }
+
+    let tab_result = StdCommand::new("zellij")
+        .args([
+            "--session",
+            &session_name,
+            "action",
+            "new-tab",
+            "--name",
+            tab_name,
+        ])
+        .status();
+
+    if tab_result.is_err() || !tab_result.unwrap().success() {
+        eprintln!("Failed to create zellij tab");
+        let _ = StdCommand::new("zellij")
+            .args(["kill-session", &session_name])
+            .status();
+        return;
+    }
+
+    let run = format!(
+        r#"{{
+        "run_version": 0,
+        "run_id": "run_d4e5f607-8901-2345-def0-123456789012",
+        "exec": {{
+            "argv": ["echo", "hello"],
+            "cwd": ".",
+            "env": {{}},
+            "timeout_sec": 0
+        }},
+        "code_state": {{
+            "repo_url": "git@github.com:org/repo.git",
+            "base_commit": "a1b2c3d4e5f6789012345678901234567890abcd"
+        }},
+        "status": "running",
+        "runtime": "zellij",
+        "handle": {{
+            "type": "Zellij",
+            "session": "{}",
+            "tab": "{}"
+        }}
+    }}"#,
+        session_name, tab_name
+    );
+
+    fs::write(
+        runs_dir.join("run_d4e5f607-8901-2345-def0-123456789012.json"),
+        run,
+    )
+    .unwrap();
+
+    Command::cargo_bin("runbox")
+        .unwrap()
+        .env("RUNBOX_HOME", temp.path())
+        .env_remove("ZELLIJ")
+        .args(["attach", "d4e5f607"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("terminal"));
+
+    let _ = StdCommand::new("zellij")
+        .args(["kill-session", &session_name])
         .status();
 }
